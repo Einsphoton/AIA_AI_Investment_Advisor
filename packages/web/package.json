@@ -1,0 +1,23 @@
+{
+  "name": "@aia/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node ../../node_modules/rollup/dist/bin/rollup -c rollup.config.mjs",
+    "build:watch": "node ../../node_modules/rollup/dist/bin/rollup -c rollup.config.mjs --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node ../../node_modules/rollup/dist/bin/rollup -c rollup.test.config.mjs && node ../../scripts/run-tests.mjs dist-test"
+  },
+  "dependencies": {
+    "@aia/shared": "*",
+    "echarts": "^6.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0"
+  }
+}

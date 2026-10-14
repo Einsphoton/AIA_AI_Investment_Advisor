@@ -1,0 +1,43 @@
+# dependencies
+node_modules/
+.pnpm-store/
+.npm-cache/
+# one-click launcher cache (portable Node downloaded by scripts/bootstrap.*)
+.tools/
+# agent/e2e scratch data + exported trajectories
+.e2e-data/
+.eval-data/
+.verify-real/
+.traces/
+
+# builds
+dist/
+dist-*/
+build/
+*.tsbuildinfo
+
+# runtime data (SQLite DB + backups)
+data/
+.smoke-data-*/
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# env
+.env
+.env.local
+.env.*.local
+
+# logs / editor / OS
+logs/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# scratch (probe scripts are developer-only)
+_probe/

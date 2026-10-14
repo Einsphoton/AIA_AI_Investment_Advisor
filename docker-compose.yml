@@ -1,0 +1,62 @@
+# AI 投资顾问 — 轻量服务器 / 本地 Docker 一键部署
+#
+#   cp .env.example .env      # 填 LLM_API_KEY（可选，也可在设置页里填）
+#   docker compose up -d --build
+#   open http://<服务器IP>:8787
+#
+# 说明：
+# - 单容器：Node 后端同时托管 API 与前端静态资源（无需 nginx）
+# - 数据持久化在命名卷 advisor-data（SQLite 数据库 + 备份快照）
+# - 想改用绑定挂载（数据放在宿主机 ./data）：把 volumes 换成 ./data:/data
+
+name: ai-investment-advisor
+
+services:
+  advisor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-investment-advisor:latest
+    container_name: ai-investment-advisor
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8787}:8787"
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+      HOST: 0.0.0.0
+      DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: ${TZ:-Asia/Shanghai}
+      # ── LLM（任意 OpenAI 兼容接口）──
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-180000}
+      # ── 可选增强数据源 / 搜索源（留空即用零 Key 默认链路）──
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      ALPHAVANTAGE_API_KEY: ${ALPHAVANTAGE_API_KEY:-}
+      FMP_API_KEY: ${FMP_API_KEY:-}
+    volumes:
+      - advisor-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  advisor-data:

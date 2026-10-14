@@ -1,0 +1,42 @@
+{
+  "name": "ai-investment-advisor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI 投资顾问 — 带 Agent Loop 的自托管投资分析应用（Docker 部署 / Windows、macOS 本地调试）",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "start:prod": "npm run build && npm start",
+    "build": "npm run build -w @aia/shared && npm run build -w @aia/server && npm run build -w @aia/web",
+    "build:server": "npm run build -w @aia/shared && npm run build -w @aia/server",
+    "start": "node --enable-source-maps packages/server/dist/index.js",
+    "typecheck": "npm run typecheck -w @aia/shared && npm run typecheck -w @aia/server && npm run typecheck -w @aia/web",
+    "test": "npm run build:server && npm run test -w @aia/server && npm run test -w @aia/web",
+    "smoke": "npm run build:server && node scripts/smoke-api.mjs",
+    "e2e:agent": "npm run build:server && node scripts/e2e-agent.mjs",
+    "eval:agent": "npm run build:server && node scripts/eval-agent.mjs",
+    "trace": "node scripts/export-trace.mjs",
+    "check:deploy": "node scripts/check-deploy.mjs",
+    "verify": "npm run typecheck && npm run build && npm test && npm run check:deploy && npm run probe:sources && npm run smoke",
+    "probe:sources": "node scripts/probe-sources.mjs",
+    "clean": "node scripts/clean.mjs"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.3",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.0",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@types/node": "^24.10.1",
+    "rollup": "^4.64.6",
+    "tslib": "^2.8.1",
+    "typescript": "^5.9.3",
+    "yaml": "^2.9.1"
+  }
+}
