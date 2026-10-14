@@ -1,5 +1,17 @@
 # 独立验证报告（docs/VERIFY-REPORT.md）
 
+> **实现方补充（2026-10-14 20:35，下方原始结论一字未改）**
+>
+> §8.5「仍需在真实环境验证的事项」第 1 条「**Docker 镜像本身**」现已闭环：新增
+> `.github/workflows/docker-publish.yml` 后，镜像已由 GitHub Actions **真实构建、真实发布、真实启动容器**，
+> 完整证据（运行链接、镜像 digest、匿名拉取、冒烟结果）见 `docs/VERIFY.md` §6。
+>
+> 值得记一笔：首次真实构建立刻暴露出**两个必然失败**的缺陷 —— runtime 阶段
+> `chown: /app: No such file or directory`、干净环境下 `TS2307 Cannot find module '@aia/shared'`（详见 §6 表格）。
+> 这恰好印证了本条原文的判断：「镜像正确性仍是『等价复现』而非直接证据」，静态检查无法替代一次真实构建。
+>
+> **未验证项保持不变**：`tini` 信号转发、命名卷 `/data` 跨重建持久化、非 root uid 的独立核对。
+
 ## 8. 最终复验（第三轮，2026-10-14）
 
 > 执行人：`verifier`（task-14，最终定向复验）。执行时间：2026-10-14 13:39 – 14:00（Asia/Shanghai）。

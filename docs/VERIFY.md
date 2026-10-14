@@ -17,7 +17,7 @@
 | Node | v24.19.0 | 使用内置 `node:sqlite`（要求 ≥ 24，`engines` 已声明） |
 | npm | 11.17.0 | 安装需 `--ignore-scripts`；`.npmrc` 把 cache 指到项目内 |
 | OS | Windows 11（pwsh 7） | 另有 `scripts/dev.sh` / `build.sh` 覆盖 macOS/Linux |
-| Docker | **本机未安装** | 无法执行 `docker build`；用 `npm run check:deploy -- --with-install` 做等价验证（见 §2.6） |
+| Docker | **本机未安装** | 本地无法执行 `docker build`，用 `npm run check:deploy -- --with-install` 做等价验证（见 §2.6）；**镜像构建/发布/启动已改由 GitHub Actions 真实验证（见 §6）** |
 | 构建工具链 | `typescript 5.9.3` + `rollup 4.64.6` + `@rollup/plugin-terser` | 全部纯 JS |
 | 前端产物 | `app.js` 1.44 MB（压缩后）、`styles.css` 20 KB、`index.html` 0.8 KB | 未压缩为 4.4 MB |
 
@@ -331,7 +331,7 @@ P0/P1 落地后交由**独立验证者**做对抗性复核（含 15 组极端上
 
 | 需求 | 落点 | 状态 |
 | --- | --- | --- |
-| Docker 部署（轻量服务器） | `Dockerfile`、`docker-compose.yml` | ✅ 配置检查 + runtime 闭包等价验证；`docker build` 本机无法执行 |
+| Docker 部署（轻量服务器） | `Dockerfile`、`docker-compose.yml`、`.github/workflows/docker-publish.yml` | ✅ 配置检查（34/34）+ runtime 闭包等价验证；**镜像已由 CI 在 amd64/arm64 真实构建、发布到 GHCR 并真实启动容器**（见 §6） |
 | Windows 本地调试脚本 | `scripts/dev.ps1`、`scripts/dev.mjs` | ✅ 结构审查通过；脚本逻辑已审阅（本机为 Windows 可直接跑 `npm run dev`） |
 | macOS/Linux 本地调试脚本 | `scripts/dev.sh`、`scripts/build.sh` | ⚠️ 无法在本机（Windows）执行，已逐行审查 |
 | Agent Loop + 工具调用 | `packages/server/src/agent/*` | ✅ 19 个工具注册；SSE 序列经本地 mock LLM 端到端验证（见 §2.7） |
@@ -375,7 +375,7 @@ P0/P1 落地后交由**独立验证者**做对抗性复核（含 15 组极端上
 
 ## 5. 已知限制（诚实声明）
 
-1. **未执行 `docker build` / `docker compose up`**：本机没有 Docker。已用「配置静态检查 + runtime 依赖闭包复现 + 真实启动」替代，但镜像本身、Alpine 上的运行、`tini` 信号转发仍未在真机验证。
+1. **`tini` 信号转发与 `/data` 卷持久化未验证**：镜像构建（amd64/arm64）、Alpine(musl) 运行、容器启动与 `/api/health` 已由 GitHub Actions 真实验证（原「本机无 Docker」的限制已消除，见 §6）。仍未验证：`tini` 的 SIGTERM 转发、命名卷跨容器重建后的数据持久化、非 root uid 的独立核对。
 2. **macOS/Linux 脚本未实机执行**：本机为 Windows；`.sh` 脚本已逐行审查（`set -euo pipefail`、Node 版本校验、依赖安装、构建/启动分支）。
 3. **前端交互未做浏览器实测**：仅无头渲染 + 打包验证。图表拖拽缩放、弹窗、SSE 增量渲染需人工确认。
 4. **真实模型已验证（2026-10-14 更新）**：用用户配置的 `deepseek-v4.1-flash` 跑通「对话 / 工具调用 / 完整资产分析流水线」并完成 4 场景评测（见 §2.15）。仍未覆盖：**长周期成本**（单次流水线约 27k+2k token）、**多市场大批量持仓**（>10 只）下的稳定性、以及其它供应商/模型（OpenAI / Qwen / Ollama 等）的兼容性 —— 需按实际使用逐步观察。
@@ -383,3 +383,36 @@ P0/P1 落地后交由**独立验证者**做对抗性复核（含 15 组极端上
 6. **无鉴权**：应用按「自托管在内网/反代之后」设计，`/api/*` 全部无认证，请勿直接暴露公网。
 7. **`AIA_OFFLINE=1` 只影响仓储侧的行情软桥，不覆盖 `/api/market/*`**（该开关是测试/离线降级用，不是用户功能）。已知，未修。
 8. **搜索自动补全的类型分类**：东方财富 suggest 把「华夏成长混合」这类场外基金归为 `etf`（因为 EM 不区分场内/场外，而 `InstrumentType` 只有 stock/etf/fund）。添加资产/标的时**类型由用户自己在下拉框选择**，自动补全只填名称，因此影响很小；来自 `fundsuggest` 的搜索结果类型正确。
+
+---
+
+## 6. Docker 镜像构建与发布（2026-10-14 补充：已由 CI 真实验证）
+
+**背景**：§5-1 原记录「本机没有 Docker，`docker build` / `docker compose up` 未执行」。本轮新增
+`.github/workflows/docker-publish.yml`，把镜像构建搬到 GitHub Actions：**每次 push 都会真实构建**
+（任意分支 + `v*` 标签），此前无法执行的验证因此闭环。
+
+**首次真实构建暴露并修复的两个必然失败缺陷**（不是偶发，静态检查发现不了）：
+
+| # | 现象 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| 1 | `[runtime 2/14] chown -R node:node /data /app` → `chown: /app: No such file or directory`（exit 1） | runtime 阶段从 `node:24-alpine` 起、**不继承** base 阶段的 `WORKDIR /app`，而 `WORKDIR /app` 写在 `RUN` 之后 | `mkdir -p /data/backups /app` 之后再 chown |
+| 2 | `npm run typecheck` → 满屏 `TS2307 Cannot find module '@aia/shared'` + 级联 `TS7006` | `@aia/shared` 的类型只经 `packages/shared/dist/index.d.ts` 暴露（无 TS `paths` 映射），而 `dist` 是构建产物且被 ignore | root `typecheck` 先 `build -w @aia/shared`（本地移走 `dist` 已 1:1 复现；修复后 exit 0，重生成产物逐文件一致） |
+
+**可复现的命令与实测结果**：
+
+```bash
+npm run check:deploy    # 34/34 通过（含 9 项 CI 一致性断言）
+npm run typecheck       # 移走 packages/shared/dist 后仍 exit 0
+git log --oneline -4    # f3f6f10 / 7b943ea / e37f9bb / 6fa363d
+```
+
+| 验证项 | 结果 | 证据 |
+| --- | --- | --- |
+| 多架构镜像真实构建 | ✅ `linux/amd64`（ubuntu-latest）与 `linux/arm64`（ubuntu-24.04-arm）原生 runner 并行，约 2 分钟（含 gha 缓存） | run 38563387605：4 个 job 全 success |
+| 公网匿名拉取 | ✅ GHCR 匿名 token（**未携带任何登录凭据**）+ `tags/list` = `main, latest, sha-6fa363d` | `docker pull` 无需登录 |
+| manifest list | ✅ OCI image index，含 `linux/amd64`、`linux/arm64`（另 2 条 `unknown/unknown` 为 BuildKit provenance 证明） | GHCR v2 `manifests/latest` |
+| 容器真实可启动 | ✅ CI 内 `docker pull ghcr.io/einsphoton/aia_ai_investment_advisor:main` → `docker run` → `curl /api/health` 第 2 次尝试通过 | 冒烟 job 日志 |
+| digest 可追溯 | `sha256:20144c7c7dff…`（`latest` / `main` / `sha-6fa363d` 指向同一 index） | 同上 |
+
+**仍未验证**：`tini` 的 SIGTERM 转发、命名卷 `/data` 跨容器重建的持久化、非 root uid 的独立核对。
