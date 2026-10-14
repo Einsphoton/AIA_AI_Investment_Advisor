@@ -1,0 +1,191 @@
+# AI 投资顾问 — Docker 镜像自动构建与发布
+#
+# 触发：每次 push（任意分支，以及 v* 标签）+ 手动 workflow_dispatch
+# 产物：多架构镜像（linux/amd64 + linux/arm64）→ GitHub Container Registry
+#
+#   ghcr.io/einsphoton/aia_ai_investment_advisor:latest        # main 分支最新
+#   ghcr.io/einsphoton/aia_ai_investment_advisor:main
+#   ghcr.io/einsphoton/aia_ai_investment_advisor:sha-<短SHA>   # 每次提交都有，可回滚
+#   ghcr.io/einsphoton/aia_ai_investment_advisor:1.2.3         # 推 v1.2.3 标签时
+#
+# 服务器上安装 / 更新：
+#   docker compose pull && docker compose up -d
+#
+# 说明：
+#   - 使用仓库内置 GITHUB_TOKEN 推送，不需要配置任何 Secret
+#   - amd64 / arm64 分别用对应架构的原生 runner 并行构建（比 QEMU 快数倍），
+#     最后合并为 manifest list，docker pull 时按机器架构自动选择
+#   - Dockerfile 内部会执行 `npm run typecheck`：类型错误直接构建失败，不会产出坏镜像
+#   - 发布完成后会真实拉取并启动容器、请求 /api/health 做冒烟验证
+name: Docker 镜像
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+# 同一分支连续推送时取消上一次未完成的构建，节省额度
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/einsphoton/aia_ai_investment_advisor
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          # arm64 使用 GitHub 原生 ARM runner（公开仓库免费）。
+          # 若该 runner 标签不可用：把 runner 改成 ubuntu-latest，并在构建步骤前加
+          # `docker/setup-qemu-action@v3`（QEMU 模拟，会慢一些）。
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: 准备平台标识
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签与 OCI 标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=AI Investment Advisor
+            org.opencontainers.image.description=自托管 AI 投资顾问：Agent Loop + 公开行情数据源 + 持仓账本
+            org.opencontainers.image.source=https://github.com/Einsphoton/AIA_AI_Investment_Advisor
+
+      - name: 构建并推送（按 digest）
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: 记录构建 digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: 上传 digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: 合并多架构 manifest
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 下载各架构 digest
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: 创建 manifest list 并推送
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: 查看发布结果
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+
+  smoke:
+    name: 冒烟验证（拉取并启动）
+    needs: [merge]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: 拉取镜像
+        run: docker pull ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+
+      - name: 启动容器
+        run: |
+          docker run -d --name aia-smoke \
+            -p 8787:8787 \
+            -e LLM_API_KEY=dummy \
+            -e TZ=Asia/Shanghai \
+            -v aia-smoke-data:/data \
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+
+      - name: 等待 /api/health 就绪
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/api/health; then
+              echo ""
+              echo "✅ 第 ${i} 次尝试即通过健康检查"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "❌ 60s 内未就绪，容器日志："
+          docker logs aia-smoke || true
+          exit 1
+
+      - name: 清理容器
+        if: always()
+        run: docker rm -fv aia-smoke || true

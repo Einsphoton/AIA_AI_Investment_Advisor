@@ -44,8 +44,58 @@
 
 前置：Docker 24+ 与 Docker Compose v2。
 
+### 方式 A：拉取预构建镜像（推荐，无需 clone、无需本地构建）
+
+每次 push 都会由 GitHub Actions 自动构建多架构镜像（`linux/amd64` + `linux/arm64`）并发布到
+GitHub Container Registry，服务器上直接拉取即可：
+
 ```bash
-git clone <your-repo> ai-investment-advisor
+mkdir -p ai-investment-advisor && cd ai-investment-advisor
+
+# 只需要两个文件：compose 配置 + 环境变量模板
+curl -fsSLO https://raw.githubusercontent.com/Einsphoton/AIA_AI_Investment_Advisor/main/docker-compose.yml
+curl -fsSL  https://raw.githubusercontent.com/Einsphoton/AIA_AI_Investment_Advisor/main/.env.example -o .env
+
+vi .env                       # 可选：填入 LLM_API_KEY（也可以启动后在设置页填）
+
+docker compose pull           # 只拉镜像，不在服务器上构建
+docker compose up -d
+
+open http://127.0.0.1:8787    # 服务器上则用 http://<公网IP>:8787
+```
+
+**更新（有新提交时）**：
+
+```bash
+docker compose pull && docker compose up -d   # 拉最新镜像并重建容器，数据留在 advisor-data 卷里
+```
+
+不想用 compose 的话，一条 `docker run` 也能跑起来：
+
+```bash
+docker run -d --name ai-investment-advisor --restart unless-stopped \
+  -p 8787:8787 -v advisor-data:/data \
+  -e TZ=Asia/Shanghai -e LLM_API_KEY=sk-xxx \
+  ghcr.io/einsphoton/aia_ai_investment_advisor:latest
+```
+
+镜像标签（`ghcr.io/einsphoton/aia_ai_investment_advisor`）：
+
+| 标签 | 含义 |
+| --- | --- |
+| `latest` / `main` | main 分支最新一次构建成功 |
+| `sha-1a2b3c4` | 每次提交一个不可变标签，便于回滚 / 固定版本 |
+| `1.2.3`、`1.2`、`1` | 推送 `v1.2.3` 这类 tag 时自动生成 |
+| `<分支名>` | 推送到其它分支时按分支名发布 |
+
+> 镜像包是公开的，`docker pull` 不需要登录。若提示 `denied` / `unauthorized`，
+> 到仓库的 **Packages** 页面把 `aia_ai_investment_advisor` 的可见性设为 Public。
+> 国内服务器拉取 `ghcr.io` 慢或超时的话，给 Docker daemon 配代理 / 镜像加速即可。
+
+### 方式 B：从源码构建
+
+```bash
+git clone https://github.com/Einsphoton/AIA_AI_Investment_Advisor.git ai-investment-advisor
 cd ai-investment-advisor
 
 cp .env.example .env          # 可选：填入 LLM_API_KEY（也可以启动后在设置页填）
@@ -60,7 +110,8 @@ open http://127.0.0.1:8787    # 服务器上则用 http://<公网IP>:8787
 docker compose logs -f advisor     # 查看日志
 docker compose restart advisor     # 重启
 docker compose down                # 停止（数据保留在命名卷 advisor-data）
-docker compose up -d --build       # 更新代码后重建
+docker compose pull && docker compose up -d   # 更新到最新发布镜像
+docker compose up -d --build       # 用当前源码重建（改了代码）
 ```
 
 数据持久化：
@@ -70,6 +121,22 @@ docker compose up -d --build       # 更新代码后重建
   （Linux 上先 `mkdir -p data && sudo chown 1000:1000 data`，容器以非 root 的 `node` 用户运行）。
 
 镜像构建过程会执行 `npm run typecheck` 作为门禁：**类型错误会直接导致构建失败**，不会产出坏镜像。
+
+### 镜像自动构建（GitHub Actions）
+
+`.github/workflows/docker-publish.yml`：**每次 push 都会构建并发布镜像**（任意分支，以及 `v*` 标签），
+所以服务器上永远只需要 `docker compose pull` 就能更新，不必在服务器上装 Node、也不必本地构建。
+
+- **多架构**：`linux/amd64`（`ubuntu-latest`）与 `linux/arm64`（`ubuntu-24.04-arm`）各用对应架构的原生
+  runner 并行构建，最后合并成 manifest list；`docker pull` 时按机器架构自动选择；
+- **零配置**：使用仓库内置的 `GITHUB_TOKEN` 推送到 GHCR，不需要配置任何 Secret；
+- **构建即校验**：`npm run typecheck` 是镜像构建的一部分，类型错误直接让构建失败；
+- **发布即冒烟**：发布后 Actions 会真实拉取镜像、启动容器并请求 `/api/health`，不通过就标红；
+- **固定版本**：在 `.env` 里写 `AIA_IMAGE=ghcr.io/einsphoton/aia_ai_investment_advisor:sha-1a2b3c4`
+  即可锁定某次提交的镜像（默认跟 `:latest`）；
+- **可回滚**：每次提交都有 `sha-xxxxxxx` 标签，改回上一个标签 + `docker compose up -d` 即可；
+- 想同时发到 Docker Hub：在仓库 Secrets 里加 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`，再给
+  workflow 增加一个 `docker/login-action` + 同名 tag 即可（当前只用 GHCR，保持零配置）。
 
 ---
 

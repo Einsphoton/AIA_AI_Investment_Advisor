@@ -1,11 +1,20 @@
 # AI 投资顾问 — 轻量服务器 / 本地 Docker 一键部署
 #
 #   cp .env.example .env      # 填 LLM_API_KEY（可选，也可在设置页里填）
+#
+#   # 方式 A（推荐）：直接用 GitHub Actions 构建好的镜像，无需在服务器上构建
+#   docker compose pull && docker compose up -d
+#
+#   # 方式 B：用当前源码在本地构建
 #   docker compose up -d --build
+#
 #   open http://<服务器IP>:8787
 #
 # 说明：
 # - 单容器：Node 后端同时托管 API 与前端静态资源（无需 nginx）
+# - 镜像由 .github/workflows/docker-publish.yml 在每次 push 时自动构建，并推送到
+#   ghcr.io/einsphoton/aia_ai_investment_advisor（多架构 amd64/arm64）；
+#   要固定版本就在 .env 里设置 AIA_IMAGE=ghcr.io/einsphoton/aia_ai_investment_advisor:sha-xxxxxxx
 # - 数据持久化在命名卷 advisor-data（SQLite 数据库 + 备份快照）
 # - 想改用绑定挂载（数据放在宿主机 ./data）：把 volumes 换成 ./data:/data
 
@@ -13,10 +22,13 @@ name: ai-investment-advisor
 
 services:
   advisor:
+    # 同时声明 image 与 build 是 compose 支持的写法：
+    #   docker compose pull           → 用 GHCR 上发布的镜像（不构建）
+    #   docker compose up -d --build  → 用当前源码构建，并打上下面这个镜像名
+    image: ${AIA_IMAGE:-ghcr.io/einsphoton/aia_ai_investment_advisor:latest}
     build:
       context: .
       dockerfile: Dockerfile
-    image: ai-investment-advisor:latest
     container_name: ai-investment-advisor
     restart: unless-stopped
     ports:

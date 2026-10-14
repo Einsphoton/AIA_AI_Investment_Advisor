@@ -13,7 +13,7 @@
 | 前端 | React 19 + React Router 7 + **Rollup 7 + TypeScript** + ECharts 6 | 图表（K 线/净值曲线）成熟；Rollup + tsc 均为纯 JS，构建产物由后端静态托管 |
 | 构建 | `tsc`（Node 包）+ `Rollup`（前端，含 terser 压缩） | 纯 JS、零原生二进制：Windows/macOS/Linux/Alpine/受限 CI 行为一致（Vite/esbuild/tsx 会 spawn 原生子进程，在受限环境直接 EPERM） |
 | 测试 | `node:test` + `scripts/run-tests.mjs`（同进程 import 编译产物） | 不用 `node --test <dir>`（它会为每个测试文件 spawn 子进程）；前端另有 `renderToString` 无头渲染测试 |
-| 部署 | 单容器（API + 静态前端）+ docker-compose | 轻量服务器上一条 `docker compose up -d --build` 即可；数据在命名卷 `/data` |
+| 部署 | 单容器（API + 静态前端）+ docker-compose | 轻量服务器上 `docker compose pull && docker compose up -d` 直接拉 GHCR 预构建镜像（每次 push 由 Actions 自动发布多架构 amd64/arm64），或 `docker compose up -d --build` 本地构建；数据在命名卷 `/data` |
 
 ## 2. 目录结构与归属
 
@@ -24,6 +24,7 @@ AIInvestmentAdvisor/
 ├── Dockerfile                  # 多阶段：deps → build → runtime(非 root)
 ├── docker-compose.yml
 ├── .env.example / .npmrc / .dockerignore
+├── .github/workflows/docker-publish.yml  # push 即构建多架构镜像并发布到 GHCR
 ├── scripts/
 │   ├── dev.mjs                 # 跨平台并行启动 server+web（本地调试）
 │   ├── dev.ps1 / dev.sh        # Windows / macOS 一键脚本

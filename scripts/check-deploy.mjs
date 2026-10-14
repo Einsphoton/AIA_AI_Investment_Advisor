@@ -7,7 +7,10 @@
  *   1. `docker-compose.yml` parses and contains the required wiring
  *   2. `Dockerfile` is multi-stage, runs as non-root, has a healthcheck and
  *      installs dependencies with the same flags used locally
- *   3. `--with-install` additionally reproduces the **runtime dependency
+ *   3. `.github/workflows/docker-publish.yml` publishes the very image that
+ *      `docker-compose.yml` pulls, so `docker compose pull` keeps working
+ *      right after a push (multi-arch amd64 + arm64)
+ *   4. `--with-install` additionally reproduces the **runtime dependency
  *      closure**: it installs production-only dependencies into a scratch
  *      directory, copies the built artifacts in exactly like the runtime image
  *      does, boots the server and calls the real API.
@@ -81,6 +84,44 @@ const dockerignore = fs.readFileSync(path.join(root, '.dockerignore'), 'utf8');
 check('忽略 node_modules', /(^|\n)node_modules/.test(dockerignore));
 check('忽略本地数据目录', /(^|\n)data/.test(dockerignore));
 check('未忽略源码目录 packages', !/^packages\/?$/m.test(dockerignore) && !/^packages\/\*/m.test(dockerignore.replace(/packages\/\*\/dist\*?/g, '')), '');
+
+/* ────────────── GitHub Actions 自动打包（与 compose 的镜像名一致） ────────── */
+
+console.log('\n== GitHub Actions ==');
+const IMAGE_REPO = 'ghcr.io/einsphoton/aia_ai_investment_advisor';
+const workflowPath = path.join(root, '.github/workflows/docker-publish.yml');
+check('存在自动构建镜像的 workflow', fs.existsSync(workflowPath), '.github/workflows/docker-publish.yml');
+
+let workflowText = '';
+let workflow = null;
+if (fs.existsSync(workflowPath)) {
+  workflowText = fs.readFileSync(workflowPath, 'utf8');
+  try {
+    workflow = parseYaml(workflowText);
+    check('workflow YAML 可解析', true);
+  } catch (error) {
+    check('workflow YAML 可解析', false, error.message);
+  }
+}
+
+check('workflow 推送到 GHCR 镜像', workflowText.includes(IMAGE_REPO), IMAGE_REPO);
+check('workflow 申请 packages: write 权限', /packages:\s*write/.test(workflowText));
+check('workflow 同时构建 amd64 与 arm64', workflowText.includes('linux/amd64') && workflowText.includes('linux/arm64'));
+
+if (workflow) {
+  const rawTriggers = workflow.on ?? workflow[true];
+  const triggerNames = Array.isArray(rawTriggers)
+    ? rawTriggers
+    : typeof rawTriggers === 'string'
+      ? [rawTriggers]
+      : Object.keys(rawTriggers ?? {});
+  check('workflow 在 push 时触发', triggerNames.includes('push'), triggerNames.join(',') || '无');
+}
+
+const composeImage = String(
+  (compose?.services ?? {})[Object.keys(compose?.services ?? {})[0]]?.image ?? '',
+);
+check('compose 拉取的镜像与 workflow 发布的一致', composeImage.includes(IMAGE_REPO), composeImage || '未声明 image');
 
 /* ─────────────────── 运行时依赖闭包（可选，需要联网） ────────────────────── */
 
