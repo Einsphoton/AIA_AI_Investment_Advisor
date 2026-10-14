@@ -57,8 +57,10 @@ ENV NODE_ENV=production \
     DATA_DIR=/data \
     LOG_LEVEL=info
 
+# 注意：runtime 阶段不继承 base 阶段的 WORKDIR /app，这里的 /app 必须显式创建，
+# 否则 chown 会以 "chown: /app: No such file or directory" 直接中断构建。
 RUN apk add --no-cache tini \
-    && mkdir -p /data/backups \
+    && mkdir -p /data/backups /app \
     && chown -R node:node /data /app
 
 WORKDIR /app
