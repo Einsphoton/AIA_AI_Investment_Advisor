@@ -4,35 +4,29 @@
  * 四个板块：持仓统计 / 计数与信号 / 持仓排名前五 / AI 持仓简报，
  * 外加全球指数、月度预算与快捷入口。
  * 指数单独走 /api/market/indices，失败静默降级（回退 DashboardPayload.indices）。
+ * 工具栏「AI一键分析」走 POST /api/agent/run-now：在同一条 SSE 流里顺序跑
+ * 资产分析 → 标的分析 → AI 投资建议（因此流内有多组 run-started/run-finished）。
+ * 推理过程由全局右下角面板（AgentActivityDock）展示，不再占用页面空间。
  */
-import { useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import type { DashboardPayload, Quote } from '@aia/shared';
 import { MARKET_LABELS, REPORT_STYLE_MAP, PERSONA_MAP } from '@aia/shared';
 import { api } from '../api/client';
-import { useAgentStream, useAsync } from '../api/hooks';
+import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
+import { useAsync } from '../api/hooks';
 import { fmtDateTime, fmtMoney, fmtNum, fmtPct, fmtPrice, fmtRelative, fmtShares, fmtSignedMoney, pnlClass } from '../format';
-import { Alert, Badge, Button, Card, Empty, ErrorAlert, Loading, ProgressBar, StatCard, useToast } from '../components/ui';
+import { Alert, Badge, Button, Card, Empty, ErrorAlert, Loading, ProgressBar, StatCard } from '../components/ui';
 import { Sparkline } from '../components/charts/Sparkline';
-import { RunPanel } from '../components/RunPanel';
 
 export function DashboardPage() {
-  const toast = useToast();
   const state = useAsync<DashboardPayload>(() => api.dashboard(), []);
   // 指数失败不允许影响整页：catch 成空数组，页面回退到 dashboard payload 里的快照。
   const liveIndices = useAsync<Quote[]>(() => api.market.indices().catch(() => []), []);
 
-  // AI 逐项分析写回 aiSummary / 生成简报时，entity 事件到达即刷新整页。
-  const stream = useAgentStream(() => state.reload());
-
-  useEffect(() => {
-    if (!stream.finished) return;
-    if (stream.finished.status === 'error') toast.error('AI 资产分析失败', stream.finished.summary);
-    else toast.success('AI 资产分析完成', stream.finished.summary);
-    state.reload();
-    // 仅在每次运行结束时触发一次
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stream.finished]);
+  // AI 一键分析 = 完整流水线（资产分析 → 标的分析 → 建议生成）；流由全局 Provider 持有，
+  // 切换页面不会中断，推理过程显示在右下角面板里。
+  const { run, running } = useAgentActivity();
+  useAgentRefresh(state.reload);
 
   const payload = state.data;
   const portfolio = payload?.portfolio;
@@ -67,17 +61,16 @@ export function DashboardPage() {
           </Button>
           <Button
             variant="primary"
-            loading={stream.running}
+            loading={running}
             onClick={() => {
-              void stream.start('/assets/analyze');
+              // 完整流水线：资产分析 → 标的分析 → AI 投资建议（同一条 SSE 流）。
+              run({ path: '/agent/run-now', title: 'AI 一键分析' });
             }}
           >
-            AI 资产分析
+            AI一键分析
           </Button>
         </div>
       </div>
-
-      <RunPanel stream={stream} title="AI 资产分析（财报 · 基本面 · 宏观 · 微观 · 国际局势）" className="mb-3" />
 
       {state.error && <ErrorAlert error={state.error} onRetry={state.reload} />}
       {state.error?.isNotConfigured && (
@@ -140,7 +133,11 @@ export function DashboardPage() {
                   </span>
                 }
                 value={counts.watchItems}
-                sub={`AI 已运行 ${counts.analysisRuns} 次 · 最近 ${fmtRelative(counts.lastRunAt)}`}
+                sub={
+                  counts.retiredWatchItems > 0
+                    ? `在池标的 · ${counts.retiredWatchItems} 个已退役（AI 判定不再适合）`
+                    : `AI 已运行 ${counts.analysisRuns} 次 · 最近 ${fmtRelative(counts.lastRunAt)}`
+                }
               />
               <StatCard
                 label={
@@ -242,9 +239,9 @@ export function DashboardPage() {
               <Button
                 size="sm"
                 variant="primary"
-                loading={stream.running}
+                loading={running}
                 onClick={() => {
-                  void stream.start('/assets/analyze');
+                  run({ path: '/assets/analyze', title: 'AI 资产分析' });
                 }}
               >
                 运行 AI 资产分析

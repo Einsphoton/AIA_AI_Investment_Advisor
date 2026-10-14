@@ -191,6 +191,11 @@ export interface Settings {
   enforceBudget: boolean;
   /** Max number of watchlist candidates the agent may create per run. */
   watchlistCandidateLimit: number;
+  /**
+   * 连续多少次分析仍被标记退役后，流水线才真正删除该标的；0 = 永不自动删除。
+   * 有持仓 / 人工录入 / 有待处理建议的标的即使达到次数也不会被删除（见 ARCHITECTURE §4.3.2）。
+   */
+  watchlistRetireDeleteRuns: number;
   /** Tool authorisation policy (deny list + write-approval mode). */
   toolPolicy: ToolPolicy;
   /** Configured MCP servers (may be empty). */
@@ -208,6 +213,7 @@ export interface SettingsInput {
   schedule?: Partial<ScheduleConfig>;
   enforceBudget?: boolean;
   watchlistCandidateLimit?: number;
+  watchlistRetireDeleteRuns?: number;
   toolPolicy?: Partial<ToolPolicy>;
   mcpServers?: McpServerConfig[];
   /** Send an empty string to keep the stored key; send null to clear it. */
@@ -380,6 +386,18 @@ export interface CreateTransactionInput {
 
 /* ──────────────────────────────── watchlist ───────────────────────────────── */
 
+/**
+ * 自选池状态（P3 淘汰机制）。
+ *
+ * active  = 在池，参与建议生成与候选挖掘；
+ * retired = AI 认为已不适合继续作为标的（原因见 `retiredReason`），
+ *           默认不在列表展示，但仍保留历史与「推荐后涨跌」复盘。
+ *
+ * 只有连续 `settings.watchlistRetireDeleteRuns` 次分析都确认退役、且未命中
+ * 持仓 / 人工录入 / 待处理建议等护栏时，流水线才会真正删除（见 ARCHITECTURE §4.3.2）。
+ */
+export type WatchItemStatus = 'active' | 'retired';
+
 export interface WatchItem {
   id: string;
   name: string;
@@ -407,6 +425,14 @@ export interface WatchItem {
   thesis: string;
   spark: number[];
   createdAt: string;
+  /** active（在池）/ retired（AI 已判定不适合，等待复活或清理）。 */
+  status: WatchItemStatus;
+  /** Why the agent retired it (latest reason). */
+  retiredReason: string;
+  /** When it was last confirmed as retired (ISO 8601); null while active. */
+  retiredAt: string | null;
+  /** Consecutive analyses that confirmed the retirement; reset when revived. */
+  retireStreak: number;
 }
 
 export interface WatchlistDetail extends WatchItem {
@@ -505,6 +531,8 @@ export interface DashboardCounts {
   holdings: number;
   instruments: number;
   watchItems: number;
+  /** 已退役（AI 判定不适合，待复活或清理）的标的数量，不计入 `watchItems`。 */
+  retiredWatchItems: number;
   newWatchItems: number;
   pendingAdvice: number;
   newAdvice: number;
@@ -782,6 +810,36 @@ export interface ChatMessage {
 /* ────────────────────────────── SSE event contract ────────────────────────── */
 
 /**
+ * Inference metrics of one LLM request inside an agent run (`metrics` event).
+ *
+ * Every agent turn issues exactly one `/chat/completions` request, and the
+ * server reports it in two phases:
+ *   · `first-token` — the stream just produced its first delta; only `ttftMs` is
+ *     known yet, usage counters are still 0 (the panel can show 首字延迟 live);
+ *   · `done`        — the request finished; usage, cache hits and speed are final.
+ *
+ * Counters are per request (never cumulative): a client that wants totals for a
+ * whole run/pipeline must sum the `done` events it received.
+ */
+export interface InferenceMetrics {
+  phase: 'first-token' | 'done';
+  /** 1-based agent turn this request belongs to. */
+  turn: number;
+  /** Model actually reported by the provider (falls back to the configured one). */
+  model: string;
+  /** Time to first token (ms); null when the provider answered non-streamed. */
+  ttftMs: number | null;
+  /** Total request wall time (ms); null while the request is still streaming. */
+  latencyMs: number | null;
+  promptTokens: number;
+  completionTokens: number;
+  /** Prompt tokens served from the provider's prompt/KV cache. */
+  cachedTokens: number;
+  /** completionTokens / generation seconds; null until the request ends. */
+  tokensPerSecond: number | null;
+}
+
+/**
  * Wire format (both analysis endpoints and chat):
  *   `event: <type>\n` + `data: <json>\n\n`
  * The `data` payload is always the corresponding AgentEvent object.
@@ -791,6 +849,7 @@ export type AgentEvent =
   | { type: 'step'; step: AgentStep }
   | { type: 'progress'; runId: string; done: number; total: number; label: string }
   | { type: 'text'; runId: string | null; delta: string }
+  | { type: 'metrics'; runId: string; metrics: InferenceMetrics }
   | { type: 'tool-call'; runId: string | null; id: string; name: string; args: unknown }
   | { type: 'tool-result'; runId: string | null; id: string; name: string; ok: boolean; summary: string }
   | {
@@ -813,6 +872,7 @@ export const AGENT_EVENT_TYPES: AgentEventType[] = [
   'step',
   'progress',
   'text',
+  'metrics',
   'tool-call',
   'tool-result',
   'entity',
@@ -861,4 +921,9 @@ export interface ApiErrorBody {
 export interface ListResponse<T> {
   items: T[];
   total: number;
+}
+
+/** `GET /api/watchlist` — 列表 + 在池/已退役计数（不受筛选影响）。 */
+export interface WatchlistListResponse extends ListResponse<WatchItem> {
+  counts: { active: number; retired: number };
 }

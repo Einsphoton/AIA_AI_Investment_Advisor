@@ -114,7 +114,9 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     const portfolio = summarizePortfolio(summaries, fx.rates);
 
     /* ── block 2: counts + signals ── */
-    const watchlist = repo.listWatchlist();
+    // 退役标的不计入「我的标的」，但数量单独展示；信号与「最近变化」仍看全部记录。
+    const watchlist = repo.listWatchlist('all');
+    const watchCounts = repo.countWatchlist();
     const advice = repo.listAdvice();
     const pendingAdvice = advice.filter((item) => item.status === 'pending');
     const runs = repo.listRuns();
@@ -123,8 +125,11 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     const counts: DashboardCounts = {
       holdings: openAssets.length,
       instruments: rows.length,
-      watchItems: watchlist.length,
-      newWatchItems: watchlist.filter((item) => now - timestamp(item.createdAt) <= NEW_ITEM_WINDOW_MS).length,
+      watchItems: watchCounts.active,
+      retiredWatchItems: watchCounts.retired,
+      newWatchItems: watchlist.filter(
+        (item) => item.status === 'active' && now - timestamp(item.createdAt) <= NEW_ITEM_WINDOW_MS,
+      ).length,
       pendingAdvice: pendingAdvice.length,
       newAdvice: pendingAdvice.length,
       analysisRuns: runs.length,

@@ -5,7 +5,7 @@
  * timelines, progress and error handling look identical everywhere.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AgentEvent, AgentRunKind, AgentStep, BudgetStatus } from '@aia/shared';
+import type { AgentEvent, AgentRunKind, AgentStep, BudgetStatus, InferenceMetrics } from '@aia/shared';
 import { ApiError } from './client';
 import { streamPost, type StreamHandle } from './sse';
 
@@ -91,6 +91,14 @@ export interface ToolEvent {
   summary?: string;
 }
 
+/** Payload of an SSE `entity` event: one write the agent performed. */
+export interface AgentEntityEvent {
+  action: string;
+  entity: string;
+  id: string;
+  label: string;
+}
+
 export interface AgentStreamState {
   running: boolean;
   runId: string | null;
@@ -100,11 +108,15 @@ export interface AgentStreamState {
   text: string;
   progress: RunProgress | null;
   /** Entities created/updated by the run — useful to trigger a list reload. */
-  entities: { action: string; entity: string; id: string; label: string }[];
+  entities: AgentEntityEvent[];
   /** Tool call/result pairs, in arrival order (chat renders these inline). */
   toolEvents: ToolEvent[];
   /** Latest budget snapshot pushed by a run (advice generation refreshes it). */
   budget: BudgetStatus | null;
+  /** Latest inference metrics of the current stream (per LLM request, in order). */
+  metrics: InferenceMetrics | null;
+  /** Every metrics event of this stream, for whole-session token/cache totals. */
+  metricsEvents: InferenceMetrics[];
   error: string | null;
   finished: { status: 'done' | 'error'; summary: string } | null;
 }
@@ -120,6 +132,8 @@ const INITIAL: AgentStreamState = {
   entities: [],
   toolEvents: [],
   budget: null,
+  metrics: null,
+  metricsEvents: [],
   error: null,
   finished: null,
 };
@@ -130,7 +144,7 @@ export interface AgentStreamApi extends AgentStreamState {
   cancel: () => void;
   reset: () => void;
   /** Called after each entity event (e.g. to reload the current list). */
-  onEntity?: (entity: { action: string; entity: string; id: string; label: string }) => void;
+  onEntity?: (entity: AgentEntityEvent) => void;
 }
 
 export function useAgentStream(onEntity?: AgentStreamApi['onEntity']): AgentStreamApi {
@@ -191,6 +205,9 @@ export function useAgentStream(onEntity?: AgentStreamApi['onEntity']): AgentStre
           break;
         case 'budget':
           apply((p) => ({ ...p, budget: event.budget }));
+          break;
+        case 'metrics':
+          apply((p) => ({ ...p, metrics: event.metrics, metricsEvents: [...p.metricsEvents, event.metrics] }));
           break;
         case 'run-finished':
           apply((p) => ({

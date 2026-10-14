@@ -27,6 +27,7 @@ import {
   DEFAULT_SCHEDULE,
   DEFAULT_TOOL_POLICY,
   DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
+  DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
   MARKET_CURRENCY,
   type AuditEntry,
   type Creator,
@@ -40,7 +41,7 @@ import {
 } from '@aia/shared';
 
 import { badRequest, conflict } from '../errors.js';
-import type { ExportBundle, Repo } from '../types/repo.js';
+import type { ExportBundle, Repo, WatchlistStatusFilter } from '../types/repo.js';
 import type {
   AdviceRow,
   AssetPatch,
@@ -138,6 +139,11 @@ function rowToWatch(row: Row): WatchRow {
     aiSummary: str(row.ai_summary),
     aiSummaryAt: nullableStr(row.ai_summary_at),
     spark: toNumberArray(row.spark),
+    // P3 淘汰机制：老库补列后可能为空，一律退化为「在池」。
+    status: str(row.status, 'active') === 'retired' ? 'retired' : 'active',
+    retiredReason: str(row.retired_reason),
+    retiredAt: nullableStr(row.retired_at),
+    retireStreak: int(row.retire_streak, 0),
     createdAt: str(row.created_at),
     updatedAt: str(row.updated_at),
   };
@@ -255,6 +261,7 @@ function rowToSettings(row: Row): StoredSettings {
     },
     enforceBudget: bool(row.enforce_budget, DEFAULT_ENFORCE_BUDGET),
     watchlistCandidateLimit: int(row.watchlist_candidate_limit, DEFAULT_WATCHLIST_CANDIDATE_LIMIT),
+    watchlistRetireDeleteRuns: int(row.watchlist_retire_delete_runs, DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS),
     lastRunAt: nullableStr(row.last_run_at),
     updatedAt: str(row.updated_at, nowIso()),
   };
@@ -440,9 +447,9 @@ class SqliteRepo implements Repo {
          id, persona, report_style, llm_base_url, llm_api_key, llm_model, llm_temperature, llm_max_tokens,
          llm_fast_model, llm_timeout_ms, llm_context_tokens, data_sources, tool_policy, mcp_servers, budget_cny,
          budget_hkd, budget_usd, enforce_budget,
-         watchlist_candidate_limit, schedule_mode, schedule_interval_minutes, schedule_daily_time,
+         watchlist_candidate_limit, watchlist_retire_delete_runs, schedule_mode, schedule_interval_minutes, schedule_daily_time,
          schedule_run_asset, schedule_run_watchlist, schedule_run_advice, last_run_at, updated_at
-       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
        ON CONFLICT(id) DO NOTHING`,
       DEFAULT_PERSONA,
       DEFAULT_REPORT_STYLE,
@@ -462,6 +469,7 @@ class SqliteRepo implements Repo {
       DEFAULT_BUDGET.US,
       DEFAULT_ENFORCE_BUDGET ? 1 : 0,
       DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
+      DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
       DEFAULT_SCHEDULE.mode,
       DEFAULT_SCHEDULE.intervalMinutes,
       DEFAULT_SCHEDULE.dailyTime,
@@ -489,6 +497,7 @@ class SqliteRepo implements Repo {
       schedule: { ...current.schedule, ...withoutUndefined(patch.schedule) },
       enforceBudget: patch.enforceBudget ?? current.enforceBudget,
       watchlistCandidateLimit: patch.watchlistCandidateLimit ?? current.watchlistCandidateLimit,
+      watchlistRetireDeleteRuns: patch.watchlistRetireDeleteRuns ?? current.watchlistRetireDeleteRuns,
       toolPolicy: mergeToolPolicy(current.toolPolicy, patch.toolPolicy),
       mcpServers: patch.mcpServers !== undefined ? patch.mcpServers : current.mcpServers,
       lastRunAt: patch.lastRunAt !== undefined ? patch.lastRunAt : current.lastRunAt,
@@ -500,7 +509,8 @@ class SqliteRepo implements Repo {
          persona = ?, report_style = ?, llm_base_url = ?, llm_api_key = ?, llm_model = ?, llm_temperature = ?,
          llm_max_tokens = ?, llm_fast_model = ?, llm_timeout_ms = ?, llm_context_tokens = ?, data_sources = ?,
          tool_policy = ?, mcp_servers = ?, budget_cny = ?,
-         budget_hkd = ?, budget_usd = ?, enforce_budget = ?, watchlist_candidate_limit = ?, schedule_mode = ?,
+         budget_hkd = ?, budget_usd = ?, enforce_budget = ?, watchlist_candidate_limit = ?,
+         watchlist_retire_delete_runs = ?, schedule_mode = ?,
          schedule_interval_minutes = ?, schedule_daily_time = ?, schedule_run_asset = ?, schedule_run_watchlist = ?,
          schedule_run_advice = ?, last_run_at = ?, updated_at = ?
        WHERE id = 1`,
@@ -522,6 +532,7 @@ class SqliteRepo implements Repo {
       merged.budget.US,
       merged.enforceBudget ? 1 : 0,
       merged.watchlistCandidateLimit,
+      merged.watchlistRetireDeleteRuns,
       merged.schedule.mode,
       merged.schedule.intervalMinutes,
       merged.schedule.dailyTime,
@@ -672,8 +683,13 @@ class SqliteRepo implements Repo {
 
   /* ── watchlist ─────────────────────────────────────────────────────────── */
 
-  listWatchlist(): WatchRow[] {
-    return this.all('SELECT * FROM watchlist ORDER BY created_at DESC, name ASC').map(rowToWatch);
+  /**
+   * `status` defaults to `'active'`: 已退役的标的不参与建议生成与候选挖掘，
+   * 但在 prompt / 备份 / 仪表盘计数里需要看到它们，那些调用点显式传 `'all'`。
+   */
+  listWatchlist(status: WatchlistStatusFilter = 'active'): WatchRow[] {
+    const where = status === 'all' ? '' : ` WHERE status = '${status === 'retired' ? 'retired' : 'active'}'`;
+    return this.all(`SELECT * FROM watchlist${where} ORDER BY created_at DESC, name ASC`).map(rowToWatch);
   }
 
   getWatchItem(id: string): WatchRow | undefined {
@@ -739,6 +755,10 @@ class SqliteRepo implements Repo {
       ['dayChangePct', 'day_change_pct'],
       ['spark', 'spark'],
       ['source', 'source'],
+      ['status', 'status'],
+      ['retiredReason', 'retired_reason'],
+      ['retiredAt', 'retired_at'],
+      ['retireStreak', 'retire_streak'],
     ];
     const sets: string[] = [];
     const values: unknown[] = [];
@@ -762,6 +782,17 @@ class SqliteRepo implements Repo {
 
   deleteWatchItem(id: string): boolean {
     return this.run('DELETE FROM watchlist WHERE id = ?', id).changes > 0;
+  }
+
+  /** 在池 / 已退役计数（仪表盘用，避免把退役标的算进「我的标的」）。 */
+  countWatchlist(): { active: number; retired: number } {
+    const row = this.get(
+      `SELECT
+         SUM(CASE WHEN status = 'retired' THEN 0 ELSE 1 END) AS active,
+         SUM(CASE WHEN status = 'retired' THEN 1 ELSE 0 END) AS retired
+       FROM watchlist`,
+    );
+    return { active: int(row?.active, 0), retired: int(row?.retired, 0) };
   }
 
   clearWatchlist(): number {
@@ -1082,7 +1113,7 @@ class SqliteRepo implements Repo {
     return {
       assets: this.listAssets(),
       transactions: this.listTransactions(),
-      watchlist: this.listWatchlist(),
+      watchlist: this.listWatchlist('all'),
       advice: this.listAdvice(),
     };
   }
@@ -1198,6 +1229,11 @@ class SqliteRepo implements Repo {
       dayChangePct: row.dayChangePct,
       spark: row.spark,
       source: row.source,
+      // P3：退役状态必须随备份/恢复一起往返，否则恢复后会被当成在池标的。
+      status: row.status,
+      retiredReason: row.retiredReason,
+      retiredAt: row.retiredAt,
+      retireStreak: row.retireStreak,
     });
     this.run('UPDATE watchlist SET updated_at = ? WHERE id = ?', row.updatedAt ?? nowIso(), row.id);
   }

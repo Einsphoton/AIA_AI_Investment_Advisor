@@ -108,6 +108,8 @@ const settingsInputSchema = z.object({
     .optional(),
   enforceBudget: z.boolean().optional(),
   watchlistCandidateLimit: z.number().int().min(0).max(100).optional(),
+  /** P3：连续确认退役多少次后才真正删除标的；0 = 只标记不删除。 */
+  watchlistRetireDeleteRuns: z.number().int().min(0).max(50).optional(),
   // P1-1: partial anywhere (repo.saveSettings merges both objects), so the UI
   // can flip `requireWriteApproval` without echoing the whole deny list.
   toolPolicy: z
@@ -167,6 +169,7 @@ export function toSettingsDto(stored: StoredSettings): Settings {
     schedule: stored.schedule,
     enforceBudget: stored.enforceBudget,
     watchlistCandidateLimit: stored.watchlistCandidateLimit,
+    watchlistRetireDeleteRuns: stored.watchlistRetireDeleteRuns,
     toolPolicy: stored.toolPolicy,
     mcpServers: stored.mcpServers.map((server) => ({
       ...server,
@@ -397,6 +400,7 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     if (body.reportStyle !== undefined) patch.reportStyle = body.reportStyle;
     if (body.enforceBudget !== undefined) patch.enforceBudget = body.enforceBudget;
     if (body.watchlistCandidateLimit !== undefined) patch.watchlistCandidateLimit = body.watchlistCandidateLimit;
+    if (body.watchlistRetireDeleteRuns !== undefined) patch.watchlistRetireDeleteRuns = body.watchlistRetireDeleteRuns;
     if (body.budget !== undefined) patch.budget = { ...stripUndefined(body.budget) } as StoredSettings['budget'];
     if (body.schedule !== undefined) patch.schedule = { ...stripUndefined(body.schedule) } as StoredSettings['schedule'];
     if (body.dataSources !== undefined) {

@@ -234,6 +234,10 @@ export function toWatchItem(row: WatchRow): WatchItem {
     thesis: row.thesis ?? '',
     spark: Array.isArray(row.spark) ? row.spark : [],
     createdAt: row.createdAt,
+    status: row.status === 'retired' ? 'retired' : 'active',
+    retiredReason: row.retiredReason ?? '',
+    retiredAt: row.retiredAt ?? null,
+    retireStreak: Number.isFinite(row.retireStreak) ? row.retireStreak : 0,
   };
 }
 

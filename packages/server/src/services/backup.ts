@@ -94,6 +94,7 @@ export function settingsForBackup(stored: StoredSettings): NonNullable<BackupPay
     schedule: stored.schedule,
     enforceBudget: stored.enforceBudget,
     watchlistCandidateLimit: stored.watchlistCandidateLimit,
+    watchlistRetireDeleteRuns: stored.watchlistRetireDeleteRuns,
     toolPolicy: stored.toolPolicy,
     // MCP `env` often carries tokens: keep the server list, drop the values.
     mcpServers: stored.mcpServers.map((server) => ({
@@ -243,6 +244,11 @@ export function toExportBundle(payload: BackupPayload, fallbackUpdatedAt = nowIs
       aiSummary: String(item.aiSummary ?? ''),
       aiSummaryAt: (item.aiSummaryAt as string | null) ?? null,
       spark: Array.isArray(item.spark) ? item.spark.map((n) => toNumber(n)) : [],
+      // P3：退役状态随备份往返（缺失时退化为在池）。
+      status: String(item.status ?? 'active') === 'retired' ? 'retired' : 'active',
+      retiredReason: String(item.retiredReason ?? ''),
+      retiredAt: (item.retiredAt as string | null) ?? null,
+      retireStreak: Math.max(0, Math.trunc(toNumber(item.retireStreak))),
       createdAt,
       updatedAt: createdAt,
     });
@@ -309,6 +315,9 @@ function applyImportedSettings(repo: Repo, payload: BackupPayload): void {
     if (typeof imported.enforceBudget === 'boolean') patch.enforceBudget = imported.enforceBudget;
     if (typeof imported.watchlistCandidateLimit === 'number') {
       patch.watchlistCandidateLimit = imported.watchlistCandidateLimit;
+    }
+    if (typeof imported.watchlistRetireDeleteRuns === 'number') {
+      patch.watchlistRetireDeleteRuns = imported.watchlistRetireDeleteRuns;
     }
     if (isRecord(imported.llm)) {
       const llm = imported.llm as Omit<LlmConfig, 'apiKey'>;

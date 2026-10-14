@@ -20,10 +20,10 @@ import type {
   ToolRisk,
 } from '@aia/shared';
 import { api } from '../api/client';
-import { toApiError, useAgentStream, useAsync } from '../api/hooks';
+import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
+import { useAsync } from '../api/hooks';
 import { fmtDateTime, fmtNum } from '../format';
-import { Alert, Badge, Button, Card, Dropdown, Empty, ErrorAlert, KV, Loading, Modal, useToast } from '../components/ui';
-import { RunPanel } from '../components/RunPanel';
+import { Alert, Badge, Button, Card, Dropdown, Empty, ErrorAlert, KV, Loading, Modal } from '../components/ui';
 
 /* ──────────────────────────────── shared bits ─────────────────────────────── */
 
@@ -343,14 +343,13 @@ function TraceModal({ run, onClose }: { run: AgentRunSummary; onClose: () => voi
 /* ─────────────────────────────────── page ─────────────────────────────────── */
 
 export function ActivityPage() {
-  const toast = useToast();
   const [kind, setKind] = useState('');
   const runs = useAsync(() => api.agent.runs(50, kind || undefined), [kind]);
   const audit = useAsync(() => api.agent.audit({ limit: 50 }), []);
-  const stream = useAgentStream();
-  const [resumeRun, setResumeRun] = useState<AgentRunSummary | null>(null);
   const [traceRun, setTraceRun] = useState<AgentRunSummary | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // 续跑的推理过程同样显示在右下角全局面板里；运行结束后刷新运行列表与审计。
+  const { run: startRun, running } = useAgentActivity();
 
   const items = runs.data ?? [];
 
@@ -359,18 +358,14 @@ export function ActivityPage() {
     audit.reload();
   }
 
-  async function resume(run: AgentRunSummary) {
-    setResumeRun(run);
+  useAgentRefresh(() => {
+    setBusyId(null);
+    refreshAll();
+  });
+
+  function resume(run: AgentRunSummary) {
     setBusyId(run.id);
-    try {
-      await stream.start(`/agent/runs/${encodeURIComponent(run.id)}/resume`);
-      toast.success('续跑已结束');
-    } catch (error) {
-      toast.error('续跑失败', toApiError(error).message);
-    } finally {
-      setBusyId(null);
-      refreshAll();
-    }
+    startRun({ path: `/agent/runs/${encodeURIComponent(run.id)}/resume`, title: `续跑 · ${run.title || run.id.slice(0, 8)}` });
   }
 
   return (
@@ -444,10 +439,16 @@ export function ActivityPage() {
                         <Button
                           size="sm"
                           variant="primary"
-                          disabled={run.status === 'done'}
+                          disabled={run.status === 'done' || running}
                           loading={busyId === run.id}
-                          title={run.status === 'done' ? '已完成的运行无需续跑' : '从中断处继续执行'}
-                          onClick={() => void resume(run)}
+                          title={
+                            run.status === 'done'
+                              ? '已完成的运行无需续跑'
+                              : running
+                                ? '已有 AI 流水线正在运行（见右下角面板）'
+                                : '从中断处继续执行'
+                          }
+                          onClick={() => resume(run)}
                         >
                           续跑
                         </Button>
@@ -460,26 +461,6 @@ export function ActivityPage() {
           </div>
         )}
       </Card>
-
-      {resumeRun && (
-        <Card
-          title={`续跑 · ${resumeRun.title || resumeRun.id.slice(0, 8)}`}
-          actions={
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                stream.reset();
-                setResumeRun(null);
-              }}
-            >
-              收起
-            </Button>
-          }
-        >
-          <RunPanel stream={stream} title={resumeRun.title || '续跑运行'} />
-        </Card>
-      )}
 
       <Card
         title="写入审计"

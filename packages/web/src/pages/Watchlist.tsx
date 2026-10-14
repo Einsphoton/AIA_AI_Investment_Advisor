@@ -2,7 +2,7 @@
  * WatchlistPage — owner: web-ai-pages.
  * 我的标的：筛选/排序、添加、清空、AI 标的分析（SSE）与详情浮窗。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   INSTRUMENT_TYPES,
@@ -13,7 +13,8 @@ import {
 } from '@aia/shared';
 import type { Creator, InstrumentType, Market, WatchItem } from '@aia/shared';
 import { api } from '../api/client';
-import { toApiError, useAgentStream, useAsync, useDebounced } from '../api/hooks';
+import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
+import { toApiError, useAsync, useDebounced } from '../api/hooks';
 import { fmtDate, fmtNum, fmtPct, fmtPrice, fmtSignedMoney, pnlClass } from '../format';
 import {
   Alert,
@@ -30,7 +31,6 @@ import {
   SortHeader,
   useToast,
 } from '../components/ui';
-import { RunPanel } from '../components/RunPanel';
 import { Sparkline } from '../components/charts/Sparkline';
 import { WatchlistDetailDialog } from './WatchlistDetailDialog';
 import { AddWatchItemDialog } from './WatchlistAddDialog';
@@ -38,12 +38,15 @@ import { AddWatchItemDialog } from './WatchlistAddDialog';
 type MarketFilter = 'all' | Market;
 type TypeFilter = 'all' | InstrumentType;
 type SourceFilter = 'all' | Creator;
+/** P3：在池（默认）/ 已退役 / 全部。 */
+type StatusFilter = 'active' | 'retired' | 'all';
 
 export function WatchlistPage() {
   const toast = useToast();
   const [market, setMarket] = useState<MarketFilter>('all');
   const [type, setType] = useState<TypeFilter>('all');
   const [source, setSource] = useState<SourceFilter>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('active');
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState('changeSinceAdded');
   const [dir, setDir] = useState<'asc' | 'desc'>('desc');
@@ -54,6 +57,7 @@ export function WatchlistPage() {
   const [clearing, setClearing] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WatchItem | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
 
   const debouncedQuery = useDebounced(query, 350);
   const list = useAsync(
@@ -62,33 +66,28 @@ export function WatchlistPage() {
         market: market === 'all' ? undefined : market,
         type: type === 'all' ? undefined : type,
         source: source === 'all' ? undefined : source,
+        status: statusFilter,
         q: debouncedQuery.trim() || undefined,
         sort,
         dir,
       }),
-    [market, type, source, debouncedQuery, sort, dir, nonce],
+    [market, type, source, statusFilter, debouncedQuery, sort, dir, nonce],
   );
   const lastRun = useAsync(() => api.watchlist.lastAnalysis(), [nonce]);
   // 清空按钮面向全部标的（不受当前筛选影响），因此单独取一次未筛选的总数
-  const allItems = useAsync(() => api.watchlist.list({}), [nonce]);
+  const allItems = useAsync(() => api.watchlist.list({ status: 'all' }), [nonce]);
   const settings = useAsync(() => api.settings.get(), []);
   const llmMissing = settings.data !== null && !settings.data.hasApiKey;
 
-  const stream = useAgentStream((event) => {
-    if (event.entity === 'watchlist') setNonce((value) => value + 1);
-  });
-
-  const wasRunning = useRef(false);
-  useEffect(() => {
-    if (wasRunning.current && !stream.running) setNonce((value) => value + 1);
-    wasRunning.current = stream.running;
-  }, [stream.running]);
+  // 标的写回或运行结束时刷新列表与「最近分析」时间；
+  // 推理过程与「新建/更新 N 个标的」结论统一显示在右下角全局面板里。
+  const { run, running } = useAgentActivity();
+  useAgentRefresh(() => setNonce((value) => value + 1));
 
   const items = list.data?.items ?? [];
   const total = list.data?.total ?? items.length;
+  const counts = list.data?.counts ?? allItems.data?.counts ?? { active: total, retired: 0 };
   const clearCount = allItems.data?.total ?? total;
-  const createdCount = stream.entities.filter((entity) => entity.entity === 'watchlist' && entity.action === 'created').length;
-  const updatedCount = stream.entities.filter((entity) => entity.entity === 'watchlist' && entity.action === 'updated').length;
   const filtering = market !== 'all' || type !== 'all' || source !== 'all' || query.trim().length > 0;
 
   function onSort(field: string) {
@@ -115,6 +114,20 @@ export function WatchlistPage() {
     }
   }
 
+  /** P3 复活：清空退役标记与累计次数，回到候选池。 */
+  async function restoreItem(item: WatchItem) {
+    setRestoringId(item.id);
+    try {
+      await api.watchlist.restore(item.id);
+      toast.success('已复活该标的', `${item.name || item.code} 回到候选池，累计退役次数已清零`);
+      setNonce((value) => value + 1);
+    } catch (error) {
+      toast.error('复活失败', toApiError(error).message);
+    } finally {
+      setRestoringId(null);
+    }
+  }
+
   async function clearAll() {
     setClearing(true);
     try {
@@ -136,7 +149,8 @@ export function WatchlistPage() {
         title={
           <span className="center gap-2">
             我的标的
-            <Badge>{total} 个</Badge>
+            <Badge>{counts.active} 个在池</Badge>
+            {counts.retired > 0 && <Badge tone="warn">{counts.retired} 个已退役</Badge>}
             {lastRun.data && <span className="tiny mute">最近分析 {fmtDate(lastRun.data.startedAt)}</span>}
           </span>
         }
@@ -145,8 +159,8 @@ export function WatchlistPage() {
             <Button onClick={() => setAddOpen(true)}>添加标的</Button>
             <Button
               variant="primary"
-              loading={stream.running}
-              onClick={() => void stream.start('/watchlist/analyze')}
+              loading={running}
+              onClick={() => run({ path: '/watchlist/analyze', title: 'AI 标的分析' })}
             >
               AI 标的分析
             </Button>
@@ -157,6 +171,15 @@ export function WatchlistPage() {
         }
       >
         <div className="toolbar mb-3">
+            <Segmented
+              value={statusFilter}
+              onChange={setStatusFilter}
+              options={[
+                { value: 'active', label: `在池（${counts.active}）` },
+                { value: 'retired', label: `已退役（${counts.retired}）` },
+                { value: 'all', label: '全部' },
+              ]}
+            />
             <Segmented
               value={market}
               onChange={setMarket}
@@ -194,6 +217,7 @@ export function WatchlistPage() {
                   setMarket('all');
                   setType('all');
                   setSource('all');
+                  setStatusFilter('active');
                   setQuery('');
                 }}
               >
@@ -203,7 +227,10 @@ export function WatchlistPage() {
           </div>
 
           <div className="tiny mute mb-2">
-            「AI 标的分析」会按当前投资性格搜索候选标的、逐个深度分析，并创建 / 更新「我的标的」。
+            「AI 标的分析」会按当前投资性格搜索候选、深度分析并创建 / 更新标的；同时复核既有标的，
+            把不再适合继续跟踪的标记为<strong>已退役</strong>
+            {settings.data ? `（连续 ${settings.data.watchlistRetireDeleteRuns} 次确认后才会自动移除；0 = 只标记不删除）` : ''}。
+            <strong>有持仓的标的不进入淘汰流程</strong>，不会因为排名落后而被移出。
           </div>
 
           {llmMissing && (
@@ -220,14 +247,26 @@ export function WatchlistPage() {
 
           {!list.loading && items.length === 0 && (
             <Empty
-              title={filtering ? '没有符合条件的标的' : '还没有任何标的'}
-              hint={filtering ? '试试放宽筛选条件或清空搜索关键词。' : '手动添加，或点击「AI 标的分析」让 Agent 按你的投资性格挖掘候选。'}
+              title={
+                statusFilter === 'retired'
+                  ? '没有已退役的标的'
+                  : filtering
+                    ? '没有符合条件的标的'
+                    : '还没有任何标的'
+              }
+              hint={
+                statusFilter === 'retired'
+                  ? 'AI 判定「不再适合继续跟踪」的标的会出现在这里：可查看退役原因、复活，或直接删除。'
+                  : filtering
+                    ? '试试放宽筛选条件或清空搜索关键词。'
+                    : '手动添加，或点击「AI 标的分析」让 Agent 按你的投资性格挖掘候选。'
+              }
               action={
                 <div className="toolbar">
                   <Button size="sm" onClick={() => setAddOpen(true)}>
                     添加标的
                   </Button>
-                  <Button size="sm" variant="primary" onClick={() => void stream.start('/watchlist/analyze')}>
+                  <Button size="sm" variant="primary" onClick={() => run({ path: '/watchlist/analyze', title: 'AI 标的分析' })}>
                     AI 标的分析
                   </Button>
                 </div>
@@ -258,7 +297,15 @@ export function WatchlistPage() {
                     return (
                       <tr key={item.id}>
                         <td>
-                          <div className="strong">{item.name || item.code}</div>
+                          <div className="strong">
+                            {item.name || item.code}
+                            {item.status === 'retired' && <Badge tone="warn">已退役</Badge>}
+                          </div>
+                          {item.status === 'retired' && item.retiredReason && (
+                            <div className="tiny warn-text truncate" style={{ maxWidth: 220 }} title={item.retiredReason}>
+                              {item.retiredReason}
+                            </div>
+                          )}
                           {item.note && <div className="tiny mute truncate" style={{ maxWidth: 200 }}>{item.note}</div>}
                         </td>
                         <td className="mono tiny">{item.code}</td>
@@ -292,6 +339,17 @@ export function WatchlistPage() {
                             <Button size="sm" variant="ghost" onClick={() => setDetailId(item.id)}>
                               查看详情
                             </Button>
+                            {item.status === 'retired' && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                loading={restoringId === item.id}
+                                title="清空退役标记与累计次数，回到候选池"
+                                onClick={() => void restoreItem(item)}
+                              >
+                                复活
+                              </Button>
+                            )}
                             <Button size="sm" variant="ghost" onClick={() => setDeleteTarget(item)}>
                               删除
                             </Button>
@@ -305,15 +363,6 @@ export function WatchlistPage() {
             </div>
           )}
         </Card>
-
-      <RunPanel stream={stream} title="AI 标的分析" />
-
-      {!stream.running && stream.finished && (
-        <Alert tone={stream.finished.status === 'error' ? 'error' : 'info'}>
-          本次运行结束（{stream.finished.status === 'error' ? '失败' : '成功'}）：新建 {createdCount} 个标的、更新 {updatedCount} 个标的。
-          {stream.finished.summary && <div className="tiny mt-1">{stream.finished.summary}</div>}
-        </Alert>
-      )}
 
       <AddWatchItemDialog
         open={addOpen}

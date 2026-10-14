@@ -9,11 +9,12 @@ import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
-import type { ListResponse, WatchItem, WatchlistDetail } from '@aia/shared';
+import type { WatchItem, WatchlistDetail, WatchlistListResponse } from '@aia/shared';
 
 import { conflict, notFound } from '../errors.js';
 import { getRepo } from '../registry.js';
 import type { WatchRow } from '../types/models.js';
+import type { WatchlistStatusFilter } from '../types/repo.js';
 import {
   loadMarketBridge,
   matchesQuery,
@@ -73,8 +74,12 @@ function watchSortValue(item: WatchItem, sort: string | undefined): unknown {
 export async function registerWatchlistRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/watchlist', async (request) => {
     const query = parseListQuery(request.query);
-    const items = getRepo()
-      .listWatchlist()
+    const repo = getRepo();
+    // P3：默认只看在池标的；`status=retired|all` 用于复盘与全量查看。
+    const rawStatus = (request.query as Record<string, unknown>).status;
+    const status: WatchlistStatusFilter = rawStatus === 'retired' || rawStatus === 'all' ? rawStatus : 'active';
+    const items = repo
+      .listWatchlist(status)
       .map(toWatchItem)
       .filter(
         (item) =>
@@ -84,7 +89,11 @@ export async function registerWatchlistRoutes(app: FastifyInstance): Promise<voi
           matchesQuery(query.q, item.name, item.code, item.note, item.thesis),
       );
     const sorted = sortItems(items, (item) => watchSortValue(item, query.sort), sortDirection(query.dir));
-    const response: ListResponse<WatchItem> = { items: sorted, total: sorted.length };
+    const response: WatchlistListResponse = {
+      items: sorted,
+      total: sorted.length,
+      counts: repo.countWatchlist(),
+    };
     return response;
   });
 
@@ -166,5 +175,24 @@ export async function registerWatchlistRoutes(app: FastifyInstance): Promise<voi
     requireWatchItem(id);
     getRepo().deleteWatchItem(id);
     return { ok: true };
+  });
+
+  /**
+   * P3 复活：清空退役标记与累计次数。
+   *
+   * 两个场景：AI 判断有误（用户重新看好），或该标的重新进入候选池。
+   * 有持仓的标的不会进入淘汰流程，因此这里的复活只影响候选状态。
+   */
+  app.post('/api/watchlist/:id/restore', async (request) => {
+    const { id } = request.params as { id: string };
+    requireWatchItem(id);
+    const updated = getRepo().updateWatchItem(id, {
+      status: 'active',
+      retiredReason: '',
+      retiredAt: null,
+      retireStreak: 0,
+    });
+    if (!updated) throw notFound(`标的不存在：${id}`);
+    return toWatchItem(updated);
   });
 }

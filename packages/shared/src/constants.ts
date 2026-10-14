@@ -923,6 +923,11 @@ export const DEFAULT_SCHEDULE: ScheduleConfig = {
 export const DEFAULT_PERSONA: Persona = 'balanced';
 export const DEFAULT_REPORT_STYLE: ReportStyle = 'professional';
 export const DEFAULT_WATCHLIST_CANDIDATE_LIMIT = 5;
+/**
+ * 自选标的淘汰阈值：连续多少次分析仍被 AI 标记退役后，才由流水线真正删除。
+ * 0 = 只标记不删除（永不自动清理）。持仓 / 人工录入 / 有待处理建议的标的不受此值影响。
+ */
+export const DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS = 3;
 export const DEFAULT_ENFORCE_BUDGET = true;
 
 /**

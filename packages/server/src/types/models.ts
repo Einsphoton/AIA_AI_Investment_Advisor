@@ -25,6 +25,7 @@ import type {
   DataSourceConfig,
   McpServerConfig,
   PendingWriteStatus,
+  WatchItemStatus,
 } from '@aia/shared';
 
 export interface StoredSettings {
@@ -36,6 +37,8 @@ export interface StoredSettings {
   schedule: ScheduleConfig;
   enforceBudget: boolean;
   watchlistCandidateLimit: number;
+  /** P3 淘汰机制：连续 N 次分析仍被标记退役才真正删除；0 = 永不删除。 */
+  watchlistRetireDeleteRuns: number;
   /** P1-1: tool authorisation policy (deny list + write approval mode). */
   toolPolicy: ToolPolicy;
   /** P1-2: configured MCP servers. */
@@ -145,6 +148,11 @@ export interface WatchRow {
   aiSummary: string;
   aiSummaryAt: string | null;
   spark: number[];
+  /** P3 淘汰机制：'active'（在池）| 'retired'（AI 判定不适合）。 */
+  status: WatchItemStatus;
+  retiredReason: string;
+  retiredAt: string | null;
+  retireStreak: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -340,4 +348,9 @@ export interface WatchPatch {
   dayChangePct?: number;
   spark?: number[];
   source?: Creator;
+  /** P3 淘汰机制字段（仅工具/流水线与 restore 接口写入）。 */
+  status?: WatchItemStatus;
+  retiredReason?: string;
+  retiredAt?: string | null;
+  retireStreak?: number;
 }

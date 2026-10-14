@@ -28,6 +28,7 @@ export const SCHEMA_STATEMENTS: string[] = [
      budget_usd REAL NOT NULL DEFAULT 0,
      enforce_budget INTEGER NOT NULL DEFAULT 1,
      watchlist_candidate_limit INTEGER NOT NULL DEFAULT 5,
+     watchlist_retire_delete_runs INTEGER NOT NULL DEFAULT 3,
      schedule_mode TEXT NOT NULL DEFAULT 'off',
      schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
      schedule_daily_time TEXT NOT NULL DEFAULT '08:30',
@@ -99,6 +100,10 @@ export const SCHEMA_STATEMENTS: string[] = [
      ai_summary TEXT NOT NULL DEFAULT '',
      ai_summary_at TEXT,
      spark TEXT NOT NULL DEFAULT '[]',
+     status TEXT NOT NULL DEFAULT 'active',
+     retired_reason TEXT NOT NULL DEFAULT '',
+     retired_at TEXT,
+     retire_streak INTEGER NOT NULL DEFAULT 0,
      created_at TEXT NOT NULL,
      updated_at TEXT NOT NULL,
      UNIQUE (code, market, type)
@@ -255,6 +260,12 @@ export function migrateSchema(db: DatabaseSync): void {
   ensureColumn(db, 'settings', 'llm_context_tokens', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'settings', 'tool_policy', "TEXT NOT NULL DEFAULT '{}'");
   ensureColumn(db, 'settings', 'mcp_servers', "TEXT NOT NULL DEFAULT '[]'");
+  // P3 淘汰机制：退役状态 + 连续退役次数（老库补列，默认在池/0 次）。
+  ensureColumn(db, 'watchlist', 'status', "TEXT NOT NULL DEFAULT 'active'");
+  ensureColumn(db, 'watchlist', 'retired_reason', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, 'watchlist', 'retired_at', 'TEXT');
+  ensureColumn(db, 'watchlist', 'retire_streak', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'settings', 'watchlist_retire_delete_runs', 'INTEGER NOT NULL DEFAULT 3');
 
   for (const statement of INDEX_STATEMENTS) db.exec(statement);
 }

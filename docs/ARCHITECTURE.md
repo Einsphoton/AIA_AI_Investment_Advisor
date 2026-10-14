@@ -51,8 +51,8 @@ AIInvestmentAdvisor/
     ├── test/render.test.tsx    # 无头渲染冒烟（renderToString）
     └── src/
         ├── main.tsx App.tsx styles.css format.ts
-        ├── api/{client.ts,sse.ts,hooks.ts}
-        ├── components/{Layout.tsx,ui.tsx,RunPanel.tsx,InstrumentDetailSections.tsx,charts/*}
+        ├── api/{client.ts,sse.ts,hooks.ts,agentActivity.tsx,agentMetrics.ts}
+        ├── components/{Layout.tsx,ui.tsx,AgentActivityDock.tsx,RunTimeline.tsx,InstrumentDetailSections.tsx,charts/*}
         └── pages/{Dashboard,Assets,Watchlist,Advice,Chat,Settings}.tsx + 各页面子组件
 ```
 
@@ -153,13 +153,15 @@ run(session, systemPrompt, userGoal)
 | `fetch_url` | 抓取指定网页正文并抽取文本 |
 | `get_news` | 按关键词检索财经资讯 |
 | `list_assets` / `get_asset` | 读取用户持仓与交易记录 |
-| `list_watchlist` | 读取自选标的 |
+| `list_watchlist` | 读取自选标的（含 `status` / `retiredReason` / `retireStreak`，默认返回全部） |
 | `save_asset_analysis` | 写回 `assets.ai_summary` |
-| `upsert_watch_item` | 新建/更新标的（优质评估、目标价、预期收益、分析总结） |
+| `upsert_watch_item` | 新建/更新标的（优质评估、目标价、预期收益、分析总结）；更新退役标的会自动复活 |
+| `retire_watch_item` | **软淘汰**：标记不再适合继续跟踪的标的，写回原因并累计 `retireStreak`（有持仓时直接拒绝） |
 | `create_advice` | 生成买入/卖出建议（受预算约束） |
 | `save_dashboard_briefing` | 写回 Dashboard 的 AI 简报 |
 | `get_budget` | 查询当月预算剩余 |
-| `get_settings_profile` | 读取投资性格/报告风格，用于调整分析口径 |
+| `get_settings_profile` | 读取投资性格/报告风格与淘汰阈值，用于调整分析口径 |
+| `delete_watch_item` | **系统工具（`systemOnly`，不发给模型）**：按淘汰规则真正删除已退役标的 |
 
 ### 4.3 三条流水线（对应 UI 按钮）
 
@@ -168,6 +170,40 @@ run(session, systemPrompt, userGoal)
 3. **AI 投资建议**（`POST /api/advice/generate`）：先跑 1 与 2 → 结合持仓、预算、性格 → 生成买/卖建议（`create_advice`）→ 写入 `advice` 表，`status=pending`。
 
 三条流水线共用同一个 Loop 与工具集，仅系统提示词与目标不同；调度器（interval/daily）复用 `POST /api/agent/run-now`。
+
+### 4.3.2 自选标的淘汰（P3：软标记 → 计数 → 删除）
+
+「我的标的」不再只增不减。模型只负责**判断**，清理由代码按规则执行：
+
+| 阶段 | 执行者 | 行为 |
+| --- | --- | --- |
+| 软淘汰 | 模型（`retire_watch_item`） | 写入 `status='retired'` + `retiredReason`，并把 `retireStreak + 1`（每次分析确认一次） |
+| 复活 | 模型（`upsert_watch_item`）/ 用户（`POST /api/watchlist/:id/restore`） | 清空退役状态与次数；**退役后又买入**的标的在下次分析时自动复活 |
+| 清理 | 流水线（`sweepRetiredWatchItems`，确定性） | `retireStreak >= settings.watchlistRetireDeleteRuns`（默认 3，0 = 只标记）时经 `delete_watch_item` 删除 |
+
+护栏（任一命中即**永不自动删除**）：
+
+- **有持仓**（净份额 > 0）：淘汰只作用于候选池。用户可能持续加仓，`retire_watch_item` 直接拒绝，
+  `delete_watch_item` 也会二次兜底；买入后该标的自动回到在池状态。
+- `source === 'manual'`：人工录入的标的需要用户自己清理。
+- 存在 `status='pending'` 的建议引用它：等建议处理完再清理。
+
+系统工具 `delete_watch_item` 标记为 `systemOnly`：不出现在发给模型的工具表里（`llmToolSchemas` 过滤），
+但 `executeTool` 仍可执行，因此 `toolPolicy.deny`、写入审批（挂起为 `pending_writes`）与审计全部照常生效。
+
+
+### 4.3.1 前端推理面板（全局 · 不随路由卸载）
+
+四类 AI 入口（Dashboard「AI一键分析」、资产分析、标的分析、投资建议）与活动页「续跑」**不再**
+在页面内联渲染推理过程，而是共用 `api/agentActivity.tsx` 提供的全局 Provider：
+
+- Provider 位于 `<Routes>` **之外**（`App.tsx`），因此切换页面不会卸载 SSE 流，推理继续、面板不消失；
+- 面板 `components/AgentActivityDock.tsx` 固定在右下角，可**收起**为一条状态小条（收起状态存 `localStorage`）；
+- 面板内的指标来自 `metrics` 事件（每个 LLM 请求两条：`first-token` / `done`）：
+  **首字延迟 TTFT**、**生成速度 tok/s**、**Token 用量（入/出）**、**KV Cache 命中率**，以及轮次、请求数、
+  已运行时长、模型名与「本次写入了什么」汇总；纯计算与格式化在 `api/agentMetrics.ts`（有单测）。
+- 页面只通过 `useAgentRefresh(reload)` 订阅「写入事件 + 运行结束」来刷新自己的列表，
+  不再各自持有流；`/chat` 保持内联（对话答复本身就是页面内容）。
 
 ### 4.4 Harness 治理能力（P0/P1）
 

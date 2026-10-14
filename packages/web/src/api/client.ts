@@ -41,6 +41,7 @@ import type {
   UpdateWatchItemInput,
   WatchItem,
   WatchlistDetail,
+  WatchlistListResponse,
 } from '@aia/shared';
 
 export class ApiError extends Error {
@@ -123,6 +124,8 @@ export interface AssetListQuery {
 
 export interface WatchlistQuery extends AssetListQuery {
   group?: 'market' | 'type' | 'none';
+  /** P3：在池 / 已退役 / 全部（默认 active）。 */
+  status?: 'active' | 'retired' | 'all';
 }
 
 export const api = {
@@ -178,12 +181,14 @@ export const api = {
 
   /* ── watchlist ────────────────────────────────────────────────────────── */
   watchlist: {
-    list: (query: WatchlistQuery = {}) => request<{ items: WatchItem[]; total: number }>(`/watchlist${qs(query)}`),
+    list: (query: WatchlistQuery = {}) => request<WatchlistListResponse>(`/watchlist${qs(query)}`),
     create: (input: CreateWatchItemInput) => request<WatchItem>('/watchlist', json(input)),
     get: (id: string) => request<WatchlistDetail>(`/watchlist/${encodeURIComponent(id)}`),
     update: (id: string, input: UpdateWatchItemInput) => request<WatchItem>(`/watchlist/${encodeURIComponent(id)}`, patchBody(input)),
     remove: (id: string) => request<{ ok: boolean }>(`/watchlist/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     clear: () => request<{ ok: boolean; deleted: number }>('/watchlist', { method: 'DELETE' }),
+    /** P3 复活：清空退役标记与累计次数。 */
+    restore: (id: string) => request<WatchItem>(`/watchlist/${encodeURIComponent(id)}/restore`, json({})),
     lastAnalysis: () => request<AgentRunSummary | null>('/watchlist/analyze/last'),
   },
 

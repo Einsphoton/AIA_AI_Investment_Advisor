@@ -20,10 +20,19 @@
 ### SSE 事件序列（所有 AI 接口一致）
 
 ```
-run-started  → ( step | progress | text | tool-call | tool-result | entity | budget )*  →  run-finished  →  done
+run-started  → ( step | progress | text | metrics | tool-call | tool-result | entity | budget )*  →  run-finished  →  done
 ```
 
 任何阶段都可能插入 `error`；客户端必须容忍未知事件类型。
+
+> `metrics` 事件携带**单次 LLM 请求**的推理指标（`InferenceMetrics`）：每个 agent 轮次发两条
+> —— 首个 token 到达时 `phase='first-token'`（此时只有 `ttftMs`），请求结束时 `phase='done'`
+> （`promptTokens` / `completionTokens` / `cachedTokens` / `tokensPerSecond` / `latencyMs` 齐备）。
+> 计数口径是「单次请求」而不是累计值，整条流水线的合计由客户端把收到的 `done` 事件相加得到。
+> `cachedTokens`（KV / prompt cache 命中）同时兼容三种厂商口径：
+> OpenCode/OpenAI 的 `prompt_tokens_details.cached_tokens`、DeepSeek 的 `prompt_cache_hit_tokens`、
+> Anthropic 风格的 `cache_read_input_tokens`；并已钳制到不超过 `promptTokens`。
+> 前端把这些指标渲染在右下角可收起的全局推理面板里（`AgentActivityDock`）。
 
 > `POST /api/advice/generate` 与 `POST /api/agent/run-now` 会在**同一条流**里顺序跑三条流水线
 > （资产分析 → 标的分析 → 建议生成），因此流内会出现**多组** `run-started … run-finished`，
@@ -94,14 +103,31 @@ run-started  → ( step | progress | text | tool-call | tool-result | entity | b
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/watchlist` | `ListResponse<WatchItem>`，支持筛选/排序/搜索 |
+| GET | `/api/watchlist` | `WatchlistListResponse`（`{ items, total, counts: { active, retired } }`），支持筛选/排序/搜索；`?status=active\|retired\|all`，**默认 `active`** |
 | POST | `/api/watchlist` | 入参 `CreateWatchItemInput`；自动补全名称并记录 `initialPrice` |
 | GET | `/api/watchlist/:id` | `WatchlistDetail`（持仓信息、交易记录、分红） |
 | PATCH | `/api/watchlist/:id` | 入参 `UpdateWatchItemInput`（备注/优质评估/目标价/预期收益/逻辑） |
-| DELETE | `/api/watchlist/:id` | `{ ok: true }` |
+| DELETE | `/api/watchlist/:id` | `{ ok: true }`（用户手动删除不受淘汰护栏限制） |
 | DELETE | `/api/watchlist` | **清空标的** → `{ ok: true, deleted: number }` |
-| POST | `/api/watchlist/analyze` | **AI 标的分析**（SSE）：按投资性格搜索/筛选/创建新标的，并更新既有标的（优质评估、目标价、预期收益、AI 分析总结） |
+| POST | `/api/watchlist/:id/restore` | **复活**：清空 `status/retiredReason/retiredAt/retireStreak` → `WatchItem` |
+| POST | `/api/watchlist/analyze` | **AI 标的分析**（SSE）：按投资性格搜索/筛选/创建新标的，更新既有标的，并复核淘汰（见 §5.1） |
 | GET | `/api/watchlist/analyze/last` | 最近一次标的分析运行 `AgentRunSummary \| null` |
+
+### 5.1 自选标的淘汰（P3）
+
+`WatchItem` 增加了四个字段：`status`（`active` 在池 / `retired` 已退役）、`retiredReason`、
+`retiredAt`、`retireStreak`（连续被确认退役的次数）。
+
+- Agent 通过 `retire_watch_item` **软淘汰**（必须给出原因），每次确认 `retireStreak += 1`；
+  用 `upsert_watch_item` 重新写入分析结论即**自动复活**（`status=active`、次数清零）。
+- 标的分析流水线在模型跑完后执行确定性清理：`retireStreak >= settings.watchlistRetireDeleteRuns`
+  （默认 3，**0 = 只标记不删除**）时才通过系统工具 `delete_watch_item` 删除，且删除同样走
+  工具策略（`toolPolicy.deny` / 写入审批）与审计。
+- **永不自动删除**的三种情况：当前有持仓（净份额 > 0，且会自动复活）、`source=manual` 的人工录入、
+  存在 `pending` 建议引用该标的。
+- 退役标的不参与建议生成与候选挖掘（`listWatchlist()` 默认只返回在池标的）；
+  备份/导出会带上退役记录，恢复后状态一致。
+
 
 ## 6. AI 投资建议（/api/advice）
 

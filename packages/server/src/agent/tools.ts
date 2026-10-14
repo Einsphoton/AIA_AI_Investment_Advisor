@@ -9,6 +9,7 @@
  * Owner: agent-engine.
  */
 import {
+  DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
   MARKET_CURRENCY,
   PERSONA_MAP,
   REPORT_STYLE_MAP,
@@ -24,7 +25,7 @@ import type { EventSink, LoggerLike, ToolDescriptor } from '../types/agent.js';
 import type { Repo } from '../types/repo.js';
 import type { LlmToolSchema } from './llm.js';
 import { budgetLine, computeBudgetStatus } from './budget.js';
-import { compactHolding, round, sparkFrom } from './positions.js';
+import { compactHolding, hasOpenPosition, round, sparkFrom } from './positions.js';
 import * as ds from '../datasources/registry.js';
 import { fundInfo } from '../datasources/fund.js';
 import { fetchUrl } from '../datasources/websearch.js';
@@ -69,6 +70,18 @@ interface RegisteredTool {
 }
 
 const MAX_RESULT_CHARS = 7000;
+
+/**
+ * P3 淘汰阈值（连续多少次分析确认退役后才真正删除）。读设置失败时退回默认值，
+ * 绝不影响工具调用（自托管场景下设置行损坏不该让分析整体失败）。
+ */
+function retireDeleteRuns(repo: Repo): number {
+  try {
+    return repo.getSettings().watchlistRetireDeleteRuns;
+  } catch {
+    return DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS;
+  }
+}
 
 /* ────────────────────────────── arg helpers ─────────────────────────────── */
 
@@ -487,11 +500,24 @@ const getAsset: RegisteredTool = {
 const listWatchlist: RegisteredTool = {
   descriptor: {
     name: 'list_watchlist',
-    description: '列出「我的标的」：代码、名称、现价、初始价、推荐后涨跌、优质评估、目标价、预期收益、逻辑。',
-    parameters: { type: 'object', properties: {}, required: [] },
+    description:
+      '列出「我的标的」：代码、名称、现价、初始价、推荐后涨跌、优质评估、目标价、预期收益、逻辑，以及 status（active 在池 / retired 已退役）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['active', 'retired', 'all'],
+          description: '筛选在池 / 已退役 / 全部，默认 all（便于复核既有标的的退役状态）',
+        },
+      },
+      required: [],
+    },
   },
-  async handler(_args, ctx) {
-    const items = ctx.repo.listWatchlist().map((row) => ({
+  async handler(args, ctx) {
+    const raw = str(args, 'status').toLowerCase();
+    const status = raw === 'active' || raw === 'retired' ? raw : 'all';
+    const items = ctx.repo.listWatchlist(status).map((row) => ({
       id: row.id,
       name: row.name,
       code: row.code,
@@ -511,9 +537,14 @@ const listWatchlist: RegisteredTool = {
       thesis: row.thesis,
       aiSummary: row.aiSummary,
       note: row.note,
+      // P3：退役状态与次数必须回传，模型才能决定「再次确认退役」还是「复活」。
+      status: row.status,
+      retiredReason: row.retiredReason,
+      retiredAt: row.retiredAt,
+      retireStreak: row.retireStreak,
       createdAt: row.createdAt,
     }));
-    return ok(`标的 ${items.length} 项`, { count: items.length, items });
+    return ok(`标的 ${items.length} 项`, { count: items.length, status, items });
   },
 };
 
@@ -614,12 +645,15 @@ const upsertWatchItem: RegisteredTool = {
 
     const existing = ctx.repo.findWatchItem(code, market, type);
     if (existing) {
+      // P3：能写出新的分析结论，说明模型重新认可它 —— 自动复活（清空退役状态与次数）。
+      const revived = existing.status === 'retired';
       const updated = ctx.repo.updateWatchItem(existing.id, {
         ...patch,
         aiSummaryAt: aiSummary ? now : existing.aiSummaryAt,
         spark: patch.spark.length > 0 ? patch.spark : existing.spark,
+        ...(revived ? { status: 'active' as const, retiredReason: '', retiredAt: null, retireStreak: 0 } : {}),
       });
-      return ok(`已更新标的 ${name}（优质评估 ${updated?.qualityScore ?? existing.qualityScore}）`, {
+      return ok(`已更新标的 ${name}（优质评估 ${updated?.qualityScore ?? existing.qualityScore}）${revived ? '，并已从退役状态复活' : ''}`, {
         id: existing.id,
         code,
         market,
@@ -679,6 +713,130 @@ const upsertWatchItem: RegisteredTool = {
       warnings: [...(quote?.warnings ?? []), ...(seriesResult?.warnings ?? [])],
     }, {
       entity: { action: 'created', entity: 'watchlist', id: created.id, label: `${name}(${code})` },
+    });
+  },
+};
+
+const retireWatchItem: RegisteredTool = {
+  requiresWrite: 'watchlist',
+  descriptor: {
+    name: 'retire_watch_item',
+    description:
+      '把「我的标的」里的某个标的标记为已退役（不再适合继续作为标的）：写回退役原因并累计连续确认次数，默认不再出现在标的列表中。' +
+      '连续 N 次分析都确认退役后系统才可能真正删除；有持仓、人工录入或存在待处理建议的标的永远不会被自动删除。' +
+      '如果之后重新变好，用 upsert_watch_item 更新即可自动复活。',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string' },
+        market: { type: 'string', enum: ['CN', 'HK', 'US'] },
+        type: { type: 'string', enum: ['stock', 'etf', 'fund'] },
+        reason: {
+          type: 'string',
+          description: '为何不再适合（必须引用具体数据：估值、趋势、基本面变化、预算/风险敞口等）',
+        },
+      },
+      required: ['code', 'market', 'reason'],
+    },
+  },
+  async handler(args, ctx) {
+    const code = str(args, 'code');
+    const market = marketArg(args);
+    const type = typeArg(args);
+    const reason = str(args, 'reason');
+    if (!code) return fail('缺少代码', 'bad_request', 'code 必填');
+    if (!reason) return fail('缺少原因', 'bad_request', 'reason 必填：说明为何不再适合作为标的');
+
+    const existing = ctx.repo.findWatchItem(code, market, type);
+    if (!existing) {
+      return fail(
+        `标的不存在：${code}`,
+        'bad_request',
+        `${code}（${market}/${type}）不在「我的标的」里，无法退役。请先用 list_watchlist 确认代码。`,
+      );
+    }
+    // 持仓护栏：淘汰只作用于「候选池」。已持仓的标的由资产分析 + 卖出建议处理，
+    // 用户可能持续加仓，绝不能让淘汰流程碰它。
+    if (hasOpenPosition(ctx.repo, existing)) {
+      return fail(
+        `${existing.name || code} 仍有持仓，不进入淘汰流程`,
+        'policy_denied',
+        '该标的当前有持仓，淘汰机制只作用于没有持仓的候选。请改用 create_advice(action="sell") 处理仓位，或在 upsert_watch_item 的 ai_summary 里说明风险；不要把它标记退役。',
+      );
+    }
+
+    const streak = existing.retireStreak + 1;
+    const now = new Date().toISOString();
+    const updated = ctx.repo.updateWatchItem(existing.id, {
+      status: 'retired',
+      retiredReason: reason,
+      retiredAt: now,
+      retireStreak: streak,
+    });
+    if (!updated) return fail('退役失败', 'tool_failed', `写入 ${code} 的退役状态失败，请重试。`);
+
+    const threshold = retireDeleteRuns(ctx.repo);
+    const note =
+      threshold <= 0
+        ? '当前设置为「只标记不删除」，该标的会一直保留退役记录。'
+        : existing.source === 'manual'
+          ? '该标的是手动录入：只标记退役，系统不会自动删除，需要你手动清理。'
+          : streak >= threshold
+            ? `已连续 ${streak}/${threshold} 次确认退役，本次运行结束后系统会尝试移除（待处理建议或写入审批会使其延后）。`
+            : `已连续 ${streak}/${threshold} 次确认退役；再确认 ${threshold - streak} 次后系统才会尝试移除。`;
+
+    return ok(`已标记退役：${updated.name || code}（连续第 ${streak} 次）`, {
+      id: updated.id,
+      code,
+      market,
+      type,
+      status: updated.status,
+      retireStreak: streak,
+      retiredReason: reason,
+      threshold,
+      summary: note,
+    }, {
+      entity: { action: 'updated', entity: 'watchlist', id: updated.id, label: `${updated.name || code}(${code})` },
+    });
+  },
+};
+
+/**
+ * 系统工具：真正删除一条已退役标的。
+ *
+ * 不暴露给模型（`systemOnly`，见 `llmToolSchemas`）：删除只能由流水线在
+ * 「连续 N 次确认退役 + 通过持仓/人工/待处理建议护栏」之后发起，并且照样走
+ * 工具策略（deny / 写入审批）与审计，与其它写操作一致。
+ */
+const deleteWatchItem: RegisteredTool = {
+  requiresWrite: 'watchlist',
+  descriptor: {
+    name: 'delete_watch_item',
+    systemOnly: true,
+    description: '【系统】删除一条已退役的「我的标的」（仅由淘汰流水线调用，不提供给模型）。',
+    parameters: {
+      type: 'object',
+      properties: { id: { type: 'string', description: '标的 id' } },
+      required: ['id'],
+    },
+  },
+  async handler(args, ctx) {
+    const id = str(args, 'id');
+    if (!id) return fail('缺少 id', 'bad_request', 'id 必填');
+    const row = ctx.repo.getWatchItem(id);
+    if (!row) return fail('标的不存在', 'not_found', `标的 ${id} 已不存在。`);
+    // 二次护栏：即使调用方判断有误，也不允许删掉有持仓的标的。
+    if (hasOpenPosition(ctx.repo, row)) {
+      return fail(
+        `${row.name || row.code} 仍有持仓，拒绝删除`,
+        'policy_denied',
+        '该标的当前有持仓，按淘汰护栏不得自动删除。',
+      );
+    }
+    const removed = ctx.repo.deleteWatchItem(id);
+    if (!removed) return fail('删除失败', 'tool_failed', `删除标的 ${id} 未生效。`);
+    return ok(`已移除退役标的 ${row.name || row.code}`, { id, code: row.code, market: row.market, type: row.type }, {
+      entity: { action: 'deleted', entity: 'watchlist', id, label: `${row.name || row.code}(${row.code})` },
     });
   },
 };
@@ -825,6 +983,8 @@ const getSettingsProfile: RegisteredTool = {
       reportStyle: settings.reportStyle,
       reportStyleGuidance: style.guidance,
       watchlistCandidateLimit: settings.watchlistCandidateLimit,
+      // P3：模型据此知道「再确认几次才会被清理」，从而正确使用 retire_watch_item。
+      watchlistRetireDeleteRuns: settings.watchlistRetireDeleteRuns,
       enforceBudget: settings.enforceBudget,
       budget: settings.budget,
     });
@@ -849,6 +1009,9 @@ export const TOOLS: RegisteredTool[] = [
   listWatchlist,
   saveAssetAnalysis,
   upsertWatchItem,
+  retireWatchItem,
+  // 系统工具：仅流水线调用（systemOnly，不进模型工具表）。
+  deleteWatchItem,
   createAdvice,
   saveDashboardBriefing,
   getBudget,
@@ -1013,14 +1176,17 @@ export function toolDescriptors(kind?: AgentRunKind, allowWrites?: AllowWrite[])
 
 /** OpenAI function-calling schemas for a run. */
 export function llmToolSchemas(kind: AgentRunKind, allowWrites?: AllowWrite[]): LlmToolSchema[] {
-  return toolDescriptors(kind, allowWrites).map((descriptor) => ({
-    type: 'function',
-    function: {
-      name: descriptor.name,
-      description: descriptor.description,
-      parameters: descriptor.parameters,
-    },
-  }));
+  return toolDescriptors(kind, allowWrites)
+    // P3：系统工具（delete_watch_item 等）由流水线发起，不交给模型自选。
+    .filter((descriptor) => !descriptor.systemOnly)
+    .map((descriptor) => ({
+      type: 'function',
+      function: {
+        name: descriptor.name,
+        description: descriptor.description,
+        parameters: descriptor.parameters,
+      },
+    }));
 }
 
 export function hasTool(name: string): boolean {

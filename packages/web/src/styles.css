@@ -31,8 +31,9 @@
                  .modal-close .toast-stack .toast .toast-success .toast-error
      charts      .chart .chart-sm .chart-md .chart-lg .chart-placeholder
                  .sparkline .marker-legend
-     agent       .run-panel .step-list .step .step-dot .step-label .step-detail
+     agent       .run-panel .run-timeline .step-list .step .step-dot .step-label .step-detail
                  .progress .progress-bar .typing-dot
+                 .agent-dock .agent-dock-pill .agent-metric（右下角全局推理面板）
      helpers     .flex .between .center .gap-1 .gap-2 .gap-3 .wrap .muted .mono
                  .right .nowrap .pos .neg .flat .truncate .scroll-y .mt-* .mb-*
                  .gold-text .strong .small .tiny
@@ -782,7 +783,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .form-grid .span-2 { grid-column: span 2; }
 
-.toast-stack { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 10px; z-index: 90; max-width: 390px; }
+.toast-stack { position: fixed; right: 18px; bottom: calc(18px + var(--dock-reserve, 0px)); display: flex; flex-direction: column; gap: 10px; z-index: 90; max-width: 390px; }
 /* 液态玻璃：Toast */
 .toast {
   position: relative;
@@ -856,6 +857,95 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   background: var(--gold-300);
   animation: pulse 1s infinite;
 }
+
+/* ── 14b. 全局推理面板（右下角悬浮 · 可收起） ─────────────────────────────
+   所有 AI 分析入口共用同一个面板：切换页面不消失，且不占用页面正文空间。
+   收起后只剩一条状态小条，永远不与正文争夺视线（液态玻璃，浮在内容之上）。 */
+
+.agent-dock {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  /* 55 < 模态遮罩（60）：弹窗永远盖在推理面板之上；> 下拉面板（50）。 */
+  z-index: 55;
+  width: 400px;
+  max-width: calc(100vw - 28px);
+  max-height: min(72vh, 620px);
+  display: flex;
+  flex-direction: column;
+  background-color: rgba(15, 15, 19, 0.94);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-strong);
+  border-top-color: var(--gold-line);
+  border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  padding: 11px 13px 12px;
+  animation: dock-in 0.18s ease-out;
+}
+@keyframes dock-in {
+  from { transform: translateY(10px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.agent-dock[data-status='running'] { border-top-color: var(--gold-400); }
+
+.agent-dock-head { display: flex; align-items: center; gap: 8px; }
+.agent-dock-title { flex: 1 1 auto; min-width: 0; font-size: 13px; letter-spacing: 0.01em; }
+.agent-dock-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+
+.agent-dock-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.agent-dock-meta > span { white-space: nowrap; max-width: 190px; }
+
+.agent-dock-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+  margin-top: 9px;
+}
+.agent-metric {
+  background: rgba(8, 8, 11, 0.62);
+  border: 1px solid var(--border-quiet);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  min-width: 0;
+}
+.agent-metric-label { font-size: 11px; color: var(--text-mute); letter-spacing: 0.02em; }
+.agent-metric-value { font-size: 15px; color: var(--gold-100); margin-top: 2px; }
+.agent-metric-sub { font-size: 10px; color: var(--text-mute); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.agent-dock-writes { margin-top: 8px; }
+
+.agent-dock-body { margin-top: 9px; overflow-y: auto; min-height: 0; }
+
+/* 收起态：只留一条状态小条，点击展开。 */
+.agent-dock-pill {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 55;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(360px, calc(100vw - 28px));
+  padding: 7px 12px;
+  font-family: inherit;
+  text-align: left;
+  color: var(--text);
+  background-color: rgba(15, 15, 19, 0.94);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+  transition: border-color 0.16s ease;
+}
+.agent-dock-pill:hover { border-color: var(--gold-400); }
+.agent-dock-pill-title { font-size: 12px; font-weight: 500; max-width: 170px; }
+.agent-dock-pill-meta { color: var(--text-dim); white-space: nowrap; }
+.agent-dock-caret { color: var(--gold-400); font-size: 10px; }
+
+.run-timeline { display: flex; flex-direction: column; }
 
 /* ── 15. chat ────────────────────────────────────────────────────────────── */
 
@@ -1000,6 +1090,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   .form-grid { grid-template-columns: 1fr; }
   .form-grid .span-2 { grid-column: span 1; }
   .dropdown-panel { max-width: calc(100vw - 32px); }
+  /* 窄屏：推理面板横向铺满，仍可收起。 */
+  .agent-dock { right: 10px; left: 10px; bottom: 10px; width: auto; max-height: 62vh; }
+  .agent-dock-pill { right: 10px; bottom: 10px; left: 10px; max-width: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

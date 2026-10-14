@@ -296,6 +296,17 @@ export function SettingsPage() {
               onChange={(event) => patch({ watchlistCandidateLimit: event.target.value })}
             />
           </Field>
+          <Field
+            label="标的淘汰确认次数"
+            hint="连续多少次分析都确认「不再适合」后才自动移除；0 = 只标记不删除。有持仓、手动添加、有待处理建议的标的永不自动删除"
+            className="span-2"
+          >
+            <Input
+              inputMode="decimal"
+              value={draft.watchlistRetireDeleteRuns}
+              onChange={(event) => patch({ watchlistRetireDeleteRuns: event.target.value })}
+            />
+          </Field>
         </div>
 
         <div className="divider" />

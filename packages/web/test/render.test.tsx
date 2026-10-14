@@ -16,6 +16,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { renderToString } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
+import type { InferenceMetrics } from '@aia/shared';
 import {
   DEFAULT_LLM,
   LLM_PROVIDER_CUSTOM_ID,
@@ -25,6 +26,15 @@ import {
   normalizeLlmBaseUrl,
 } from '@aia/shared';
 import { App } from '../src/App';
+import {
+  EMPTY_TOTALS,
+  fmtCacheHitRate,
+  fmtMilliseconds,
+  fmtSpeed,
+  fmtTokens,
+  summarizeEntities,
+  summarizeMetrics,
+} from '../src/api/agentMetrics';
 import { Dropdown, ToastProvider } from '../src/components/ui';
 import { LlmProviderField } from '../src/pages/SettingsLlmProvider';
 import { ModelField } from '../src/pages/SettingsModelField';
@@ -49,6 +59,13 @@ function render(path: string): string {
   );
 }
 
+const SRC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
+
+/** Reads a file under `packages/web/src` (for wiring assertions). */
+function readSource(...segments: string[]): string {
+  return fs.readFileSync(path.join(SRC_DIR, ...segments), 'utf8');
+}
+
 for (const route of ROUTES) {
   test(`页面可无头渲染：${route.path}`, () => {
     const html = render(route.path);
@@ -69,6 +86,159 @@ test('侧边栏包含全部七个导航入口', () => {
   for (const label of ['Dashboard', '我的资产', '我的标的', 'AI 投资建议', 'AI Chat', '活动与审计', '设置']) {
     assert.ok(html.includes(label), `侧边栏缺少导航项「${label}」`);
   }
+});
+
+/* ─────────────── Dashboard「AI一键分析」= 完整流水线 ─────────────── */
+
+test('Dashboard 工具栏提供「AI一键分析」，并走完整流水线（资产 → 标的 → 建议）', () => {
+  const html = render('/');
+  assert.ok(html.includes('AI一键分析'), 'Dashboard 工具栏缺少「AI一键分析」按钮');
+
+  // 只跑资产分析（/assets/analyze）不会产出标的与建议，必须走 /agent/run-now：
+  // 该端点在同一条 SSE 流里顺序执行 runFullPipeline（arch §4.3-3）。
+  const source = readSource('pages', 'Dashboard.tsx');
+  assert.ok(
+    /path: '\/agent\/run-now'/.test(source),
+    '「AI一键分析」必须调用 /agent/run-now，才能跑完资产分析 → 标的分析 → AI 投资建议',
+  );
+});
+
+/* ─────────── 推理过程：右下角全局面板（切换页面不消失） ─────────── */
+
+test('推理过程只在右下角全局面板渲染：页面不再内联 RunPanel', () => {
+  const offenders: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.tsx$/.test(entry.name)) {
+        const code = fs.readFileSync(full, 'utf8');
+        if (/<RunPanel[\s/>]/.test(code)) offenders.push(path.relative(SRC_DIR, full));
+      }
+    }
+  };
+  walk(SRC_DIR);
+  assert.deepEqual(offenders, [], `这些页面仍把推理过程内联在正文里（应改走右下角面板）：${offenders.join(', ')}`);
+});
+
+test('全局推理面板挂在 <Routes> 之外，路由切换不会卸载它', () => {
+  const source = readSource('App.tsx');
+  const routesClose = source.indexOf('</Routes>');
+  const dock = source.indexOf('<AgentActivityDock');
+  assert.ok(routesClose > 0, 'App.tsx 未找到 </Routes>');
+  assert.ok(dock > routesClose, '推理面板必须渲染在 <Routes> 之外，否则切换页面会卸载并丢失推理过程');
+  assert.ok(source.includes('<AgentActivityProvider>'), '全局 Provider 必须在路由之外持有 SSE 流');
+});
+
+test('全站 AI 入口统一通过全局 Provider 发起运行', () => {
+  const pages = fs.readdirSync(path.join(SRC_DIR, 'pages'));
+  const offenders: string[] = [];
+  for (const name of pages) {
+    const code = fs.readFileSync(path.join(SRC_DIR, 'pages', name), 'utf8');
+    // Chat 是对话式 Agent（答复本身就是页面内容），仍保留自己的流。
+    if (name === 'Chat.tsx') continue;
+    if (/useAgentStream\(/.test(code)) offenders.push(name);
+  }
+  assert.deepEqual(offenders, [], `这些页面仍各自持有 SSE 流（切换页面会丢失推理过程）：${offenders.join(', ')}`);
+});
+
+/* ─────────────── 自选标的淘汰（在池 / 已退役 / 复活） ─────────────── */
+
+test('我的标的页提供在池/已退役筛选、复活入口与持仓护栏说明', () => {
+  const html = render('/watchlist');
+  assert.ok(html.includes('在池（'), '缺少「在池」筛选');
+  assert.ok(html.includes('已退役（'), '缺少「已退役」筛选');
+  assert.ok(html.includes('有持仓的标的不进入淘汰流程'), '未在界面上说明持仓护栏');
+  const source = readSource('pages', 'Watchlist.tsx');
+  assert.ok(/api\.watchlist\.restore\(/.test(source), '已退役标的需要提供「复活」入口');
+  assert.ok(/status: statusFilter/.test(source), '列表请求必须带上 status 筛选');
+});
+
+test('设置页可配置淘汰确认次数（0 = 只标记不删除）', () => {
+  // 设置页在无头渲染时只输出 Loading（数据在 useEffect 里拉取），因此核对源码。
+  const page = readSource('pages', 'Settings.tsx');
+  assert.ok(page.includes('标的淘汰确认次数'), '设置页缺少淘汰确认次数输入');
+  assert.ok(/watchlistRetireDeleteRuns/.test(page), '设置页未绑定 watchlistRetireDeleteRuns');
+  const draft = readSource('pages', 'settingsDraft.ts');
+  assert.ok(/watchlistRetireDeleteRuns/.test(draft), '设置草稿必须带上传淘汰确认次数');
+});
+
+test('推理指标聚合：只按 done 事件累计用量，首字延迟取最快与最慢', () => {
+  const event = (over: Partial<InferenceMetrics>): InferenceMetrics => ({
+    phase: 'done',
+    turn: 1,
+    model: 'deepseek-v4.1-flash',
+    ttftMs: null,
+    latencyMs: null,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedTokens: 0,
+    tokensPerSecond: null,
+    ...over,
+  });
+  const totals = summarizeMetrics([
+    // first-token 事件只有计时，绝不能把用量算两次。
+    event({ phase: 'first-token', turn: 1, ttftMs: 1200 }),
+    event({ turn: 1, ttftMs: 1200, latencyMs: 3200, promptTokens: 1000, completionTokens: 200, cachedTokens: 800, tokensPerSecond: 100 }),
+    event({ phase: 'first-token', turn: 2, ttftMs: 800 }),
+    event({ turn: 2, ttftMs: 800, latencyMs: 2100, promptTokens: 500, completionTokens: 100, cachedTokens: 500, tokensPerSecond: 50 }),
+  ]);
+  assert.equal(totals.requests, 2, 'first-token 事件不应计入请求数');
+  assert.equal(totals.promptTokens, 1500);
+  assert.equal(totals.completionTokens, 300);
+  assert.equal(totals.totalTokens, 1800);
+  assert.equal(totals.cachedTokens, 1300);
+  assert.ok(totals.cacheHitRate !== null && Math.abs(totals.cacheHitRate - 1300 / 1500) < 1e-9, '命中率 = 命中 / 输入');
+  assert.equal(totals.tokensPerSecond, 50, '生成速度取最近一次完成请求');
+  assert.equal(totals.bestTtftMs, 800);
+  assert.equal(totals.worstTtftMs, 1200);
+  assert.equal(totals.lastLatencyMs, 2100);
+  assert.equal(totals.model, 'deepseek-v4.1-flash');
+});
+
+test('推理指标聚合：无数据与越界值都退化为「—」而不是假的 100%', () => {
+  assert.deepEqual(summarizeMetrics([]), EMPTY_TOTALS);
+  const noCache = summarizeMetrics([
+    {
+      phase: 'done',
+      turn: 1,
+      model: 'm',
+      ttftMs: null,
+      latencyMs: 900,
+      promptTokens: 0,
+      completionTokens: 0,
+      cachedTokens: 0,
+      tokensPerSecond: null,
+    },
+  ]);
+  assert.equal(noCache.cacheHitRate, null, '没有输入 tokens 时不得报命中率');
+  assert.equal(fmtCacheHitRate(noCache.cacheHitRate), '—');
+  assert.equal(fmtCacheHitRate(2), '100.0%', '命中率上限 100%');
+  assert.equal(fmtMilliseconds(null), '—');
+  assert.equal(fmtSpeed(null), '—');
+});
+
+test('推理指标格式化：毫秒 / 秒 / 分钟与千分位', () => {
+  assert.equal(fmtMilliseconds(450), '450ms');
+  assert.equal(fmtMilliseconds(1250), '1.25s');
+  assert.equal(fmtMilliseconds(84_000), '1m24s');
+  assert.equal(fmtTokens(12_480), '12,480');
+  assert.equal(fmtTokens(0), '0');
+  assert.equal(fmtSpeed(42.06), '42.1 tok/s');
+  assert.equal(fmtCacheHitRate(0.8734), '87.3%');
+});
+
+test('写入汇总按 实体 × 动作 计数', () => {
+  assert.deepEqual(
+    summarizeEntities([
+      { action: 'created', entity: 'asset', id: '1', label: 'A' },
+      { action: 'created', entity: 'asset', id: '2', label: 'B' },
+      { action: 'updated', entity: 'watchlist', id: '3', label: 'C' },
+      { action: 'deleted', entity: 'advice', id: '4', label: 'D' },
+    ]),
+    ['资产 +2', '标的 ~1', '建议 -1'],
+  );
+  assert.deepEqual(summarizeEntities([]), []);
 });
 
 test('页面不再使用占位 stub', () => {

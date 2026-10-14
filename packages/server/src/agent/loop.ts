@@ -418,6 +418,11 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
             streamedText += delta;
             safeEmit(request.sink, { type: 'text', runId, delta });
           },
+          // P3: inference telemetry (TTFT / tokens / KV-cache hits) of this turn.
+          onMetrics: (metrics) => {
+            if (!request.sink) return;
+            safeEmit(request.sink, { type: 'metrics', runId, metrics: { ...metrics, turn: turns } });
+          },
         });
       } catch (error) {
         const message = error instanceof LlmError ? error.message : error instanceof Error ? error.message : String(error);
@@ -442,7 +447,9 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
       finishStep(
         step,
         'done',
-        `返回 ${result.content.length} 字、${result.toolCalls.length} 个工具调用（tokens: ${result.promptTokens}+${result.completionTokens}）`,
+        `返回 ${result.content.length} 字、${result.toolCalls.length} 个工具调用（tokens: ${result.promptTokens}+${result.completionTokens}${
+          result.cachedTokens > 0 ? `，KV cache 命中 ${result.cachedTokens}` : ''
+        }${result.ttftMs !== null ? `，首字 ${result.ttftMs}ms` : ''}）`,
       );
 
       if (result.toolCalls.length === 0) {

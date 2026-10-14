@@ -34,6 +34,8 @@ export interface Draft {
   budgetUS: string;
   enforceBudget: boolean;
   watchlistCandidateLimit: string;
+  /** P3：连续确认退役多少次后自动移除标的；0 = 只标记不删除。 */
+  watchlistRetireDeleteRuns: string;
   scheduleMode: ScheduleMode;
   intervalMinutes: string;
   dailyTime: string;
@@ -59,6 +61,7 @@ export function toDraft(settings: Settings): Draft {
     budgetUS: String(settings.budget?.US ?? DEFAULT_BUDGET.US),
     enforceBudget: settings.enforceBudget,
     watchlistCandidateLimit: String(settings.watchlistCandidateLimit ?? 5),
+    watchlistRetireDeleteRuns: String(settings.watchlistRetireDeleteRuns ?? 3),
     scheduleMode: settings.schedule?.mode ?? DEFAULT_SCHEDULE.mode,
     intervalMinutes: String(settings.schedule?.intervalMinutes ?? DEFAULT_SCHEDULE.intervalMinutes),
     dailyTime: settings.schedule?.dailyTime ?? DEFAULT_SCHEDULE.dailyTime,
@@ -113,6 +116,9 @@ export function buildInput(draft: Draft, base: Draft): SettingsInput {
   if (draft.enforceBudget !== base.enforceBudget) input.enforceBudget = draft.enforceBudget;
   if (draft.watchlistCandidateLimit !== base.watchlistCandidateLimit) {
     input.watchlistCandidateLimit = parseNumber('每次候选数量上限', draft.watchlistCandidateLimit);
+  }
+  if (draft.watchlistRetireDeleteRuns !== base.watchlistRetireDeleteRuns) {
+    input.watchlistRetireDeleteRuns = parseNumber('淘汰确认次数', draft.watchlistRetireDeleteRuns);
   }
 
   const schedule: Partial<ScheduleConfig> = {};

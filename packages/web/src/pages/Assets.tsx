@@ -5,16 +5,16 @@
  * 排序与「按市场 / 按资产类型分列」在客户端完成：分组行只在渲染期插入，
  * 这样切换视图不会重新请求，也不会让服务端排序破坏分组顺序。
  */
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { AssetSummary, Creator, InstrumentType, Market } from '@aia/shared';
 import { INSTRUMENT_TYPES, INSTRUMENT_TYPE_LABELS, MARKETS, MARKET_LABELS } from '@aia/shared';
 import { api } from '../api/client';
-import { toApiError, useAgentStream, useAsync, useDebounced } from '../api/hooks';
+import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
+import { toApiError, useAsync, useDebounced } from '../api/hooks';
 import { fmtDate, fmtMoney, fmtPct, fmtPrice, fmtShares, fmtSignedMoney, pnlClass } from '../format';
 import { Alert, Badge, Button, Card, ConfirmDialog, Dropdown, Empty, ErrorAlert, Input, Loading, Segmented, SortHeader, useToast } from '../components/ui';
 import { Sparkline } from '../components/charts/Sparkline';
-import { RunPanel } from '../components/RunPanel';
 import { AssetDetailDialog } from './AssetDetailDialog';
 import { AssetCreateDialog, AssetEditDialog } from './AssetFormDialog';
 
@@ -104,17 +104,9 @@ export function AssetsPage() {
 
   const state = useAsync(() => api.assets.list({ market, type, source, q: query }), [market, type, source, query]);
 
-  // entity 事件（AI 逐项分析写回 aiSummary）到达时立刻刷新列表。
-  const stream = useAgentStream(() => state.reload());
-
-  useEffect(() => {
-    if (!stream.finished) return;
-    if (stream.finished.status === 'error') toast.error('AI 资产分析失败', stream.finished.summary);
-    else toast.success('AI 资产分析完成', stream.finished.summary);
-    state.reload();
-    // 仅在每次运行结束时触发一次
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stream.finished]);
+  // entity 事件（AI 逐项分析写回 aiSummary）到达或运行结束时立刻刷新列表。
+  const { run, running } = useAgentActivity();
+  useAgentRefresh(state.reload);
 
   const rows = state.data?.items ?? [];
 
@@ -230,17 +222,15 @@ export function AssetsPage() {
           <Button onClick={() => setCreateOpen(true)}>添加资产</Button>
           <Button
             variant="primary"
-            loading={stream.running}
+            loading={running}
             onClick={() => {
-              void stream.start('/assets/analyze');
+              run({ path: '/assets/analyze', title: 'AI 资产分析' });
             }}
           >
             AI 资产分析
           </Button>
         </div>
       </div>
-
-      <RunPanel stream={stream} title="AI 资产分析（财报 · 基本面 · 宏观 · 微观 · 国际局势）" className="mb-3" />
 
       {state.error && <ErrorAlert error={state.error} onRetry={state.reload} />}
       {state.error?.isNotConfigured && (

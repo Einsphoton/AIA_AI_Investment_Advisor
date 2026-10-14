@@ -2,12 +2,13 @@
  * AdvicePage — owner: web-ai-pages.
  * AI 投资建议：月度预算约束、SSE 生成、确认/驳回。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { MARKETS, MARKET_LABELS } from '@aia/shared';
 import type { AdviceItem } from '@aia/shared';
 import { api } from '../api/client';
-import { toApiError, useAgentStream, useAsync } from '../api/hooks';
+import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
+import { toApiError, useAsync } from '../api/hooks';
 import { fmtDateTime, fmtMoney, fmtPct, fmtPrice, fmtShares, safeNumber, todayIso } from '../format';
 import {
   Alert,
@@ -24,7 +25,6 @@ import {
   Segmented,
   useToast,
 } from '../components/ui';
-import { RunPanel } from '../components/RunPanel';
 
 type StatusFilter = 'pending' | 'confirmed' | 'rejected';
 
@@ -46,22 +46,14 @@ export function AdvicePage() {
   const last = useAsync(() => api.advice.last(), [nonce]);
   const settings = useAsync(() => api.settings.get(), []);
   const llmMissing = settings.data !== null && !settings.data.hasApiKey;
-  const stream = useAgentStream((event) => {
-    if (event.entity === 'advice' || event.entity === 'asset' || event.entity === 'briefing') {
-      setNonce((value) => value + 1);
-    }
-  });
-
-  const wasRunning = useRef(false);
-  useEffect(() => {
-    if (wasRunning.current && !stream.running) setNonce((value) => value + 1);
-    wasRunning.current = stream.running;
-  }, [stream.running]);
+  // 建议写作 / 资产写作 / 简报写作与运行结束都会刷新列表；
+  // 推理过程与「新增 N 条建议」结论统一显示在右下角全局面板里。
+  const { run, running, budget: liveBudget } = useAgentActivity();
+  useAgentRefresh(() => setNonce((value) => value + 1));
 
   const items = list.data?.items ?? [];
   // 运行中优先用 SSE 推送的实时预算（budget 事件）；运行结束后回落到列表返回的预算
-  const budget = (stream.running ? stream.budget : null) ?? list.data?.budget ?? null;
-  const createdCount = stream.entities.filter((entity) => entity.entity === 'advice' && entity.action === 'created').length;
+  const budget = (running ? liveBudget : null) ?? list.data?.budget ?? null;
 
   async function reject(item: AdviceItem) {
     setBusyId(item.id);
@@ -96,7 +88,7 @@ export function AdvicePage() {
             ) : (
               <span className="tiny mute">尚未生成过投资建议</span>
             )}
-            <Button variant="primary" loading={stream.running} onClick={() => void stream.start('/advice/generate')}>
+            <Button variant="primary" loading={running} onClick={() => run({ path: '/advice/generate', title: 'AI 投资建议' })}>
               AI 投资建议
             </Button>
           </div>
@@ -146,15 +138,6 @@ export function AdvicePage() {
           </div>
         )}
       </Card>
-
-      <RunPanel stream={stream} title="AI 投资建议" />
-
-      {!stream.running && stream.finished && (
-        <Alert tone={stream.finished.status === 'error' ? 'error' : 'info'}>
-          本次运行结束（{stream.finished.status === 'error' ? '失败' : '成功'}）：新增 {createdCount} 条建议。
-          {stream.finished.summary && <div className="tiny mt-1">{stream.finished.summary}</div>}
-        </Alert>
-      )}
 
       <Card
         title={`建议列表（${items.length}）`}

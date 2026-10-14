@@ -15,6 +15,7 @@ import type {
   ImportResult,
   PendingWriteStatus,
   ToolRisk,
+  WatchItemStatus,
 } from '@aia/shared';
 import type {
   AdviceRow,
@@ -45,6 +46,9 @@ export interface ExportBundle {
   advice: AdviceRow[];
 }
 
+/** 自选池筛选：`all` 用于 prompt / 备份 / 计数，其余用于列表展示。 */
+export type WatchlistStatusFilter = WatchItemStatus | 'all';
+
 /**
  * Settings patch with *nested* partials.
  *
@@ -61,6 +65,8 @@ export interface SettingsPatch {
   schedule?: Partial<StoredSettings['schedule']>;
   enforceBudget?: boolean;
   watchlistCandidateLimit?: number;
+  /** P3 淘汰机制：连续确认退役多少次后才真正删除（0 = 只标记不删除）。 */
+  watchlistRetireDeleteRuns?: number;
   /** P1-1: tool policy (deny list + write-approval mode). */
   toolPolicy?: Partial<StoredSettings['toolPolicy']>;
   /** P1-2: MCP servers (replaced wholesale when provided). */
@@ -97,7 +103,9 @@ export interface Repo {
   deleteTransaction(id: string): boolean;
 
   /* ── watchlist ─────────────────────────────────────────────────────────── */
-  listWatchlist(): WatchRow[];
+  /** `status` defaults to `'active'`; pass `'all'` for prompt/backup/counting. */
+  listWatchlist(status?: WatchlistStatusFilter): WatchRow[];
+  countWatchlist(): { active: number; retired: number };
   getWatchItem(id: string): WatchRow | undefined;
   findWatchItem(code: string, market: string, type: string): WatchRow | undefined;
   createWatchItem(input: NewWatch): WatchRow;

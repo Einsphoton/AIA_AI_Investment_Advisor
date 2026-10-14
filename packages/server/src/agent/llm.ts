@@ -13,9 +13,13 @@
  * exponential backoff + jitter, honouring `Retry-After`; cancellation and
  * deterministic 4xx errors are never retried.
  *
+ * P3: every request reports TTFT / latency / token usage / prompt-cache hits via
+ * `ChatRequest.onMetrics` — the agent loop forwards them as `metrics` SSE events
+ * so the UI can show inference telemetry while the model is thinking.
+ *
  * Owner: agent-engine.
  */
-import { DEFAULT_LLM, LLM_MAX_RETRIES, LLM_RETRY_BASE_MS, type LlmConfig } from '@aia/shared';
+import { DEFAULT_LLM, LLM_MAX_RETRIES, LLM_RETRY_BASE_MS, type InferenceMetrics, type LlmConfig } from '@aia/shared';
 import type { LoggerLike } from '../types/agent.js';
 
 export interface LlmToolCall {
@@ -37,6 +41,13 @@ export interface LlmToolSchema {
   function: { name: string; description: string; parameters: Record<string, unknown> };
 }
 
+/**
+ * One LLM request's inference metrics, as reported to the agent loop. Same shape
+ * as the `metrics` SSE event minus `turn` (the loop knows the turn, the client
+ * library does not).
+ */
+export type LlmRequestMetrics = Omit<InferenceMetrics, 'turn'>;
+
 export interface ChatRequest {
   messages: LlmMessage[];
   tools?: LlmToolSchema[];
@@ -45,6 +56,12 @@ export interface ChatRequest {
   maxTokens?: number;
   /** Called for every streamed content delta. */
   onDelta?: (delta: string) => void;
+  /**
+   * Called twice per request: once when the first streamed delta arrives
+   * (`phase: 'first-token'`, TTFT known) and once when the request settles
+   * (`phase: 'done'`, usage + speed final). Never called on failure.
+   */
+  onMetrics?: (metrics: LlmRequestMetrics) => void;
   signal?: AbortSignal;
 }
 
@@ -53,6 +70,12 @@ export interface ChatResult {
   toolCalls: LlmToolCall[];
   promptTokens: number;
   completionTokens: number;
+  /** Prompt tokens served from the provider's prompt/KV cache. */
+  cachedTokens: number;
+  /** Time to first token (ms); null for non-streamed responses. */
+  ttftMs: number | null;
+  /** Total request wall time (ms). */
+  latencyMs: number;
   finishReason: string;
   model: string;
   /** True when the response arrived as a stream. */
@@ -166,6 +189,41 @@ export function readableHttpError(status: number, body: string): LlmError {
   return new LlmError(`LLM 请求失败（HTTP ${status}）：${snippet}`, 'LLM_HTTP', status);
 }
 
+/** Usage block of one response; every field is optional because providers differ. */
+interface LlmUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  /** OpenAI / OpenCode: `prompt_tokens_details.cached_tokens`. */
+  prompt_tokens_details?: { cached_tokens?: number } | null;
+  /** DeepSeek: explicit hit/miss split of `prompt_tokens`. */
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+  /** Anthropic-style gateways. */
+  cache_read_input_tokens?: number;
+}
+
+/**
+ * Prompt tokens the provider served from its prompt/KV cache.
+ *
+ * Providers spell this differently and all three shapes appear in the wild
+ * (OpenCode/OpenAI `prompt_tokens_details.cached_tokens`, DeepSeek
+ * `prompt_cache_hit_tokens`, Anthropic proxies `cache_read_input_tokens`), so we
+ * read whichever one is present. Missing / non-numeric values become 0, which
+ * makes the UI show「—」instead of a made-up hit rate.
+ */
+export function cachedTokensFromUsage(usage: LlmUsage | null | undefined): number {
+  if (!usage) return 0;
+  const candidates = [
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.cache_read_input_tokens,
+  ];
+  for (const value of candidates) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value);
+  }
+  return 0;
+}
+
 interface StreamChunk {
   choices?: Array<{
     delta?: {
@@ -175,7 +233,7 @@ interface StreamChunk {
     };
     finish_reason?: string | null;
   }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+  usage?: LlmUsage | null;
   model?: string;
   error?: { message?: string };
 }
@@ -350,6 +408,71 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
       : new LlmError('LLM 请求失败（已重试）', 'LLM_NETWORK');
   }
 
+  /**
+   * Per-request inference metrics: `firstToken()` fires once when the first
+   * streamed delta lands (TTFT), `done()` when the request settles (usage +
+   * generation speed). Both are best-effort: a throwing consumer must never
+   * break a run, so the calls are wrapped.
+   */
+  interface MetricsTracker {
+    firstToken(model?: string): void;
+    done(usage: { model: string; promptTokens: number; completionTokens: number; cachedTokens: number }): LlmRequestMetrics;
+    readonly ttftMs: number | null;
+  }
+
+  function createMetricsTracker(
+    onMetrics: ChatRequest['onMetrics'],
+    fallbackModel: string,
+  ): MetricsTracker {
+    const startedAt = Date.now();
+    let ttftMs: number | null = null;
+    const emit = (metrics: LlmRequestMetrics): void => {
+      try {
+        onMetrics?.(metrics);
+      } catch (error) {
+        logger?.warn?.(`metrics sink threw: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    return {
+      get ttftMs() {
+        return ttftMs;
+      },
+      firstToken(model?: string): void {
+        if (ttftMs !== null) return;
+        ttftMs = Date.now() - startedAt;
+        emit({
+          phase: 'first-token',
+          model: model || fallbackModel,
+          ttftMs,
+          latencyMs: null,
+          promptTokens: 0,
+          completionTokens: 0,
+          cachedTokens: 0,
+          tokensPerSecond: null,
+        });
+      },
+      done(usage): LlmRequestMetrics {
+        const latencyMs = Date.now() - startedAt;
+        // Speed is measured from the first token, i.e. pure generation time.
+        const generationMs = ttftMs === null ? latencyMs : Math.max(1, latencyMs - ttftMs);
+        const metrics: LlmRequestMetrics = {
+          phase: 'done',
+          model: usage.model || fallbackModel,
+          ttftMs,
+          latencyMs,
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          // A provider must never report more cached tokens than prompt tokens.
+          cachedTokens: Math.max(0, Math.min(usage.cachedTokens, usage.promptTokens)),
+          tokensPerSecond:
+            usage.completionTokens > 0 ? Math.round((usage.completionTokens / (generationMs / 1000)) * 10) / 10 : null,
+        };
+        emit(metrics);
+        return metrics;
+      },
+    };
+  }
+
   async function chat(request: ChatRequest): Promise<ChatResult> {
     if (!config.apiKey) throw new LlmError(NOT_CONFIGURED_MESSAGE, 'NOT_CONFIGURED', 400);
     const model = request.model || config.model;
@@ -367,9 +490,10 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     // The scope keeps `request.signal` wired for the whole exchange, including
     // the streamed body read (P0-2: cancel must stop a running answer).
     const scope = createHttpScope(request.signal);
+    const tracker = createMetricsTracker(request.onMetrics, model);
     try {
       try {
-        return await streamChat(request, basePayload, model, scope);
+        return await streamChat(request, basePayload, model, scope, tracker);
       } catch (error) {
         const abortError = toAbortError(error, scope);
         if (abortError) throw abortError;
@@ -378,7 +502,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
           logger?.warn?.('llm stream failed, retrying without streaming', error.message);
           const retryScope = createHttpScope(request.signal);
           try {
-            return await plainChat(request, basePayload, model, retryScope);
+            return await plainChat(request, basePayload, model, retryScope, tracker);
           } catch (retryError) {
             throw toAbortError(retryError, retryScope) ?? retryError;
           } finally {
@@ -397,18 +521,20 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     payload: Record<string, unknown>,
     model: string,
     scope: HttpScope,
+    tracker: MetricsTracker,
   ): Promise<ChatResult> {
     const response = await sendHttp(
       { ...payload, stream: true, stream_options: { include_usage: true } },
       true,
       scope,
     );
-    if (!response.body) return await plainChat(request, payload, model, scope);
+    if (!response.body) return await plainChat(request, payload, model, scope, tracker);
 
     let content = '';
     let finishReason = '';
     let promptTokens = 0;
     let completionTokens = 0;
+    let cachedTokens = 0;
     let resolvedModel = model;
     const toolAcc = new Map<number, { id: string; name: string; args: string }>();
 
@@ -438,6 +564,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
         if (chunk.usage) {
           promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
           completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+          cachedTokens = cachedTokensFromUsage(chunk.usage) || cachedTokens;
         }
         const choice = chunk.choices?.[0];
         if (!choice) continue;
@@ -445,9 +572,12 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
         const delta = choice.delta;
         if (!delta) continue;
         if (typeof delta.content === 'string' && delta.content.length > 0) {
+          // TTFT: measured on the first token of this request, not on headers.
+          tracker.firstToken(resolvedModel);
           content += delta.content;
           request.onDelta?.(delta.content);
         }
+        if ((delta.tool_calls?.length ?? 0) > 0) tracker.firstToken(resolvedModel);
         for (const call of delta.tool_calls ?? []) {
           const index = call.index ?? toolAcc.size;
           const current = toolAcc.get(index) ?? { id: '', name: '', args: '' };
@@ -469,7 +599,19 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
       }));
 
     if (content.length === 0 && toolCalls.length === 0) throw new LlmError('LLM 返回了空响应', 'LLM_EMPTY');
-    return { content, toolCalls, promptTokens, completionTokens, finishReason: finishReason || 'stop', model: resolvedModel, streamed: true };
+    const metrics = tracker.done({ model: resolvedModel, promptTokens, completionTokens, cachedTokens });
+    return {
+      content,
+      toolCalls,
+      promptTokens,
+      completionTokens,
+      cachedTokens: metrics.cachedTokens,
+      ttftMs: metrics.ttftMs,
+      latencyMs: metrics.latencyMs ?? 0,
+      finishReason: finishReason || 'stop',
+      model: resolvedModel,
+      streamed: true,
+    };
   }
 
   async function plainChat(
@@ -477,11 +619,12 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     payload: Record<string, unknown>,
     model: string,
     scope: HttpScope,
+    tracker: MetricsTracker,
   ): Promise<ChatResult> {
     const response = await sendHttp(payload, false, scope);
     const json = (await response.json()) as {
       choices?: Array<{ message?: { content?: string | null; tool_calls?: LlmToolCall[] }; finish_reason?: string }>;
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
+      usage?: LlmUsage;
       model?: string;
       error?: { message?: string };
     };
@@ -489,11 +632,22 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     const choice = json.choices?.[0];
     const content = choice?.message?.content ?? '';
     if (content) request.onDelta?.(content);
+    const promptTokens = json.usage?.prompt_tokens ?? 0;
+    const completionTokens = json.usage?.completion_tokens ?? 0;
+    const metrics = tracker.done({
+      model: json.model ?? model,
+      promptTokens,
+      completionTokens,
+      cachedTokens: cachedTokensFromUsage(json.usage),
+    });
     return {
       content,
       toolCalls: choice?.message?.tool_calls ?? [],
-      promptTokens: json.usage?.prompt_tokens ?? 0,
-      completionTokens: json.usage?.completion_tokens ?? 0,
+      promptTokens,
+      completionTokens,
+      cachedTokens: metrics.cachedTokens,
+      ttftMs: metrics.ttftMs,
+      latencyMs: metrics.latencyMs ?? 0,
       finishReason: choice?.finish_reason ?? 'stop',
       model: json.model ?? model,
       streamed: false,
@@ -513,6 +667,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
           { model: config.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 8, temperature: 0 },
           config.model,
           scope,
+          createMetricsTracker(undefined, config.model),
         );
         return {
           ok: true,

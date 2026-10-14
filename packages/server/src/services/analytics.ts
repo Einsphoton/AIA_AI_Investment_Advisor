@@ -12,6 +12,7 @@ import {
   DEFAULT_PERSONA,
   DEFAULT_REPORT_STYLE,
   DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
+  DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
   PERSONA_MAP,
   type AgentRun,
   type BudgetStatus,
@@ -25,7 +26,7 @@ import * as ds from '../datasources/registry.js';
 import { mapLimit } from '../datasources/http.js';
 import { fundInfo } from '../datasources/fund.js';
 import { computeBudgetStatus } from '../agent/budget.js';
-import { compactHolding, computePosition, round, sparkFrom, type CompactHolding } from '../agent/positions.js';
+import { compactHolding, computePosition, hasOpenPosition, round, sparkFrom, type CompactHolding } from '../agent/positions.js';
 import { executeTool, type AllowWrite } from '../agent/tools.js';
 import { readBriefing } from './briefing.js';
 
@@ -43,6 +44,8 @@ export interface SafeSettings {
   persona: Persona;
   reportStyle: ReportStyle;
   watchlistCandidateLimit: number;
+  /** P3 淘汰阈值：连续多少次确认退役后才真正删除（0 = 永不删除）。 */
+  watchlistRetireDeleteRuns: number;
 }
 
 /** Settings read that never throws during boot/tests. */
@@ -53,12 +56,17 @@ export function safeSettings(repo: Repo): SafeSettings {
       persona: settings.persona,
       reportStyle: settings.reportStyle,
       watchlistCandidateLimit: settings.watchlistCandidateLimit || DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
+      watchlistRetireDeleteRuns:
+        typeof settings.watchlistRetireDeleteRuns === 'number'
+          ? settings.watchlistRetireDeleteRuns
+          : DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
     };
   } catch {
     return {
       persona: DEFAULT_PERSONA,
       reportStyle: DEFAULT_REPORT_STYLE,
       watchlistCandidateLimit: DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
+      watchlistRetireDeleteRuns: DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
     };
   }
 }
@@ -310,13 +318,15 @@ export async function refreshWatchlistPrices(context: PipelineContext): Promise<
   return { updated, failed };
 }
 
-/** Runs the 标的分析 pipeline (search → screen → deep-dive → upsert). */
+/** Runs the 标的分析 pipeline (search → screen → deep-dive → upsert → 淘汰复核). */
 export async function runWatchlistAnalysis(context: PipelineContext): Promise<AgentRun> {
   const { repo, agent, logger, sink } = context;
   const settings = safeSettings(repo);
   const persona = PERSONA_MAP[settings.persona];
   const refresh = await refreshWatchlistPrices(context);
-  const watchlist = repo.listWatchlist();
+  // 退役标的也要进 prompt：模型需要看到退役原因与已累计次数，才能决定
+  // 「再次确认退役（累计到阈值后清理）」还是「复活」。
+  const watchlist = repo.listWatchlist('all');
   const existing = watchlist.map((item) => ({
     id: item.id,
     name: item.name,
@@ -333,10 +343,13 @@ export async function runWatchlistAnalysis(context: PipelineContext): Promise<Ag
     thesis: item.thesis,
     aiSummary: item.aiSummary,
     note: item.note,
+    status: item.status,
+    retiredReason: item.retiredReason,
+    retireStreak: item.retireStreak,
   }));
 
   const goal = [
-    '请按用户投资性格挖掘新的候选标的，并刷新既有标的的结论。',
+    '请按用户投资性格挖掘新的候选标的，复核既有标的，并淘汰不再适合继续跟踪的标的。',
     `候选数量上限：${settings.watchlistCandidateLimit} 个（本次允许新增）。质量分门槛：${persona.qualityGate}。`,
     '流程：',
     '1) 用 web_search / get_news 按性格偏好检索候选（行业景气、财务特征、政策与主题）。',
@@ -344,9 +357,12 @@ export async function runWatchlistAnalysis(context: PipelineContext): Promise<Ag
     '3) 对通过初筛的候选做深度分析（get_series / get_fundamentals / get_fund_info / get_dividends / get_news）。',
     `4) 对每个合格候选调用 upsert_watch_item（quality_score 0-100、target_price、expected_return、thesis、ai_summary）；quality_score 低于 ${persona.qualityGate} 的不要写入；最多新增 ${settings.watchlistCandidateLimit} 个。`,
     '5) 对既有标的中结论过时或价格显著变化的，同样调用 upsert_watch_item 更新（不要修改 initial_price）。',
-    `既有标的（价格已刷新：成功 ${refresh.updated}、失败 ${refresh.failed}）：`,
+    '6) 淘汰复核（P3）：逐个判断既有标的是否还值得继续跟踪。如果已经不适合（逻辑被证伪、基本面恶化、估值/趋势走坏、流动性或性价比明显落后），调用 retire_watch_item 写明原因；',
+    `   已被标记 retired 的，如果仍然不适合，请再次调用 retire_watch_item 以累计次数（连续 ${settings.watchlistRetireDeleteRuns} 次后系统才会真正移除；0 表示只标记不删除）；如果重新变好，用 upsert_watch_item 更新即可自动复活。`,
+    '   注意：有持仓的标的不得退役（retire_watch_item 会直接拒绝）——用户可能持续加仓，仓位处置请用 create_advice(action="sell")。',
+    `既有标的（价格已刷新：成功 ${refresh.updated}、失败 ${refresh.failed}；status=active 在池 / retired 已退役）：`,
     JSON.stringify(existing),
-    '分析要求：所有数字必须来自工具返回；数据缺失要写明；给出目标价与预期收益时必须说明依据与风险。',
+    '分析要求：所有数字必须来自工具返回；数据缺失要写明；给出目标价与预期收益时必须说明依据与风险；退役结论必须引用具体数据，不要凭感觉。',
   ].join('\n');
 
   const run = await agent.run({
@@ -358,7 +374,104 @@ export async function runWatchlistAnalysis(context: PipelineContext): Promise<Ag
     allowWrites: ['watchlist'],
   });
   logger.info(`watchlist analysis run ${run.id} finished (${run.status}) after ${run.turns} turns`);
+
+  // 模型只负责「判断」，清理由代码按规则执行（不交给模型自己删）。
+  try {
+    const swept = await sweepRetiredWatchItems(context, run.id);
+    if (swept.removed > 0 || swept.revived > 0) {
+      logger.info(
+        `watchlist retire sweep after run ${run.id}: removed ${swept.removed}, revived ${swept.revived}, kept ${swept.kept.length}, deferred ${swept.deferred}`,
+      );
+    }
+  } catch (error) {
+    // 清理失败绝不能影响这次分析的结论。
+    logger.warn(`watchlist retire sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return run;
+}
+
+export interface RetireSweepResult {
+  /** 真正移除的标的数（经工具层，含策略/审计）。 */
+  removed: number;
+  /** 因重新出现持仓而自动复活的标的数。 */
+  revived: number;
+  /** 保留但未删除的标的及其原因（含等待次数、护栏、待审批）。 */
+  kept: { id: string; code: string; reason: string }[];
+  /** 因写入审批模式被挂起的删除数。 */
+  deferred: number;
+}
+
+/**
+ * P3 淘汰清理（确定性，不依赖模型自觉）。
+ *
+ * 规则（按顺序判断）：
+ *   1. 又出现持仓 → **自动复活**（持仓是加仓的复盘锚点，永不被淘汰流程删除）；
+ *   2. 人工录入（source=manual）→ 只保留退役标记，需用户手动清理；
+ *   3. 存在待处理建议引用它 → 暂不删除，等建议处理完；
+ *   4. 连续确认次数 < 阈值 → 继续等待（每分析一次累计一次）；
+ *   5. 否则通过 `delete_watch_item` 工具删除 —— 走工具策略（deny / 写入审批）与审计。
+ *
+ * 阈值为 0 时整个清理流程关闭（只标记不删除）。
+ */
+export async function sweepRetiredWatchItems(
+  context: PipelineContext,
+  runId: string,
+  options: { batchId?: string } = {},
+): Promise<RetireSweepResult> {
+  const { repo, logger, sink } = context;
+  const result: RetireSweepResult = { removed: 0, revived: 0, kept: [], deferred: 0 };
+  const threshold = safeSettings(repo).watchlistRetireDeleteRuns;
+  const retired = repo.listWatchlist('retired');
+  if (retired.length === 0) return result;
+
+  for (const item of retired) {
+    // ① 持仓护栏（最高优先级）：买入过的标的自动回到在池状态。
+    if (hasOpenPosition(repo, item)) {
+      repo.updateWatchItem(item.id, { status: 'active', retiredReason: '', retiredAt: null, retireStreak: 0 });
+      result.revived += 1;
+      logger.info(`watchlist item ${item.code} revived: user holds an open position`);
+      continue;
+    }
+    // ② 人工录入的标的一律不自动删除。
+    if (item.source === 'manual') {
+      result.kept.push({ id: item.id, code: item.code, reason: 'manual' });
+      continue;
+    }
+    // ③ 还有待处理建议引用它 → 等用户先处理建议。
+    const pending = repo
+      .listAdvice({ status: 'pending' })
+      .some((advice) => advice.watchItemId === item.id);
+    if (pending) {
+      result.kept.push({ id: item.id, code: item.code, reason: 'pending-advice' });
+      continue;
+    }
+    // ④ 还没连续确认够次数（0 = 只标记不删除）。
+    if (threshold <= 0 || item.retireStreak < threshold) {
+      result.kept.push({ id: item.id, code: item.code, reason: 'below-threshold' });
+      continue;
+    }
+    // ⑤ 通过工具层删除：策略拒绝 / 写入审批都会在这里被尊重。
+    const outcome = await executeTool('delete_watch_item', JSON.stringify({ id: item.id }), {
+      runId,
+      kind: 'watchlist-analysis',
+      repo,
+      logger,
+      sink: sink ?? (() => undefined),
+      allowWrites: new Set<AllowWrite>(['watchlist']),
+      target: null,
+      batchId: options.batchId ?? runId,
+    });
+    if (outcome.ok) {
+      result.removed += 1;
+      logger.info(`watchlist item ${item.code} removed after ${item.retireStreak} confirmed retirements`);
+    } else {
+      result.deferred += 1;
+      result.kept.push({ id: item.id, code: item.code, reason: outcome.summary || 'delete-rejected' });
+      logger.warn(`watchlist item ${item.code} not removed: ${outcome.summary}`);
+    }
+  }
+  // 上面 updateWatchItem 只写库；页面靠 entity 事件与运行结束时的刷新拿到结果。
+  return result;
 }
 
 export { computePosition };

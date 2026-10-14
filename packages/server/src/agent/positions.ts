@@ -10,6 +10,22 @@
  */
 import type { PositionMath } from '@aia/shared';
 import type { AssetRow, TxRow } from '../types/models.js';
+import type { Repo } from '../types/repo.js';
+
+/** Anything at or below this is "no position" (matches the ledger epsilon). */
+const SHARE_EPSILON = 1e-6;
+
+/**
+ * P3 淘汰护栏：用户当前是否仍持有该标的（净份额 > 0）。
+ *
+ * 有持仓的标的一律**不得自动删除** —— 用户可能持续加仓，自选记录是这条持仓
+ * 的复盘锚点（推荐价、逻辑、目标价都在上面）。
+ */
+export function hasOpenPosition(repo: Repo, item: { code: string; market: string; type: string }): boolean {
+  const asset = repo.findAsset(item.code, item.market, item.type);
+  if (!asset) return false;
+  return computePosition(repo.listTransactions(asset.id)).shares > SHARE_EPSILON;
+}
 
 /** Moving weighted-average cost, mirroring docs/API.md §4. */
 export function computePosition(transactions: TxRow[]): PositionMath {

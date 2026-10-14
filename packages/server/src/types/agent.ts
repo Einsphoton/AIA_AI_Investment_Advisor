@@ -20,6 +20,11 @@ export interface ToolDescriptor {
   risk?: ToolRisk;
   /** P1-2: set for tools provided by an MCP server (`mcp__<server>__<tool>`). */
   source?: string;
+  /**
+   * P3: 只能由流水线/系统调用的工具（例如按退役次数清理标的）——`executeTool`
+   * 仍可执行、策略与审计照常生效，但**不会**出现在发给模型的工具表里。
+   */
+  systemOnly?: boolean;
 }
 
 export interface AgentRunRequest {
