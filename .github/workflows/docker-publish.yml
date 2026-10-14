@@ -77,6 +77,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # latest 只对 tag/semver 事件自动生成，分支推送必须显式声明，
+          # 否则 docker compose pull（默认 :latest）会拉不到
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=AI Investment Advisor
             org.opencontainers.image.description=自托管 AI 投资顾问：Agent Loop + 公开行情数据源 + 持仓账本
@@ -137,6 +147,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # latest 只对 tag/semver 事件自动生成，分支推送必须显式声明，
+          # 否则 docker compose pull（默认 :latest）会拉不到
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: 创建 manifest list 并推送
         working-directory: /tmp/digests
@@ -159,6 +179,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: 拉取镜像
         run: docker pull ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}

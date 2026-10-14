@@ -107,6 +107,8 @@ if (fs.existsSync(workflowPath)) {
 check('workflow 推送到 GHCR 镜像', workflowText.includes(IMAGE_REPO), IMAGE_REPO);
 check('workflow 申请 packages: write 权限', /packages:\s*write/.test(workflowText));
 check('workflow 同时构建 amd64 与 arm64', workflowText.includes('linux/amd64') && workflowText.includes('linux/arm64'));
+check('workflow 在默认分支生成 latest 标签', /value=latest/.test(workflowText), '分支推送不会自动生成 latest，需显式声明');
+check('workflow 生成 sha-<短SHA> 标签', /type=sha,prefix=sha-/.test(workflowText));
 
 if (workflow) {
   const rawTriggers = workflow.on ?? workflow[true];
