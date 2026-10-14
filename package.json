@@ -17,7 +17,7 @@
     "build": "npm run build -w @aia/shared && npm run build -w @aia/server && npm run build -w @aia/web",
     "build:server": "npm run build -w @aia/shared && npm run build -w @aia/server",
     "start": "node --enable-source-maps packages/server/dist/index.js",
-    "typecheck": "npm run typecheck -w @aia/shared && npm run typecheck -w @aia/server && npm run typecheck -w @aia/web",
+    "typecheck": "npm run build -w @aia/shared && npm run typecheck -w @aia/shared && npm run typecheck -w @aia/server && npm run typecheck -w @aia/web",
     "test": "npm run build:server && npm run test -w @aia/server && npm run test -w @aia/web",
     "smoke": "npm run build:server && node scripts/smoke-api.mjs",
     "e2e:agent": "npm run build:server && node scripts/e2e-agent.mjs",
