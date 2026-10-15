@@ -99,6 +99,11 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
+          # 构建标识注入镜像（.dockerignore 排除了 .git，容器里读不到 git 元数据）：
+          # `GET /api/version` 与前端左上角版本徽标据此显示真实 revision。
+          build-args: |
+            AIA_GIT_COMMIT=${{ github.sha }}
+            AIA_GIT_BRANCH=${{ github.ref_name }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}

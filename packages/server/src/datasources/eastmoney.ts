@@ -191,19 +191,37 @@ export async function emQuote(
   return null;
 }
 
-/** Batch quotes (used for indices and heat lists): one HTTP round-trip. */
+/**
+ * Batch quotes (used for indices and heat lists): one HTTP round-trip.
+ *
+ * `onError` mirrors `emQuote`/`emSeries`: without it `tryJson` swallowed the
+ * transport failure and a dead `push2` host became an empty snapshot, so callers
+ * could only say「快照不可用」with no reason (timeout? 502? DNS?). 实测本机
+ * push2 返回 502 / 连接被重置时，这条 warning 是唯一的现场线索。
+ */
 export async function emBatchQuotes(
   secids: string[],
   marketOf: (secid: string, code: string, marketFlag: number) => Market,
+  onError?: (message: string) => void,
 ): Promise<Quote[]> {
   if (secids.length === 0) return [];
   const url =
     'https://push2.eastmoney.com/api/qt/ulist.np/get?secids=' +
     encodeURIComponent(secids.join(',')) +
     '&fields=f1,f2,f3,f4,f12,f13,f14';
-  const json = await tryJson<{
+  let json: {
     data?: { diff?: Array<{ f1?: unknown; f2?: unknown; f3?: unknown; f4?: unknown; f12?: unknown; f13?: unknown; f14?: unknown }> };
-  }>(url, { headers: { Referer: REFERER }, cacheTtlMs: QUOTE_TTL_MS, cacheKey: `em:ulist:${secids.join(',')}` });
+  } | null = null;
+  try {
+    json = await httpJson(url, {
+      headers: { Referer: REFERER },
+      cacheTtlMs: QUOTE_TTL_MS,
+      cacheKey: `em:ulist:${secids.join(',')}`,
+    });
+  } catch (error) {
+    onError?.(errorMessage(error));
+    return [];
+  }
   const rows = json?.data?.diff ?? [];
   const out: Quote[] = [];
   for (const row of rows) {
@@ -652,14 +670,24 @@ const INDEX_MARKET: Record<string, Market> = {
   'NDX.X': 'US',
 };
 
-export async function emIndices(): Promise<Quote[]> {
-  return emBatchQuotes(INDEX_SECIDS, (_secid, code, flag) => {
-    const known = INDEX_MARKET[code];
-    if (known) return known;
-    if (flag === 116) return 'HK';
-    if (flag === 100) return 'US';
-    return 'CN';
-  });
+/**
+ * Global index snapshot used by the dashboard and macro tool.
+ *
+ * `onError` reports the transport failure of the underlying `push2` request so
+ * the caller can tell「上游挂了」from「上游返回空」(see `emBatchQuotes`).
+ */
+export async function emIndices(onError?: (message: string) => void): Promise<Quote[]> {
+  return emBatchQuotes(
+    INDEX_SECIDS,
+    (_secid, code, flag) => {
+      const known = INDEX_MARKET[code];
+      if (known) return known;
+      if (flag === 116) return 'HK';
+      if (flag === 100) return 'US';
+      return 'CN';
+    },
+    onError,
+  );
 }
 
 /** Single-file JSON helper shared by the other EM endpoints. */

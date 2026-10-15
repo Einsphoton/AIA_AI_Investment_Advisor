@@ -5,6 +5,7 @@
  * scheduler → listen. Wiring lives here; behaviour lives in the modules.
  */
 import { config, ensureDataDirs } from './config.js';
+import { formatVersionLabel } from '@aia/shared';
 import { buildApp } from './app.js';
 import { createRepo } from './db/repo.js';
 import { createAgent } from './agent/runtime.js';
@@ -75,7 +76,11 @@ async function main(): Promise<void> {
 
   try {
     await app.listen({ port: config.port, host: config.host });
-    app.log.info(`AI Investment Advisor ${config.version} → http://${config.host}:${config.port}`);
+    // Log the full build identity: which revision is serving is the first thing
+    // anyone needs when a deployment behaves differently than expected.
+    const { version, commit, environment } = config.versionInfo;
+    const identity = [formatVersionLabel(version, commit), environment].filter(Boolean).join(' · ');
+    app.log.info(`AI Investment Advisor ${identity} → http://${config.host}:${config.port}`);
   } catch (error) {
     app.log.error(error);
     process.exit(1);

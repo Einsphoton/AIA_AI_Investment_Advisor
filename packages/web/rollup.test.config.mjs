@@ -11,6 +11,7 @@ import commonjs from '@rollup/plugin-commonjs';
 import typescript from '@rollup/plugin-typescript';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { defineAppVersion, readAppVersion } from './scripts/app-version-plugin.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -25,6 +26,9 @@ export default {
   },
   treeshake: false,
   plugins: [
+    // Same version substitution as the browser bundle, so the render test can
+    // assert the real version text instead of a placeholder.
+    defineAppVersion(readAppVersion()),
     resolve({
       browser: false,
       preferBuiltins: true,

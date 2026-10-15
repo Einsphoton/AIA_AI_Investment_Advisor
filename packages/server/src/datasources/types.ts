@@ -71,7 +71,14 @@ export interface ProviderProfile {
 export interface MacroBundle {
   items: MacroItem[];
   indices: Quote[];
+  /** Real failures / degradations only — every entry means something went wrong. */
   warnings: string[];
+  /**
+   * Known coverage gaps that are **not** failures (e.g. 社会融资规模 has no
+   * zero-key upstream). Kept separate from `warnings` because a fixed note that
+   * fired on every run made a healthy analysis look like an outage.
+   */
+  notes: string[];
 }
 
 export interface SearchOptions {

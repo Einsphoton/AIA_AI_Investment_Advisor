@@ -32,17 +32,17 @@ import type { StoredSettings } from '../types/models.js';
 import {
   emDividends,
   emFundamentals,
-  emIndices,
   emQuote,
   emSearch,
   emSeries,
 } from './eastmoney.js';
 import { fundInfo, fundQuote, fundSearch, fundSeries } from './fund.js';
 import { emFinancials } from './financials.js';
+import { globalIndices } from './indices.js';
 import { keyedFundamentals, keyedQuote, keyedSeries } from './keyed.js';
 import { macroBundle, macroReport } from './macro.js';
 import { newsSearch } from './news.js';
-import { normalizeUsTicker, tencentBatch, tencentFundamentals, tencentQuote, tencentSeries } from './tencent.js';
+import { normalizeUsTicker, tencentFundamentals, tencentQuote, tencentSeries } from './tencent.js';
 import { tryText, errorMessage, clearHttpCache } from './http.js';
 import type {
   DataSourceSlot,
@@ -642,24 +642,9 @@ const DASHLESS_US_CLASS_SHARES = new Map([
 
 /* ─────────────────────────────── indices ────────────────────────────────── */
 
+/** Global index snapshot: Eastmoney first, Tencent fallback (see `indices.ts`). */
 export async function getIndices(): Promise<Sourced<Quote[]>> {
-  const warnings: string[] = [];
-  try {
-    const quotes = await emIndices();
-    if (quotes.length > 0) return { value: quotes, sources: ['eastmoney'], warnings };
-    warnings.push('东方财富指数快照为空');
-  } catch (error) {
-    warnings.push(`东方财富指数失败：${errorMessage(error)}`);
-  }
-  try {
-    const symbols = ['sh000001', 'sz399001', 'hkHSI', 'usDJI', 'usIXIC', 'usINX'];
-    const quotes = await tencentBatch(symbols, (symbol) => (symbol.startsWith('hk') ? 'HK' : symbol.startsWith('us') ? 'US' : 'CN'));
-    if (quotes.length > 0) return { value: quotes, sources: ['tencent'], warnings };
-    warnings.push('腾讯指数快照为空');
-  } catch (error) {
-    warnings.push(`腾讯指数失败：${errorMessage(error)}`);
-  }
-  return { value: [], sources: [], warnings };
+  return globalIndices();
 }
 
 /* ──────────────────────────────── macro ─────────────────────────────────── */
@@ -672,6 +657,7 @@ export async function getMacro(): Promise<MacroSnapshot> {
     news,
     updatedAt: new Date().toISOString(),
     warnings: bundle.warnings,
+    notes: bundle.notes,
   };
 }
 

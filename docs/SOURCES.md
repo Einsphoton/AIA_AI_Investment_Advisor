@@ -160,10 +160,10 @@
 | GDP | `reportName=RPT_ECONOMY_GDP` | ✅ |
 | PMI | `reportName=RPT_ECONOMY_PMI` | ✅ |
 | 货币供应 M2 | `reportName=RPT_ECONOMY_CURRENCY_SUPPLY` | ✅ |
-| 全球指数 | `push2.eastmoney.com/api/qt/ulist.np/get?secids=1.000001,1.000300,0.399001,100.HSI,100.NDX,100.DJIA,100.SPX` | ✅ |
+| 全球指数 | `push2.eastmoney.com/api/qt/ulist.np/get?secids=1.000001,1.000300,0.399001,100.HSI,100.NDX,100.DJIA,100.SPX` | ✅ **有兜底**：失败时降级腾讯 `qt.gtimg.cn/q=sh000001,sz399001,hkHSI,usDJI,usIXIC,usINX`（实现见 `datasources/indices.ts`，首页与 `get_macro` 共用同一条链路；上游失败原因写入 `warnings`，不再只报「快照不可用」） |
 | 财经资讯搜索 | `https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param={JSON}`（JSONP，需剥壳；`type:["cmsArticleWebOld"]`，`sort:"time"`） | ✅ |
 | **LPR（贷款市场报价利率）** | `reportName=RPTA_WEB_RATE&columns=ALL&sortColumns=TRADE_DATE&sortTypes=-1`（**注意排序字段是 TRADE_DATE**，没有 REPORT_DATE；无需 token） | ✅ 2026-10-15 实测：`LPR1Y=3`、`LPR5Y=3.5`、`RATE_1=4.35`、`RATE_2=4.9` @2026-09-20 |
-| 社会融资规模 | `RPT_ECONOMY_LPR` / `RPT_ECONOMY_TOTAL_SOCIETY_FINANCE` / `RPTA_WEB_SHRZGM` 等 48 种命名 | ❌ 2026-10-15 复核：报表均不存在；维持 web_search 兜底 |
+| 社会融资规模 | `RPT_ECONOMY_LPR` / `RPT_ECONOMY_TOTAL_SOCIETY_FINANCE` / `RPTA_WEB_SHRZGM` 等 48 种命名 | ❌ 2026-10-15 复核：报表均不存在。这是**已知覆盖缺口，不是故障**：放在 `get_macro` 返回的 `notes`（不再进 `warnings`、不再每次运行刷「缺失」），需要时由模型用 web_search 检索官方口径并注明发布日 |
 
 ## 5. 网页检索（Agent 挖掘信息用）
 

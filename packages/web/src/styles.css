@@ -243,6 +243,7 @@ ul { margin: 0; padding-left: 18px; }
 }
 
 .sidebar-brand { display: flex; align-items: center; gap: 12px; padding: 0 6px; }
+.sidebar-brand-text { display: flex; flex-direction: column; min-width: 0; }
 
 .sidebar-logo {
   position: relative;
@@ -263,6 +264,44 @@ ul { margin: 0; padding-left: 18px; }
   text-transform: uppercase;
   margin-top: 2px;
 }
+
+/* ── 版本徽标（左上角）────────────────────────────────────────────────────
+   展示「本次加载的前端版本 · 构建提交」，点开 / 悬浮可见服务端构建标识。
+   前后端版本不一致时转成告警色：浏览器缓存了旧 app.js 是最难排查的部署问题。 */
+.version-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-top: 5px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  border: 1px solid var(--gold-line);
+  background-color: var(--gold-soft);
+  color: var(--gold-200);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.version-badge-dot { width: 5px; height: 5px; flex: 0 0 5px; border-radius: 50%; background-color: var(--gold-400); }
+.version-badge-label { overflow: hidden; text-overflow: ellipsis; }
+.version-badge-warn {
+  border-color: rgba(224, 106, 84, 0.45);
+  background-color: rgba(224, 106, 84, 0.12);
+  color: #f0a894;
+}
+.version-badge-warn .version-badge-dot { background-color: #e06a54; }
+
+.version-detail { display: flex; flex-direction: column; gap: 5px; min-width: 224px; }
+.version-detail-row { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.version-detail-key {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  white-space: nowrap;
+}
+.version-detail-val { font-size: 11.5px; color: var(--text-dim); text-align: right; overflow-wrap: anywhere; }
+.version-detail-note { margin: 4px 0 0; font-size: 11px; line-height: 1.55; color: #f0a894; }
 
 .nav { display: flex; flex-direction: column; gap: 3px; }
 .nav-item {
@@ -1612,6 +1651,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   .sidebar-logo { width: 32px; height: 32px; flex-basis: 32px; border-radius: 9px; }
   .logo-text { font-size: 13px; }
   .sidebar-sub { display: none; }
+  /* 吸顶栏只有一行高度：版本徽标跟着品牌行竖排但收紧间距。 */
+  .version-badge { margin-top: 3px; font-size: 9.5px; }
   .nav {
     flex-direction: row; gap: 6px;
     overflow-x: auto;

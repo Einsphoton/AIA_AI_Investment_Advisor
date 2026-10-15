@@ -54,11 +54,19 @@ RUN npm ci --omit=dev --ignore-scripts \
 # ────────────────────────────── runtime ─────────────────────────────────────
 FROM node:${NODE_VERSION} AS runtime
 
+# 构建标识：镜像里没有 .git，服务器只能从环境变量知道自己在哪个 revision 上构建
+# （见 packages/server/src/version.ts）。CI 通过 --build-arg 注入，最终由
+# `GET /api/version` 和前端左上角的版本徽标展示。
+ARG AIA_GIT_COMMIT=""
+ARG AIA_GIT_BRANCH=""
+
 ENV NODE_ENV=production \
     PORT=8787 \
     HOST=0.0.0.0 \
     DATA_DIR=/data \
-    LOG_LEVEL=info
+    LOG_LEVEL=info \
+    AIA_GIT_COMMIT=${AIA_GIT_COMMIT} \
+    AIA_GIT_BRANCH=${AIA_GIT_BRANCH}
 
 # 注意：runtime 阶段不继承 base 阶段的 WORKDIR /app，这里的 /app 必须显式创建，
 # 否则 chown 会以 "chown: /app: No such file or directory" 直接中断构建。
@@ -80,6 +88,11 @@ COPY --from=build --chown=node:node /app/packages/server/package.json ./packages
 COPY --from=build --chown=node:node /app/packages/server/dist ./packages/server/dist
 COPY --from=build --chown=node:node /app/packages/web/package.json ./packages/web/package.json
 COPY --from=build --chown=node:node /app/packages/web/dist ./packages/web/dist
+# 运维脚本：远程部署排障要在**容器内**跑 `npm run trace`（直读 /data/advisor.db）
+# 与 `npm run probe:sources`（从这台机器的网络实测数据源）。之前只 COPY 到 build
+# 阶段，导致容器里 `npm run trace` 直接报模块不存在，只能先把 DB 拷出来。
+# 这些脚本只用 node 内置模块（node:sqlite / 全局 fetch），不需要 devDependencies。
+COPY --from=build --chown=node:node /app/scripts ./scripts
 
 USER node
 VOLUME ["/data"]

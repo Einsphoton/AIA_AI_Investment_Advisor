@@ -43,9 +43,14 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 
 ---
 
-## 1. 健康检查
+## 1. 健康检查与版本
 
-- `GET /api/health` → `{ ok, version, uptime, dataDir, webBuilt }`（`webBuilt` 表示前端产物是否存在）
+- `GET /api/health` → `{ ok, version, commit, builtAt, uptime, dataDir, webBuilt }`（`webBuilt` 表示前端产物是否存在；`commit`/`builtAt` 让部署核查一次请求就能确认「跑的是哪个 revision」）
+- `GET /api/version` → `AppVersionPayload`：`{ ok, version, commit, branch, builtAt, environment, node, startedAt, uptimeSeconds }`
+  - **版本号唯一来源是根 `package.json` 的 `version`**：服务端启动时解析，前端在构建期注入，任何一侧都不再写死
+  - `commit` / `branch` 优先取 `AIA_GIT_COMMIT` / `AIA_GIT_BRANCH`（`GIT_COMMIT` / `GITHUB_SHA` / `GITHUB_REF_NAME` 亦可）；本地开发直接读 `.git`（不调用 `git` 子进程）；容器镜像里 `.git` 被排除，由 CI 通过 `--build-arg` 注入；读不到一律为 `unknown`
+  - `builtAt` 取 `AIA_BUILD_TIME` → `SOURCE_DATE_EPOCH` → 运行产物 mtime；解析不到为 `''`
+  - 前端左上角版本徽标同时显示「本次加载的前端版本」与「服务端版本」，两者不一致时高亮告警 —— 这是「浏览器缓存了旧 `app.js`、却配上新 API」唯一可见的信号
 
 ## 2. 设置（/api/settings）
 
@@ -303,7 +308,35 @@ audit_log / pending_writes / kv`，返回逐表删除行数（`ClearDataResult`�
 - AI 流水线正在运行时拒绝执行（**409**），否则 run 结束后会把数据重新写回来；
 - 磁盘上的备份快照（`data/backups`）**不删除**，这是不可撤销操作的恢复后路。
 
-## 11. 前端路由
+## 11. 远程诊断（/api/diagnostics）
+
+远程部署（NAS 等无法随手进容器看日志的环境）用这两个接口把「现场」一次取走：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/diagnostics/logs?limit=200&level=warn` | `{ count, records: LogRecord[] }`；`level` 可选，按 `trace/debug/info/warn/error/fatal` 下限过滤 |
+| GET | `/api/diagnostics/report?logs=100&probe=1&runs=10&providers=eastmoney,tencent` | 完整现场（见下） |
+
+`LogRecord` = `{ seq, at, level, msg, raw }`，来自进程内的**日志环形缓冲**（最多 1000 条）：
+`buildApp()` 把 pino 输出同时写 stdout 与这个缓冲区，所以即使 Docker 的 json-file 日志
+（10MB × 3）已经轮转掉，最近日志仍在。`LOG_LEVEL=silent` 时缓冲区为空。
+
+`GET /api/diagnostics/report` 返回：
+
+| 字段 | 内容 |
+| --- | --- |
+| `app` | version / uptimeSec / node / platform / timezone / logLevel / dataDir / dbPath / webBuilt |
+| `llm` | `baseUrlHost`（只给 host，避免 query 里的 token 泄漏）、`model`、`keyConfigured`、`keySource` |
+| `sources` | **实时探测**结果 `ProbeResult[]`（默认探测零 Key 核心链路：eastmoney / tencent / eastmoney-macro / eastmoney-news / eastmoney-fund / bing），`?probe=0` 可跳过 |
+| `indices` | `{ count, sources, warnings }` —— 与 `get_macro` **同一条代码路径**（东财优先、腾讯兜底），失败原因（HTTP 502 / 超时 / 连接重置）在这里可见 |
+| `macro` | `{ itemCount, indexCount, warnings, notes }`；`warnings` 是真实故障/降级，`notes` 是已知覆盖缺口（如社会融资规模无零 Key 上游） |
+| `runs` | 最近 run 摘要 + `trace` 路径（`GET /api/agent/runs/:id/trace` 取完整轨迹） |
+| `logs` | 最近日志（同 `/api/diagnostics/logs`） |
+
+**不返回任何 API Key**：LLM 与数据源 Key 只报「是否已配置」。每条链路独立降级，
+一次探测失败不会把整份报告变成 500。
+
+## 12. 前端路由
 
 | 路径 | 页面 |
 | --- | --- |

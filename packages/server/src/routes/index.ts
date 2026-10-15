@@ -6,6 +6,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 
+import { registerVersionRoutes } from './version.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerAssetRoutes } from './assets.js';
 import { registerWatchlistRoutes } from './watchlist.js';
@@ -16,12 +17,15 @@ import { registerMarketRoutes } from './market.js';
 import { registerAgentRoutes } from './agent.js';
 import { registerChatRoutes } from './chat.js';
 import { registerApprovalRoutes } from './approval.js';
+import { registerDiagnosticsRoutes } from './diagnostics.js';
 import { registerMcpRoutes } from './mcp.js';
 import { registerRunRoutes } from './runs.js';
 
 export const API_PREFIX = '/api';
 
 export async function registerRoutes(app: FastifyInstance): Promise<void> {
+  // Version/build identity first: the left-top UI badge hits it on every load.
+  await registerVersionRoutes(app);
   await registerSettingsRoutes(app);
   await registerAssetRoutes(app);
   await registerWatchlistRoutes(app);
@@ -35,4 +39,6 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   await registerApprovalRoutes(app);
   await registerMcpRoutes(app);
   await registerRunRoutes(app);
+  // 远程部署排障：日志环形缓冲 + 数据源实时探测 + 指数/宏观链路现场。
+  await registerDiagnosticsRoutes(app);
 }

@@ -8,11 +8,48 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { resolveVersionInfo } from './version.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-/** Repository root (鈥?packages/server/src 鈫?鈥?) or `/app` in the container. */
-export const APP_ROOT = path.resolve(here, '..', '..', '..');
+/**
+ * Repository root — found by walking up to the workspace manifest.
+ *
+ * A fixed number of `..` hops does not work: the compiled server sits at
+ * `<root>/packages/server/dist` in production but at
+ * `<root>/packages/server/dist-test/src` in the test build, and the wrong root
+ * silently resolves to `packages/` (which has no `package.json`, so the version,
+ * the web bundle and the default data dir all point at nothing). The manifest
+ * check is the deterministic marker of the workspace root; the historical
+ * 3-level hop stays as the fallback.
+ */
+function findAppRoot(from: string): string {
+  let dir = from;
+  for (let depth = 0; depth < 6; depth += 1) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as { workspaces?: unknown };
+      if (manifest.workspaces) return dir;
+    } catch {
+      /* no manifest here — keep walking up */
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.resolve(from, '..', '..', '..');
+}
+
+/** Repository root (…/packages/server/src → …) or `/app` in the container. */
+export const APP_ROOT = findAppRoot(here);
+
+/**
+ * Build identity (version from the root `package.json`, plus commit / branch /
+ * build time). Resolved once at boot: it cannot change while the process runs.
+ */
+const versionInfo = resolveVersionInfo({
+  appRoot: APP_ROOT,
+  environment: process.env.NODE_ENV ?? 'development',
+});
 
 function envStr(name: string, fallback: string): string {
   const raw = process.env[name];
@@ -41,7 +78,10 @@ export const config = {
   /** Built web assets served in production (`packages/web/dist`). */
   webDistDir: path.resolve(APP_ROOT, 'packages/web/dist'),
   isProduction: process.env.NODE_ENV === 'production',
-  version: '0.1.0',
+  /** Always mirrors `versionInfo.version`; kept for existing callers. */
+  version: versionInfo.version,
+  /** Version + build identity, surfaced by `GET /api/version` and the UI badge. */
+  versionInfo,
   /** Default LLM config from env; overridden by stored settings when present. */
   envLlm: {
     baseUrl: envStr('LLM_BASE_URL', 'https://api.deepseek.com/v1'),

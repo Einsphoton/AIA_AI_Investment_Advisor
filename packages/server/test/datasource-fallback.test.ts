@@ -18,6 +18,8 @@ import { clearHttpCache, UpstreamHttpError } from '../src/datasources/http.js';
 import { normalizeCode } from '../src/datasources/registry.js';
 import { getFundamentals, getQuote, getSeries } from '../src/datasources/registry.js';
 import { emSecidCandidates, emUsCode } from '../src/datasources/eastmoney.js';
+import { globalIndices } from '../src/datasources/indices.js';
+import { macroBundle } from '../src/datasources/macro.js';
 import { parseTencentRecord, parseIfzqSeries, tencentSymbol } from '../src/datasources/tencent.js';
 
 /** One `~`-separated Tencent record; only the indices we assert on need meaning. */
@@ -253,4 +255,98 @@ test('UpstreamHttpError 保留状态码与响应体（诊断依赖它）', () =>
   const error = new UpstreamHttpError('https://push2.eastmoney.com/api/qt/stock/get', 502, '<html>502</html>');
   assert.equal(error.status, 502);
   assert.match(error.message, /502/);
+});
+
+/* ─────────────────── global indices fallback (macro, 2026-10-15) ──────────── */
+
+/** `v_<symbol>="…"` batch body, the shape `qt.gtimg.cn/q=` really returns. */
+function tencentBatchBody(entries: Array<[symbol: string, name: string, price: string]>): string {
+  return entries
+    .map(([symbol, name, price]) => {
+      const fields = new Array<string>(80).fill('');
+      fields[1] = name;
+      fields[3] = price;
+      return `v_${symbol}="${fields.join('~')}";`;
+    })
+    .join('');
+}
+
+test('回归：push2 挂掉时全球指数由腾讯兜底，且降级原因带 HTTP 状态', async () => {
+  // 生产现场：首页能显示指数（走后端 registry.getIndices），而 get_macro 报
+  // 「全球指数快照不可用」—— 因为 macroBundle 直接调 emIndices()，绕过了兜底。
+  const { urls } = stubFetch((url) => {
+    if (url.includes('qt.gtimg.cn')) {
+      return new Response(
+        tencentBatchBody([
+          ['sh000001', '上证指数', '3200.12'],
+          ['hkHSI', '恒生指数', '26000.50'],
+        ]),
+        { status: 200 },
+      );
+    }
+    return null; // push2 ulist → 502
+  });
+  try {
+    const result = await globalIndices();
+    assert.ok(result.value.length > 0, '腾讯兜底必须给出指数，不能是空快照');
+    assert.deepEqual(result.sources, ['tencent']);
+    assert.ok(urls.some((url) => url.includes('push2.eastmoney.com')), '必须先试东方财富');
+    assert.ok(urls.some((url) => url.includes('qt.gtimg.cn')), '必须真的请求过腾讯兜底');
+    assert.ok(
+      result.warnings.some((warning) => /HTTP 502/.test(warning)),
+      `降级原因必须保留 HTTP 状态，实际：${result.warnings.join(' | ')}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('回归：两家都挂时，指数 warning 带真实原因而不是只有「不可用」', async () => {
+  stubFetch(() => null); // push2 + qt.gtimg 全挂
+  try {
+    const result = await globalIndices();
+    assert.equal(result.value.length, 0);
+    assert.deepEqual(result.sources, []);
+    assert.ok(
+      result.warnings.some((warning) => /HTTP 502|失败/.test(warning)),
+      `必须能区分「上游故障」与「上游返回空」，实际：${result.warnings.join(' | ')}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('回归：macroBundle 有兜底时不再报「快照不可用」；社融只在 notes、不进 warnings', async () => {
+  stubFetch((url) => {
+    if (url.includes('datacenter-web.eastmoney.com')) {
+      // 报表返回空即可 —— 本用例只关心指数链路与 社融/notes 的分流。
+      return new Response(JSON.stringify({ success: true, result: { data: [] } }), { status: 200 });
+    }
+    if (url.includes('qt.gtimg.cn')) {
+      return new Response(tencentBatchBody([['sh000001', '上证指数', '3200.12']]), { status: 200 });
+    }
+    return null; // push2 → 502
+  });
+  try {
+    const bundle = await macroBundle();
+    assert.equal(bundle.indices.length, 1, '兜底成功后 indices 不能为空');
+    assert.ok(
+      bundle.warnings.some((warning) => warning.includes('已降级为腾讯行情')),
+      `网络降级要如实标注，实际：${bundle.warnings.join(' | ')}`,
+    );
+    assert.ok(
+      !bundle.warnings.some((warning) => warning.includes('全球指数快照不可用')),
+      '有兜底数据时绝不能再说「不可用」',
+    );
+    assert.ok(
+      bundle.notes.some((note) => note.includes('社会融资规模')),
+      '社融是已知覆盖缺口，应作为 notes 告知模型',
+    );
+    assert.ok(
+      !bundle.warnings.some((warning) => warning.includes('社会融资规模')),
+      '社融是稳态缺口，不允许再当成每次运行的 warning 刷屏',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

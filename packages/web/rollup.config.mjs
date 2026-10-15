@@ -15,6 +15,7 @@ import terser from '@rollup/plugin-terser';
 import { copyFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { defineAppVersion, readAppVersion } from './scripts/app-version-plugin.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const watching = process.argv.includes('--watch') || process.argv.includes('-w');
@@ -101,6 +102,10 @@ export default {
   },
   treeshake: { moduleSideEffects: 'no-external' },
   plugins: [
+    // App version from the root package.json (single source of truth) — the
+    // top-left badge must show the version of *this* bundle even before the API
+    // answers, so the value is baked in rather than duplicated by hand.
+    defineAppVersion(readAppVersion()),
     defineProcessEnv(nodeEnv),
     copyHtml(),
     resolve({

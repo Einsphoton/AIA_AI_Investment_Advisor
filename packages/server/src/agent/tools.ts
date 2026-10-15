@@ -470,7 +470,9 @@ const getDividends: RegisteredTool = {
 const getMacro: RegisteredTool = {
   descriptor: {
     name: 'get_macro',
-    description: '获取宏观环境：CPI/PPI/GDP/PMI/M2 最新值与同比，以及全球主要指数快照。',
+    description:
+      '获取宏观环境：CPI/PPI/GDP/PMI/M2/LPR 最新值与同比，以及全球主要指数快照。' +
+      '注意：社会融资规模没有零 Key 上游（已知覆盖缺口，不是故障），需要时用 web_search 检索官方口径。',
     parameters: { type: 'object', properties: {}, required: [] },
   },
   async handler() {
@@ -479,7 +481,9 @@ const getMacro: RegisteredTool = {
       items: snapshot.items,
       indices: snapshot.indices,
       updatedAt: snapshot.updatedAt,
+      // 只放真实故障/降级；已知覆盖缺口单独放 notes，避免把稳态缺口当成报错。
       warnings: snapshot.warnings,
+      notes: snapshot.notes ?? [],
     });
   },
 };

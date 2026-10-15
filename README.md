@@ -7,6 +7,7 @@
 - 🤖 **真 Agent，不是套壳提示词**：多轮工具调用循环（搜索、抓网页、取行情、查财报、写库），带步骤时间线、轮次与 token 统计
 - 🔓 **零 Key 数据源开箱可用**：东方财富 / 腾讯行情 / 天天基金 / Bing，全部为公开接口；也可在设置里换成 Tushare、Finnhub、Alpha Vantage、Tavily 等需 Key 的源
 - 🔐 **数据自己拿着**：SQLite 单文件 + 一键导出/导入 JSON 备份
+- 🏷️ **版本可见**：版本号唯一来源是根 `package.json`，服务端启动时解析并由 `GET /api/version` 暴露；前端在构建期注入同一份版本号，**左上角常驻显示「版本 · 提交」**，前后端版本不一致（浏览器缓存旧 `app.js`）时会高亮告警
 
 ---
 
@@ -115,6 +116,14 @@ docker compose pull && docker compose up -d   # 更新到最新发布镜像
 docker compose up -d --build       # 用当前源码重建（改了代码）
 ```
 
+远程部署出问题时，用一条命令把「现场」取走（日志环形缓冲 + 数据源实时探测 + 指数/宏观链路）：
+
+```bash
+curl -s http://<服务器IP>:8787/api/diagnostics/report | tee diag.json
+```
+
+详见「常见问题 → 远程部署（NAS 等）上出问题，怎么把现场发出去排查」。
+
 数据持久化：
 
 - 默认使用命名卷 `advisor-data`，挂载到容器内 `/data`（SQLite 数据库 + 备份快照）。
@@ -136,6 +145,8 @@ docker compose up -d --build       # 用当前源码重建（改了代码）
 - **固定版本**：在 `.env` 里写 `AIA_IMAGE=ghcr.io/einsphoton/aia_ai_investment_advisor:sha-1a2b3c4`
   即可锁定某次提交的镜像（默认跟 `:latest`）；
 - **可回滚**：每次提交都有 `sha-xxxxxxx` 标签，改回上一个标签 + `docker compose up -d` 即可；
+- **可核对版本**：镜像里没有 `.git`，CI 会把提交号作为构建参数注入，所以 `curl -s localhost:8787/api/version`
+  或页面左上角的版本徽标能直接确认「这个容器跑的是哪个 revision」，不用去翻镜像标签；
 - 想同时发到 Docker Hub：在仓库 Secrets 里加 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`，再给
   workflow 增加一个 `docker/login-action` + 同名 tag 即可（当前只用 GHCR，保持零配置）。
 
@@ -244,6 +255,9 @@ npm run probe:sources
 | `LLM_TIMEOUT_MS` | `180000` | 单次 LLM 请求超时 |
 | `TAVILY_API_KEY` / `SERPER_API_KEY` / `BRAVE_API_KEY` | 空 | 可选，配置后优先用于联网检索 |
 | `FINNHUB_API_KEY` / `ALPHAVANTAGE_API_KEY` / `FMP_API_KEY` | 空 | 可选，美股/港股基本面增强 |
+| `AIA_VERSION` | 根 `package.json` 的 `version` | 覆盖版本号（一般不用改：版本号以 `package.json` 为唯一来源） |
+| `AIA_GIT_COMMIT` / `AIA_GIT_BRANCH` | 本地读 `.git`，容器里为空 | 构建标识。镜像内没有 `.git`，由 CI 通过 `--build-arg` 注入，最终显示在 `GET /api/version` 与左上角版本徽标里 |
+| `AIA_BUILD_TIME` | 运行产物 mtime | ISO 时间或 Unix 秒；可复现构建也可用 `SOURCE_DATE_EPOCH` |
 
 环境变量只提供**默认值**；同名配置在设置页修改后会写入 SQLite 并优先生效（API Key 在界面上始终以掩码显示）。
 
@@ -351,6 +365,7 @@ AIInvestmentAdvisor/
 
 ```
 GET    /api/health
+GET    /api/version                   # 版本号 + commit/branch/builtAt（左上角徽标的数据源）
 GET    /api/dashboard
 GET/PUT /api/settings                 POST /api/settings/test-llm
 GET    /api/settings/data-sources     POST /api/settings/data-sources/probe
@@ -431,7 +446,34 @@ A：可以。本地调试与生产模式都只需要 Node 24；Docker 只是部�
 A：到「设置 → AI 配置」填写 Base URL 与 API Key（或在 `.env` 里设置 `LLM_API_KEY`），点「测试连接」确认可用。行情、标的列表、备份等功能不依赖 Key，可先离线使用。
 
 **Q：某些行情/财务数据显示为空？**
-A：运行 `npm run probe:sources` 看哪个源在当前网络不可用；界面上每处数据都会标注来源（`sources`）与提示（`warnings`），应用不会用 0 或假数据糊弄。**财报三表**走东方财富 F10：A 股完整三表（按通用/银行/证券/保险模板自动匹配）、港股为利润表 + 资产负债表 + 主要指标口径的现金流总量、美股为利润表 + 资产负债表；**美股现金流量表由 SEC EDGAR 的官方 XBRL 补齐**（零 Key，少数只以带维度事实申报的发行人如 KO/V 拿不到，会明确标注「数据缺失 + 原因」并由 Agent 改用 `web_search` 检索 10-K/10-Q 原文，绝不编造）。
+A：运行 `npm run probe:sources` 看哪个源在当前网络不可用（远程部署时用 `docker exec` 进容器跑，见下条）；界面上每处数据都会标注来源（`sources`）与提示（`warnings`），应用不会用 0 或假数据糊弄。**财报三表**走东方财富 F10：A 股完整三表（按通用/银行/证券/保险模板自动匹配）、港股为利润表 + 资产负债表 + 主要指标口径的现金流总量、美股为利润表 + 资产负债表；**美股现金流量表由 SEC EDGAR 的官方 XBRL 补齐**（零 Key，少数只以带维度事实申报的发行人如 KO/V 拿不到，会明确标注「数据缺失 + 原因」并由 Agent 改用 `web_search` 检索 10-K/10-Q 原文，绝不编造）。
+
+**Q：远程部署（NAS 等）上出问题，怎么把「现场」发出去排查？**
+A：三种手段，按方便程度排：
+
+```bash
+# ① 一次请求拿到完整现场（推荐）：最近日志 + 数据源实时探测 + 指数/宏观链路 + 最近 run
+curl -s "http://<NAS>:8787/api/diagnostics/report" | tee diag.json
+
+# ② 容器日志（stdout → json-file，10MB × 3 轮转；调详细度：.env 里 LOG_LEVEL=debug 后重启）
+docker logs --since 24h ai-investment-advisor 2>&1 | tail -200
+
+# ③ 容器内直接跑运维脚本（镜像内已带 scripts/）
+docker exec -i ai-investment-advisor npm run probe:sources      # 从这台机器的网络实测各数据源
+docker exec -i ai-investment-advisor npm run trace -- --list    # 最近 20 次 run
+docker exec -i ai-investment-advisor npm run trace -- <runId>   # 导出完整轨迹 JSON
+```
+
+说明：
+
+- `/api/diagnostics/report` 里的 `sources` 是**实时探测**结果，`indices.warnings` / `macro.warnings`
+  会带上真实失败原因（HTTP 502 / 超时 / 连接重置）—— 这正是「全球指数快照不可用」这类提示
+  以前查不到原因的地方。接口**不返回任何 API Key**。
+- 完整对话与工具返回不在日志里，而在 SQLite 的持久化消息轨迹中：`GET /api/agent/runs/:id/trace`
+  （界面「活动与审计」页也能看，并可一键续跑）。把 `diag.json` + 某个 run 的 trace JSON 发出来即可定位。
+- 容器没挂载文件日志：日志只进 stdout，所以 `docker logs` 轮转掉就没了；`/api/diagnostics/logs`
+  读的是进程内的环形缓冲（最近 1000 条），可以补上这段。
+- 实在要离线分析：`docker cp ai-investment-advisor:/data/advisor.db .` 把库拷出来，在本地 `npm run trace`。
 
 **Q：定时任务会跑多久、会不会重叠？**
 A：单次流水线的时间取决于持仓/标的数量与 LLM 速度。调度器保证**同一时刻只有一个流水线在运行**：定时触发若上一次未结束会跳过本次；手动入口（AI 资产分析 / AI 标的分析 / AI 投资建议 / 手动运行）在锁被占用时会立即提示「已有 AI 流水线正在运行，请稍后再试」且不写入任何数据。唯一例外是 **AI Chat 有意不受这把锁保护**（交互对话不该被动辄数十秒的流水线阻塞），因此它与该批流水线可能并发写入 —— 单用户自托管场景可接受。

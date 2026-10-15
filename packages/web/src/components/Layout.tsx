@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import { Badge } from './ui';
 import { PendingWritesBar } from './PendingWritesBar';
+import { VersionBadge } from './VersionBadge';
 
 interface NavEntry {
   to: string;
@@ -110,9 +111,11 @@ export function Layout() {
             <div className="sidebar-logo" aria-hidden="true">
               <span className="logo-text">AI</span>
             </div>
-            <div>
+            <div className="sidebar-brand-text">
               <div className="sidebar-title">投资顾问</div>
               <div className="sidebar-sub">Self-hosted Agent</div>
+              {/* 左上角版本徽标：构建期注入的前端版本 + 服务端构建标识（悬浮展开） */}
+              <VersionBadge />
             </div>
           </div>
 

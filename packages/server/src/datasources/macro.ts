@@ -5,14 +5,19 @@
  *
  * LPR 走 `RPTA_WEB_RATE`（贷款市场报价利率，字段 LPR1Y / LPR5Y）—— 2026-10-15
  * 复核确认可用，此前注释里「上游没有 LPR 报表」的结论是错的，已修正。
- * 社会融资规模确实没有可用的零 Key 报表（已核对 RPT_ECONOMY_* / RPTA_WEB_* 的常见
- * 命名），仍然如实报 warning，由模型按硬性规则用 `web_search` 补充并注明来源。
+ *
+ * 全球指数走 `indices.globalIndices()`（东财优先、腾讯兜底），不再直接调
+ * `emIndices()` —— 那条路径没有兜底，上游 502 就会整块报「快照不可用」。
+ *
+ * 社会融资规模确实没有可用的零 Key 报表（已核对 RPT_ECONOMY_* / RPTA_WEB_*
+ * 的常见命名）。它是**已知覆盖缺口，不是故障**：放在 `notes` 而不是 `warnings`，
+ * 不再每次运行都刷一条「缺失」；模型侧由系统提示词规则 14 兜底。
  *
  * Owner: agent-engine.
  */
 import type { MacroItem, SourceId } from '@aia/shared';
 import { round4, toNumber, tryJson } from './http.js';
-import { emIndices } from './eastmoney.js';
+import { globalIndices } from './indices.js';
 import type { MacroBundle } from './types.js';
 
 const SOURCE: SourceId = 'eastmoney-macro';
@@ -90,7 +95,8 @@ export async function macroBundle(): Promise<MacroBundle> {
     macroRows('RPT_ECONOMY_CURRENCY_SUPPLY', 3),
     // LPR 按报价日（每月 20 日）排序，没有 REPORT_DATE 列。
     macroRows('RPTA_WEB_RATE', 3, 'TRADE_DATE'),
-    emIndices(),
+    // 东财优先、腾讯兜底；失败原因留在 `indices.warnings` 里。
+    globalIndices(),
   ]);
 
   const latest = (rows: Array<Record<string, unknown>>): Record<string, unknown> | undefined => rows[0];
@@ -123,12 +129,21 @@ export async function macroBundle(): Promise<MacroBundle> {
   if (pmi.length === 0) warnings.push('宏观：PMI 报表不可用');
   if (money.length === 0) warnings.push('宏观：货币供应报表不可用');
   if (lpr.length === 0) warnings.push('宏观：LPR 报表不可用（RPTA_WEB_RATE）');
-  if (indices.length === 0) warnings.push('宏观：全球指数快照不可用');
-  warnings.push(
-    '社会融资规模：东财数据中心无可用零 Key 报表（已核对 RPT_ECONOMY_* / RPTA_WEB_* 常见命名），如需引用请用 web_search 检索并注明来源与发布日期',
-  );
 
-  return { items, indices, warnings };
+  // 指数：两家都拿到空才是「不可用」；东财挂了但腾讯兜住，如实标注降级原因，
+  // 但不再让整块指数消失（此前 macroBundle 直接调 emIndices()，没有兜底）。
+  if (indices.value.length === 0) {
+    warnings.push(`宏观：全球指数快照不可用（${indices.warnings.join('；') || '两家上游均返回空'}）`);
+  } else if (!indices.sources.includes('eastmoney')) {
+    warnings.push(`宏观：全球指数已降级为腾讯行情（${indices.warnings.join('；') || '东方财富不可用'}）`);
+  }
+
+  // 已知覆盖缺口，不是故障 —— 见文件头注释与系统提示词规则 14。
+  const notes: string[] = [
+    '社会融资规模：东财数据中心无可用零 Key 报表（已核对 RPT_ECONOMY_* / RPTA_WEB_* 常见命名），属已知覆盖缺口；如需引用请用 web_search 检索官方口径并注明来源与发布日期',
+  ];
+
+  return { items, indices: indices.value, warnings, notes };
 }
 
 /** Exposed for tests/tools: single macro report rows. */

@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import { config } from './config.js';
 import { AppError } from './errors.js';
 import { registerRoutes } from './routes/index.js';
+import { createLogStream } from './services/log-buffer.js';
 
 export interface BuildAppOptions {
   /** Disable the static web app (used by tests). */
@@ -18,7 +19,11 @@ export interface BuildAppOptions {
 
 export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: config.logLevel === 'silent' ? false : { level: config.logLevel },
+    // `createLogStream()` tees pino into a ring buffer while still writing to
+    // stdout, so `GET /api/diagnostics/report` can return recent lines even
+    // when the container's json-file log has already rotated.
+    logger:
+      config.logLevel === 'silent' ? false : { level: config.logLevel, stream: createLogStream() },
     bodyLimit: 32 * 1024 * 1024,
     // Long-running AI pipelines stream for minutes; never time them out.
     requestTimeout: 0,
@@ -61,6 +66,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   app.get('/api/health', async () => ({
     ok: true,
     version: config.version,
+    // Build identity inline: `docker logs`/curl deployment checks should not need
+    // a second request to tell which revision is actually serving.
+    commit: config.versionInfo.commit,
+    builtAt: config.versionInfo.builtAt,
     uptime: process.uptime(),
     dataDir: config.dataDir,
     webBuilt: fs.existsSync(`${config.webDistDir}/index.html`),

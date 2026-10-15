@@ -17,6 +17,7 @@ import type { AddressInfo } from 'node:net';
 import type { FastifyInstance } from 'fastify';
 
 import { createRepo } from '../src/db/repo.js';
+import { config } from '../src/config.js';
 import { setServices } from '../src/registry.js';
 import type { AgentRuntime } from '../src/types/agent.js';
 import type { Repo } from '../src/types/repo.js';
@@ -61,6 +62,36 @@ after(async () => {
 });
 
 const json = (res: { body: string }): any => JSON.parse(res.body);
+
+/* ─────────────── 版本 / 构建标识（前端左上角徽标的数据源） ─────────────── */
+
+test('version: /api/version 返回运行中的构建标识，版本号来自根 package.json', async () => {
+  const res = await app.inject({ method: 'GET', url: '/api/version' });
+  assert.equal(res.statusCode, 200);
+  const payload = json(res);
+  const rootVersion = (
+    JSON.parse(fs.readFileSync(path.join(config.appRoot, 'package.json'), 'utf8')) as { version: string }
+  ).version;
+
+  assert.equal(payload.ok, true);
+  assert.equal(payload.version, rootVersion, '版本号必须等于根 package.json（唯一来源）');
+  assert.match(payload.commit, /^([0-9a-f]{7,40}|unknown)$/, 'commit 必须是短哈希或 unknown');
+  assert.ok(typeof payload.branch === 'string' && payload.branch.length > 0, 'branch 不能为空');
+  assert.ok(typeof payload.environment === 'string' && payload.environment.length > 0);
+  assert.equal(payload.node, process.version);
+  assert.ok(Number.isFinite(payload.uptimeSeconds) && payload.uptimeSeconds >= 0);
+  assert.ok(!Number.isNaN(Date.parse(payload.startedAt)), 'startedAt 必须是可解析的 ISO 时间');
+  assert.ok(Date.parse(payload.startedAt) <= Date.now(), '启动时间不能在未来');
+});
+
+test('health: 带上 commit/builtAt，部署核查不用再发第二个请求', async () => {
+  const health = json(await app.inject({ method: 'GET', url: '/api/health' }));
+  const version = json(await app.inject({ method: 'GET', url: '/api/version' }));
+  assert.equal(health.ok, true);
+  assert.equal(health.version, version.version);
+  assert.equal(health.commit, version.commit);
+  assert.equal(health.builtAt, version.builtAt);
+});
 
 test('settings: 掩码返回，绝不泄漏明文；apiKey 省略/null/字符串 三态', async () => {
   const initial = json(await app.inject({ method: 'GET', url: '/api/settings' }));
@@ -1402,4 +1433,71 @@ test('backup/clear: 一键清除所有数据（默认保留 AI 配置，可恢�
   assert.equal(fresh.persona, 'balanced');
   assert.equal(fresh.schedule.mode, 'off');
   assert.ok(!JSON.stringify(fresh).includes(RAW_API_KEY), '响应中不得出现明文 API Key');
+});
+
+/* ───────────────────────── 远程诊断（/api/diagnostics） ───────────────────── */
+
+test('diagnostics: 一次请求带齐日志/探测/指数现场，且绝不泄漏 Key', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  // 生产现场：push2 / 腾讯 / bing 全挂 —— 报告必须把真实原因写出来。
+  globalThis.fetch = (async (input: unknown) => {
+    calls.push(String(input));
+    return new Response('<html>502 Bad Gateway</html>', { status: 502 });
+  }) as unknown as typeof fetch;
+  try {
+    await app.inject({ method: 'PUT', url: '/api/settings', payload: { apiKey: RAW_API_KEY } });
+    const res = await app.inject({ method: 'GET', url: '/api/diagnostics/report?probe=1&logs=20&runs=5' });
+    assert.equal(res.statusCode, 200);
+    const body = json(res);
+
+    assert.equal(typeof body.app.version, 'string');
+    assert.ok(body.app.version.length > 0);
+    assert.equal(typeof body.app.uptimeSec, 'number');
+    assert.ok(body.app.dataDir.length > 0);
+
+    // Key 只报「是否已配置」，明文与字段名都不许出现。
+    assert.equal(body.llm.keyConfigured, true);
+    assert.equal(body.llm.keySource, 'settings');
+    assert.ok(!('apiKey' in body.llm), '诊断报告不得包含 apiKey 字段');
+    assert.ok(!res.body.includes(RAW_API_KEY), '诊断报告不得出现明文 API Key');
+
+    // 指数失败原因必须可见（这正是「全球指数快照不可用」以前查不到的地方）。
+    assert.ok(
+      body.indices.warnings.some((warning: string) => /HTTP 502|失败/.test(warning)),
+      `指数链路原因必须透出，实际：${JSON.stringify(body.indices.warnings)}`,
+    );
+    // 社融是已知缺口 → notes；不得再作为 warning 出现。
+    assert.ok(body.macro.notes.some((note: string) => note.includes('社会融资规模')));
+    assert.ok(!body.macro.warnings.some((warning: string) => warning.includes('社会融资规模')));
+
+    assert.ok(Array.isArray(body.sources) && body.sources.length > 0, 'probe=1 必须返回探测结果');
+    assert.ok(calls.length > 0, 'probe=1 必须真的发起探测请求');
+    assert.ok(Array.isArray(body.runs));
+    assert.ok(Array.isArray(body.logs));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('diagnostics: probe=0 跳过探测；日志接口不会因缓冲为空而失败', async () => {
+  const originalFetch = globalThis.fetch;
+  // 即便 probe=0，report 仍会实时跑指数/宏观链路 —— 用 502 短路，避免真实联网。
+  globalThis.fetch = (async () => new Response('502', { status: 502 })) as unknown as typeof fetch;
+  try {
+    const res = await app.inject({ method: 'GET', url: '/api/diagnostics/report?probe=0&logs=5' });
+    assert.equal(res.statusCode, 200);
+    const body = json(res);
+    assert.deepEqual(body.sources, [], 'probe=0 不发起探测');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const logs = json(await app.inject({ method: 'GET', url: '/api/diagnostics/logs?limit=5&level=warn' }));
+  assert.equal(typeof logs.count, 'number');
+  assert.ok(Array.isArray(logs.records));
+  for (const record of logs.records) {
+    assert.equal(typeof record.at, 'string');
+    assert.equal(typeof record.msg, 'string');
+  }
 });

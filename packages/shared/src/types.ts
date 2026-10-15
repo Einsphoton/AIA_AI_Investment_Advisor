@@ -899,6 +899,11 @@ export interface MacroSnapshot {
   news: NewsItem[];
   updatedAt: string;
   warnings: string[];
+  /**
+   * Known coverage gaps (不是故障): e.g. 社会融资规模没有零 Key 上游。
+   * Optional so older clients/payloads stay valid.
+   */
+  notes?: string[];
 }
 
 export interface NewsItem {

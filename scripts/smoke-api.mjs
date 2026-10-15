@@ -395,6 +395,30 @@ try {
   const macro = await call('GET', '/api/market/macro');
   record('GET /api/market/macro 宏观', macro.status === 200 ? 'PASS' : 'WARN', `status=${macro.status}`);
 
+  /* ── 远程诊断（NAS 排障入口） ─────────────────────────────────────────── */
+  const diagnostics = await call('GET', '/api/diagnostics/report?probe=0&logs=10&runs=5');
+  check(
+    'GET /api/diagnostics/report 返回现场（app/indices/macro/logs）',
+    diagnostics.status === 200 &&
+      typeof diagnostics.json?.app?.uptimeSec === 'number' &&
+      Array.isArray(diagnostics.json?.indices?.warnings) &&
+      Array.isArray(diagnostics.json?.macro?.notes) &&
+      Array.isArray(diagnostics.json?.logs),
+    `status=${diagnostics.status}`,
+  );
+  check(
+    '诊断报告：社融是 notes 而不是 warnings（已知缺口 ≠ 报错）',
+    (diagnostics.json?.macro?.notes ?? []).some((note) => note.includes('社会融资规模')) &&
+      !(diagnostics.json?.macro?.warnings ?? []).some((warning) => warning.includes('社会融资规模')),
+    `notes=${diagnostics.json?.macro?.notes?.length} warnings=${diagnostics.json?.macro?.warnings?.length}`,
+  );
+  const diagLogs = await call('GET', '/api/diagnostics/logs?limit=10');
+  check(
+    'GET /api/diagnostics/logs 读进程内日志缓冲',
+    diagLogs.status === 200 && typeof diagLogs.json?.count === 'number' && Array.isArray(diagLogs.json?.records),
+    `status=${diagLogs.status} count=${diagLogs.json?.count}`,
+  );
+
   /* ── 删除级联 ─────────────────────────────────────────────────────────── */
   const removed = await call('DELETE', `/api/assets/${assetId}`);
   check('DELETE /api/assets/:id', removed.status === 200 && removed.json?.ok === true);
@@ -419,6 +443,9 @@ try {
   leaks.push(['GET /api/settings', settingsAfter.text]);
   leaks.push(['GET /api/settings/data-sources', (await call('GET', '/api/settings/data-sources')).text]);
   leaks.push(['GET /api/backup/export', (await call('GET', '/api/backup/export')).text]);
+  // 诊断接口会回传最近日志与 LLM 配置摘要，必须同样不含明文 Key。
+  leaks.push(['GET /api/diagnostics/report', (await call('GET', '/api/diagnostics/report?probe=0&logs=50')).text]);
+  leaks.push(['GET /api/diagnostics/logs', (await call('GET', '/api/diagnostics/logs?limit=100')).text]);
   const snapshot = await call('POST', '/api/backup/files', {});
   leaks.push(['POST /api/backup/files 响应', snapshot.text]);
   if (snapshot.json?.name) {

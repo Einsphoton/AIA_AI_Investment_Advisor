@@ -11,6 +11,7 @@ import type {
   AgentRun,
   AgentRunSummary,
   AgentTrace,
+  AppVersionPayload,
   AssetDetail,
   AssetSummary,
   AuditEntry,
@@ -133,7 +134,10 @@ export interface WatchlistQuery extends AssetListQuery {
 }
 
 export const api = {
-  health: () => request<{ ok: boolean; version: string; webBuilt: boolean }>('/health'),
+  health: () =>
+    request<{ ok: boolean; version: string; commit: string; builtAt: string; webBuilt: boolean }>('/health'),
+  /** Build identity of the running API — shown in the top-left version badge. */
+  version: () => request<AppVersionPayload>('/version'),
 
   /* ── settings ─────────────────────────────────────────────────────────── */
   settings: {

@@ -109,6 +109,52 @@ test('侧边栏包含全部七个导航入口', () => {
   }
 });
 
+/* ───────────────────── 左上角版本徽标 ───────────────────── */
+
+/** 根 package.json 的版本号 —— 全站唯一来源。 */
+function rootVersion(): string {
+  const pkg = JSON.parse(fs.readFileSync(path.resolve(SRC_DIR, '..', '..', '..', 'package.json'), 'utf8'));
+  return pkg.version as string;
+}
+
+test('左上角显示版本徽标：版本号来自根 package.json，且在导航之前', () => {
+  const html = render('/');
+  const version = rootVersion();
+  assert.ok(html.includes('version-badge'), '侧边栏品牌区缺少版本徽标');
+  assert.ok(html.includes(`v${version}`), `版本徽标未显示根 package.json 的版本 v${version}`);
+  assert.ok(!/version-badge-label">\s*(undefined|v—)/.test(html), '版本徽标必须渲染出真实版本号，不能是占位');
+  assert.ok(html.includes('查看版本信息'), '版本徽标缺少无障碍名称（键盘/读屏拿不到详情）');
+
+  // 「左上角」= 侧边栏品牌区，且必须排在导航之前（塞进页脚就是左下角了）。
+  const brand = html.indexOf('sidebar-brand');
+  const badge = html.indexOf('version-badge');
+  const nav = html.indexOf('class="nav"');
+  assert.ok(brand >= 0 && badge > brand, '版本徽标必须挂在左上角的侧边栏品牌区内');
+  assert.ok(nav > badge, '版本徽标必须位于导航之前（左上角），不能挪到侧边栏页脚');
+});
+
+test('版本机制接线：前端构建期注入 + /api/version 服务端标识 + 不一致告警', () => {
+  // 前端版本号不是手写的：由 rollup 从根 package.json 注入。
+  const rollupConfig = fs.readFileSync(path.resolve(SRC_DIR, '..', 'rollup.config.mjs'), 'utf8');
+  assert.ok(rollupConfig.includes('defineAppVersion'), '浏览器构建未注入版本号，前端版本会退化成 unknown');
+  assert.ok(/__AIA_VERSION__/.test(readSource('version.ts')), '前端未读取构建期注入的版本号');
+
+  const client = readSource('api', 'client.ts');
+  assert.ok(/AppVersionPayload/.test(client) && /'\/version'/.test(client), 'client 缺少 GET /api/version');
+
+  const badge = readSource('components', 'VersionBadge.tsx');
+  assert.ok(/api\s*\.\s*version\(\)/.test(badge), '版本徽标必须拉取服务端版本');
+  assert.ok(/isVersionMismatch/.test(badge), '前后端版本不一致时必须能告警（旧缓存 app.js 最难排查）');
+
+  const layout = readSource('components', 'Layout.tsx');
+  assert.ok(/<VersionBadge/.test(layout), 'Layout 未挂载版本徽标');
+
+  // 服务端只有一个来源：config.version 镜像根 package.json（不再写死）。
+  const serverConfig = fs.readFileSync(path.resolve(SRC_DIR, '..', '..', 'server', 'src', 'config.ts'), 'utf8');
+  assert.ok(!/version:\s*'\d+\.\d+/.test(serverConfig), '服务端 config 又硬编码了版本号');
+  assert.ok(/versionInfo/.test(serverConfig), '服务端 config 未暴露 versionInfo');
+});
+
 /* ─────────────── Dashboard「AI一键分析」= 完整流水线 ─────────────── */
 
 test('Dashboard 工具栏提供「AI一键分析」，并走完整流水线（资产 → 标的 → 建议）', () => {
