@@ -32,6 +32,9 @@ RUN npm ci --ignore-scripts
 # ─────────────────────────────── build ──────────────────────────────────────
 FROM deps AS build
 COPY tsconfig.base.json ./
+# pre* 钩子会先跑 scripts/guard-running-pipeline.mjs（构建/测试前检查本机是否有 AI 流水线在跑），
+# 所以构建阶段必须把 scripts/ 一并复制进来；容器内 127.0.0.1:8787 没有服务，守卫直接放行（与 CI 同一分支）
+COPY scripts ./scripts
 COPY packages/shared ./packages/shared
 COPY packages/server ./packages/server
 COPY packages/web ./packages/web
