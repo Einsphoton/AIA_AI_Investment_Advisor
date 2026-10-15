@@ -410,6 +410,8 @@ export interface WatchItem {
   targetPrice: number;
   /** Expected return in percent, e.g. 25 means +25%. */
   expectedReturn: number;
+  /** 预期多久达到该收益，例如「6-12 个月」「1-3 年」；空串表示未标注。 */
+  expectedReturnHorizon: string;
   /** Price when the item was added, used for "推荐后涨跌". */
   initialPrice: number;
   initialPriceAt: string | null;
@@ -455,10 +457,18 @@ export interface UpdateWatchItemInput {
   qualityScore?: number;
   targetPrice?: number;
   expectedReturn?: number;
+  /** 预期收益的到达期限（自由文本，例如「6-12 个月」）。 */
+  expectedReturnHorizon?: string;
   thesis?: string;
 }
 
 /* ───────────────────────────────── advice ─────────────────────────────────── */
+
+/**
+ * 建议的来源：持仓（加仓/减仓）、我的标的（经标的分析的候选池）、
+ * 池外（既非持仓也不在「我的标的」中）。
+ */
+export type AdviceOrigin = 'holding' | 'watchlist' | 'external';
 
 export interface AdviceItem {
   id: string;
@@ -470,6 +480,11 @@ export interface AdviceItem {
   market: Market;
   type: InstrumentType;
   action: AdviceAction;
+  /**
+   * 建议依据的池子。池外建议意味着它跳过了「AI 标的分析」的质量分门槛，
+   * 界面上必须标出来，用户才知道该建议没经过候选池筛选。
+   */
+  origin: AdviceOrigin;
   targetShares: number;
   targetPrice: number;
   /** Cash value implied by targetShares * targetPrice. */
@@ -491,6 +506,116 @@ export interface ConfirmAdviceInput {
   price: number;
   tradeDate?: string;
   fee?: number;
+}
+
+/* ── 建议结果追踪（确定性，不经过 LLM） ─────────────────────────────────────── */
+
+/**
+ * 一条建议的实际结果，全部由「建议日 → 今」的日线序列算出，可重复计算且幂等。
+ *
+ * 口径（必须显式写清，否则胜率会误导）：
+ * - 基准价 = 建议日当日（或之后第一个交易日）的收盘价；标的一旦取不到序列即不可度量。
+ * - `adviceReturnPct` 按方向调整：买入=涨幅，卖出=跌幅（正数代表「建议方向对」）。
+ *   它衡量的是模型方向判断的准确度，**不是**用户真实盈亏（用户可能没执行）。
+ * - `excessPct` 与同区间的基准指数（A股 沪深300 / 港股 盈富基金 / 美股 SPY）比较。
+ */
+export interface AdviceOutcome {
+  adviceId: string;
+  runId: string | null;
+  code: string;
+  market: Market;
+  type: InstrumentType;
+  action: AdviceAction;
+  currency: string;
+  /** 建议创建时间。 */
+  advisedAt: string;
+  /** 建议是否已被用户确认执行（仅作展示与筛选，不改变度量口径）。 */
+  adviceStatus: AdviceStatus;
+  executed: boolean;
+  /** 度量起点（YYYY-MM-DD）：建议日或之后第一个交易日。 */
+  baselineDate: string;
+  baselinePrice: number;
+  /** 最新观测日与收盘价。 */
+  lastDate: string;
+  lastPrice: number;
+  /** 原始价格变动 %，不做方向调整。 */
+  priceChangePct: number;
+  /** 方向调整后的收益 %：buy=+涨，sell=+跌。 */
+  adviceReturnPct: number;
+  benchmarkCode: string;
+  benchmarkName: string;
+  benchmarkBase: number;
+  benchmarkChangePct: number;
+  /** adviceReturnPct − benchmarkChangePct。 */
+  excessPct: number;
+  /** 区间内最大有利 / 最大不利（方向调整后，均为 %）。 */
+  maxReturnPct: number;
+  minReturnPct: number;
+  /** 区间内的有效交易日数；< 2 表示还度量不了（如建议当天）。 */
+  samples: number;
+  daysTracked: number;
+  status: AdviceOutcomeStatus;
+  /** 取数失败等非致命问题，必须原样展示。 */
+  warnings: string[];
+  updatedAt: string;
+}
+
+/**
+ * `tracking` 在观测窗口内持续更新；`expired` 表示窗口已满、数字冻结为最终结果。
+ */
+export type AdviceOutcomeStatus = 'tracking' | 'expired';
+
+export interface AdviceOutcomeMarketStats {
+  market: Market;
+  measured: number;
+  /** 方向正确（adviceReturnPct > 0）的比例，0–100。 */
+  winRate: number;
+  /** 跑赢基准（excessPct > 0）的比例，0–100。 */
+  beatRate: number;
+  avgReturnPct: number;
+  avgExcessPct: number;
+}
+
+export interface AdviceOutcomeStats {
+  /** 参与统计的建议总数（含不可度量项）。 */
+  total: number;
+  /** 可度量项：samples >= 2。 */
+  measured: number;
+  /** 不可度量项（样本不足或序列取不到）——必须显示，否则胜率会虚高。 */
+  unmeasured: number;
+  winRate: number;
+  beatRate: number;
+  avgReturnPct: number;
+  avgExcessPct: number;
+  byMarket: AdviceOutcomeMarketStats[];
+  /** 观测窗口（自然日），超过即冻结为最终结果。 */
+  windowDays: number;
+  /** 最近一次成功追踪的时间；从未追踪过为 null。 */
+  updatedAt: string | null;
+  warnings: string[];
+}
+
+export interface AdviceOutcomesResponse {
+  items: AdviceOutcome[];
+  stats: AdviceOutcomeStats;
+}
+
+/** 一次追踪重算的结果（`POST /api/advice/outcomes/track`）。 */
+export interface AdviceOutcomeTrackResult {
+  /** 本次实际重算并写入的建议数。 */
+  tracked: number;
+  measured: number;
+  unmeasurable: number;
+  /** 已超出观测窗口、被冻结为最终结果的条数（本次未重算）。 */
+  frozen: number;
+  /** 清理掉的、对应建议已不存在的残留行。 */
+  pruned: number;
+  ranAt: string;
+  warnings: string[];
+}
+
+export interface AdviceOutcomesTrackResponse extends AdviceOutcomesResponse {
+  tracked: AdviceOutcomeTrackResult;
 }
 
 export interface MarketBudgetStatus {
@@ -645,6 +770,69 @@ export interface Fundamentals {
   /** Peer/industry context lines, already formatted for display. */
   highlights: string[];
   sources: SourceId[];
+}
+
+/* ───────────────────────────── 财务报表（三表） ───────────────────────────── */
+
+/** 报表种类：利润表 / 资产负债表 / 现金流量表。 */
+export type StatementKind = 'income' | 'balance' | 'cashflow';
+
+export interface FinancialLine {
+  /** 稳定的指标键（跨市场统一，便于跨期比较）。 */
+  key: string;
+  /** 中文标签，直接用于报告书写。 */
+  label: string;
+  value: number;
+  /** 金额为币种代码（CNY/HKD/USD），每股指标为 `<币种>/股`，比率为 `%`。 */
+  unit: string;
+  /** 同比（%）；上游未提供时为 null。 */
+  yoy?: number | null;
+}
+
+export interface FinancialPeriod {
+  /** 报告期标签，例如 `2026中报`、`2026年 三季报`。 */
+  period: string;
+  /** 报告期截止日 `YYYY-MM-DD`。 */
+  reportDate: string;
+  /** 报告类型，例如 中报 / 年报 / 三季报 / 单季报 / 累计季报。 */
+  reportType: string;
+  currency: string;
+  /** 是否为年初至今累计口径（定期报告为 true，美股单季报为 false）。 */
+  cumulative: boolean;
+  lines: FinancialLine[];
+}
+
+export interface FinancialStatement {
+  kind: StatementKind;
+  label: string;
+  available: boolean;
+  /** 不可用时的原因，必须回传给模型（禁止静默留空）。 */
+  reason?: string;
+  /** 补充说明，例如「港股现金流量表明细无源，此处为总量指标」。 */
+  note?: string;
+  /** 新 → 旧排序。 */
+  periods: FinancialPeriod[];
+}
+
+export interface Financials {
+  code: string;
+  market: Market;
+  name: string;
+  /** 报表主币种。 */
+  currency: string;
+  /** 会计准则，例如「中国会计准则」「国际会计准则」「美国会计准则」。 */
+  standard: string | null;
+  statements: FinancialStatement[];
+  /** 已由数据算出的比率/排雷信号（`标签=值`），可直接引用。 */
+  highlights: string[];
+  sources: SourceId[];
+  warnings: string[];
+}
+
+/** `GET /api/market/financials` 的响应：三表 + 该标的是否适用财报。 */
+export interface FinancialsResponse extends Financials {
+  /** false = 该标的不适用公司财报（ETF / 场外基金），此时 statements 为空。 */
+  applicable: boolean;
 }
 
 export interface FundHolding {
@@ -907,6 +1095,35 @@ export interface ImportResult {
 }
 
 export type ImportMode = 'merge' | 'replace';
+
+/**
+ * `POST /api/backup/clear`（设置页「一键清除所有数据」）的回执：逐表给出删除行数。
+ *
+ * 默认只清业务数据与 AI 历史，**保留** AI 配置（含 LLM / 数据源 Key）；
+ * `keepSettings: false` 时连设置一起恢复出厂默认。服务端 `data/backups`
+ * 下的快照文件不属于「数据」，不受影响。
+ */
+export interface ClearDataResult {
+  assets: number;
+  transactions: number;
+  watchlist: number;
+  advice: number;
+  /** 建议结果追踪（可重算的物化缓存）。 */
+  adviceOutcomes: number;
+  runs: number;
+  steps: number;
+  runMessages: number;
+  chatSessions: number;
+  chatMessages: number;
+  auditEntries: number;
+  pendingWrites: number;
+  /** 汇率 / 简报指针等本地缓存键。 */
+  kvEntries: number;
+  /** 设置是否被重置为出厂默认（含清空全部 API Key、关闭定时任务）。 */
+  settingsReset: boolean;
+  /** 删除的数据行总数（业务数据 + AI 历史 + 缓存，不含设置行本身）。 */
+  deleted: number;
+}
 
 /* ───────────────────────────────── errors ─────────────────────────────────── */
 

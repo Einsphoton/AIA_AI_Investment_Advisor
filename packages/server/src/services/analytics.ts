@@ -13,6 +13,10 @@ import {
   DEFAULT_REPORT_STYLE,
   DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
   DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
+  INSTRUMENT_TYPES,
+  INSTRUMENT_TYPE_LABELS,
+  MARKETS,
+  MARKET_LABELS,
   PERSONA_MAP,
   type AgentRun,
   type BudgetStatus,
@@ -23,6 +27,7 @@ import type { AgentRuntime, EventSink, LoggerLike } from '../types/agent.js';
 import type { Repo } from '../types/repo.js';
 import type { AssetRow, TxRow } from '../types/models.js';
 import * as ds from '../datasources/registry.js';
+import { compactFinancials } from '../datasources/financials.js';
 import { mapLimit } from '../datasources/http.js';
 import { fundInfo } from '../datasources/fund.js';
 import { computeBudgetStatus } from '../agent/budget.js';
@@ -39,6 +44,8 @@ export interface PipelineContext {
 
 const MAX_ASSETS = 12;
 const MAX_WATCH_REFRESH = 20;
+/** 资产分析预取的财报期数（新 → 旧）：4 期足够看趋势，同时控制提示词 token。 */
+const FINANCIAL_PERIODS = 4;
 
 export interface SafeSettings {
   persona: Persona;
@@ -88,10 +95,12 @@ export async function collectInstrumentData(
 ): Promise<{ data: Record<string, unknown>; warnings: string[] }> {
   const { code, market, type, name } = asset;
   const warnings: string[] = [];
-  const [quote, series, fundamentals, dividends, news, fund] = await Promise.all([
+  const [quote, series, fundamentals, financials, dividends, news, fund] = await Promise.all([
     ds.getQuote({ code, market, type }),
     ds.getSeries({ code, market, type, range: '1y', interval: 'day' }),
     type === 'fund' ? Promise.resolve(null) : ds.getFundamentals({ code, market, type, name }),
+    // 财报三表（多期）：ETF/基金没有财报，registry 直接返回 null。
+    type === 'fund' ? Promise.resolve(null) : ds.getFinancials({ code, market, type, name, periods: FINANCIAL_PERIODS }),
     ds.getDividends({ code, market, type }),
     ds.getNews(`${name} ${code}`, 3),
     type === 'fund' ? fundInfo(code) : Promise.resolve(null),
@@ -134,6 +143,12 @@ export async function collectInstrumentData(
       highlights: fundamentals.value.highlights,
     };
     warnings.push(...fundamentals.warnings);
+  }
+  if (financials) {
+    data.financials = compactFinancials(financials.value, FINANCIAL_PERIODS);
+    warnings.push(...financials.warnings);
+  } else if (type !== 'fund') {
+    warnings.push('财报三表不可用（上游未返回该标的的财务报表）');
   }
   if (fund) {
     data.fundInfo = {
@@ -232,9 +247,12 @@ export async function runAssetAnalysis(context: PipelineContext): Promise<AgentR
     '请对以下持仓逐项完成深度分析，并生成组合简报。',
     truncated ? `注意：持仓数量超过单次上限，本次仅提供前 ${MAX_ASSETS} 项。` : '',
     '要求：',
-    '1) 对每一项调用 save_asset_analysis 写回 ai_summary（Markdown，200-400 字）：趋势与量价、估值水平（引用 PE/PB/ROE 等具体数值）、基本面对比、基金质量（场外基金看净值/阶段收益/持仓）、消息面与风险。',
+    '1) 对每一项调用 save_asset_analysis 写回 ai_summary（Markdown，200-400 字）：趋势与量价、估值水平（引用 PE/PB/ROE 等具体数值）、**财报分析（营收与归母净利同比、毛利率/ROE 的跨期变化、经营现金流与净利润是否匹配、资产负债率与商誉/应收排雷，必须引用 financials 里的多期数字）**、基金质量（场外基金看净值/阶段收益/持仓）、消息面与风险。',
     '2) 全部写回后调用 save_dashboard_briefing 写组合简报（200-500 字）：组合结构、行业集中度、风险敞口、需要关注的事件与 2-4 条可执行动作。',
-    '3) 数据缺失（见「数据缺失」字段）必须在结论中明说，不得用 0 或编造数值填充；必要时调用工具补充（get_series/get_fundamentals/get_fund_info/get_news/web_search/get_macro）。',
+    '3) 两份文本都按 Markdown 结构书写：`## 小标题` 分段、关键数字加粗、可对比的数据用表格；需要突出关键指标或数值分布时使用 metrics / chart 代码块（语法见系统提示的输出格式章节）。',
+    '4) 数据缺失（见「数据缺失」字段）必须在结论中明说，不得用 0 或编造数值填充；必要时调用工具补充（get_financials/get_series/get_fundamentals/get_fund_info/get_news/web_search/get_macro）。',
+    '5) 财报核对：market 数据里的 financials 已预取 4 期三表（A股为完整三表；港股现金流量表为总量口径；美股现金流量明细来自 SEC EDGAR）。若某张报表 available=false，必须按 unavailable 里的 reason 写明「数据缺失」，需要跨期更长趋势时再调用 get_financials（periods 最多 8）。注意 A 股/港股为年初至今累计口径，美股取的是累计季报口径，不得混用。',
+    '6) 财报趋势图：financials 里某标的的报表有 ≥3 期时，ai_summary 必须附一张 ```chart 趋势图（营业总收入 / 归母净利润 / 经营活动现金流量净额，categories 用报告期），json 合法且 categories 与各 series.data 等长；期数不足 3 期则不画。',
     '以下是已抓取好的市场数据 JSON：',
     JSON.stringify(payload),
   ]
@@ -340,6 +358,7 @@ export async function runWatchlistAnalysis(context: PipelineContext): Promise<Ag
     qualityScore: item.qualityScore,
     targetPrice: item.targetPrice,
     expectedReturn: item.expectedReturn,
+    expectedReturnHorizon: item.expectedReturnHorizon,
     thesis: item.thesis,
     aiSummary: item.aiSummary,
     note: item.note,
@@ -348,21 +367,40 @@ export async function runWatchlistAnalysis(context: PipelineContext): Promise<Ag
     retireStreak: item.retireStreak,
   }));
 
+  // 覆盖度：模型天然会锚定已有池子（实测 5 个全是 A 股股票），把「缺哪个市场 /
+  // 类型」显式喂给它，跨市场挖掘才会真的发生。退役标的不计入覆盖度。
+  const active = watchlist.filter((item) => item.status !== 'retired');
+  const byMarket = Object.fromEntries(MARKETS.map((m) => [m, active.filter((i) => i.market === m).length]));
+  const byType = Object.fromEntries(INSTRUMENT_TYPES.map((t) => [t, active.filter((i) => i.type === t).length]));
+  const gaps = [
+    ...MARKETS.filter((m) => byMarket[m] === 0).map((m) => `${MARKET_LABELS[m]}（${m}）市场`),
+    ...INSTRUMENT_TYPES.filter((t) => byType[t] === 0).map((t) => INSTRUMENT_TYPE_LABELS[t]),
+  ];
+
   const goal = [
     '请按用户投资性格挖掘新的候选标的，复核既有标的，并淘汰不再适合继续跟踪的标的。',
     `候选数量上限：${settings.watchlistCandidateLimit} 个（本次允许新增）。质量分门槛：${persona.qualityGate}。`,
+    // 市场/类型多样性：预算覆盖 CN/HK/US 三个市场，行情与财报数据源对三者都可用，
+    // 因此不允许只挖 A 股；只有数据源真的不可用时才可跳过（必须在报告里说明）。
+    `当前在池分布：市场 ${JSON.stringify(byMarket)}；类型 ${JSON.stringify(byType)}。`,
+    gaps.length > 0
+      ? `【覆盖度要求】本次请优先补齐未覆盖的：${gaps.join('、')}。CN / HK / US 三个市场都要认真检索（预算覆盖三地）；如果某个市场或类型最终没有合格候选，必须在报告中写明是哪个、为什么（数据源不可用 / 找不到达到质量分门槛的标的），不要默默只挑 A 股。`
+      : '【覆盖度要求】池内已覆盖三个市场与三种类型，本次按景气度与性格择优，避免新增高度相关的同类标的。',
     '流程：',
     '1) 用 web_search / get_news 按性格偏好检索候选（行业景气、财务特征、政策与主题）。',
     '2) 用 market_search 确认代码与市场，用 get_quote 初筛（流动性、估值、涨跌幅），明显不合格的直接淘汰。',
-    '3) 对通过初筛的候选做深度分析（get_series / get_fundamentals / get_fund_info / get_dividends / get_news）。',
-    `4) 对每个合格候选调用 upsert_watch_item（quality_score 0-100、target_price、expected_return、thesis、ai_summary）；quality_score 低于 ${persona.qualityGate} 的不要写入；最多新增 ${settings.watchlistCandidateLimit} 个。`,
-    '5) 对既有标的中结论过时或价格显著变化的，同样调用 upsert_watch_item 更新（不要修改 initial_price）。',
-    '6) 淘汰复核（P3）：逐个判断既有标的是否还值得继续跟踪。如果已经不适合（逻辑被证伪、基本面恶化、估值/趋势走坏、流动性或性价比明显落后），调用 retire_watch_item 写明原因；',
+    '3) 对通过初筛的候选做深度分析（get_financials 三表至少 4 期 / get_series / get_fundamentals / get_fund_info / get_dividends / get_news）。**基本面判断必须基于财报数字**：营收与归母净利同比、毛利率与 ROE 的跨期方向、经营现金流与净利润是否匹配、资产负债率与商誉/应收风险。',
+    `4) 对每个合格候选调用 upsert_watch_item（quality_score 0-100、target_price、expected_return、expected_return_horizon、thesis、ai_summary）；quality_score 低于 ${persona.qualityGate} 的不要写入；最多新增 ${settings.watchlistCandidateLimit} 个。`,
+    '5) 给出 target_price / expected_return 时必须同时给出 expected_return_horizon（例如「6-12 个月」「1-3 年」），期限要与收益口径一致（短线题材不要写「1-3 年」）。',
+    '5.1) 【重要】每确认一个候选就**立刻**调用 upsert_watch_item 写回，不要攒到最后统一写 —— 轮次预算有限，实测出现过「研究完候选但轮次用尽、一个字都没写回」的情况。先写回，再研究下一个。',
+    '6) 类型判定：market_search 对场外基金可能返回 type=etf（东财 suggest 的历史问题）。名称含「混合 / 债券 / 联接 / 发起式 / 定期开放 / 货币」的一律按场外基金处理：用 type=fund 再调 get_quote 与 get_fund_info 复核；type=etf 会命中同代码的股票（000001 场外基金 vs 平安银行），写入前必须核对 get_quote 返回的名称与搜索名称一致。',
+    '7) 对既有标的中结论过时或价格显著变化的，同样调用 upsert_watch_item 更新（不要修改 initial_price）。',
+    '8) 淘汰复核（P3）：逐个判断既有标的是否还值得继续跟踪。如果已经不适合（逻辑被证伪、基本面恶化、估值/趋势走坏、流动性或性价比明显落后），调用 retire_watch_item 写明原因；',
     `   已被标记 retired 的，如果仍然不适合，请再次调用 retire_watch_item 以累计次数（连续 ${settings.watchlistRetireDeleteRuns} 次后系统才会真正移除；0 表示只标记不删除）；如果重新变好，用 upsert_watch_item 更新即可自动复活。`,
     '   注意：有持仓的标的不得退役（retire_watch_item 会直接拒绝）——用户可能持续加仓，仓位处置请用 create_advice(action="sell")。',
     `既有标的（价格已刷新：成功 ${refresh.updated}、失败 ${refresh.failed}；status=active 在池 / retired 已退役）：`,
     JSON.stringify(existing),
-    '分析要求：所有数字必须来自工具返回；数据缺失要写明；给出目标价与预期收益时必须说明依据与风险；退役结论必须引用具体数据，不要凭感觉。',
+    '分析要求：所有数字必须来自工具返回；数据缺失要写明（财报 unavailable 的 reason 必须原样交代）；给出目标价与预期收益时必须说明依据与风险；退役结论必须引用具体数据（含最新一期财报的可核对数字），不要凭感觉。',
   ].join('\n');
 
   const run = await agent.run({

@@ -32,6 +32,7 @@ import { DataSourcesCard } from './SettingsDataSources';
 import { LlmProviderField } from './SettingsLlmProvider';
 import { ModelField } from './SettingsModelField';
 import { BackupCard } from './SettingsBackup';
+import { DangerZoneCard } from './SettingsDangerZone';
 import { ToolPolicyCard } from './SettingsToolPolicy';
 import { McpServersCard } from './SettingsMcpServers';
 import { buildInput, isDirty, toDraft, type Draft } from './settingsDraft';
@@ -557,6 +558,14 @@ export function SettingsPage() {
       </Card>
 
       <BackupCard />
+
+      {/* 清空后必须重读设置（可能已恢复默认）与仪表盘（下次运行时间/计数会变）。 */}
+      <DangerZoneCard
+        onCleared={() => {
+          state.reload();
+          dashboard.reload();
+        }}
+      />
 
       <SaveBar dirty={dirty} saving={saving} onSave={() => void save()} onReset={reset} />
     </div>

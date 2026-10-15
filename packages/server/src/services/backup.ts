@@ -233,6 +233,7 @@ export function toExportBundle(payload: BackupPayload, fallbackUpdatedAt = nowIs
       qualityScore: toNumber(item.qualityScore),
       targetPrice: toNumber(item.targetPrice),
       expectedReturn: toNumber(item.expectedReturn),
+      expectedReturnHorizon: String(item.expectedReturnHorizon ?? ''),
       initialPrice: toNumber(item.initialPrice),
       initialPriceAt: (item.initialPriceAt as string | null) ?? null,
       price,

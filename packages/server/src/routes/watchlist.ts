@@ -42,6 +42,8 @@ const updateWatchSchema = z.object({
   qualityScore: z.number().min(0).max(100).optional(),
   targetPrice: z.number().min(0).optional(),
   expectedReturn: z.number().optional(),
+  /** 预期收益的到达期限（自由文本，例如「6-12 个月」），最长 40 字。 */
+  expectedReturnHorizon: z.string().max(40).optional(),
   thesis: z.string().optional(),
 });
 
@@ -143,6 +145,57 @@ export async function registerWatchlistRoutes(app: FastifyInstance): Promise<voi
   });
 
   app.delete('/api/watchlist', async () => ({ ok: true, deleted: getRepo().clearWatchlist() }));
+
+  /**
+   * 刷新池内标的行情：现价 / 昨收 / 当日涨跌 / 走势缩略图。
+   *
+   * 以前价格只在「AI 标的分析」开跑时顺带刷新一次，两次分析之间列表里的
+   * 「推荐后涨跌」一直是 0。这个入口让页面可以随取随新（也供定时任务之外的手动刷新）。
+   */
+  app.post('/api/watchlist/refresh', async (request) => {
+    const repo = getRepo();
+    const items = repo.listWatchlist('all');
+    const bridge = await loadMarketBridge();
+    if (!bridge) {
+      request.log.warn('行情数据源不可用（AIA_OFFLINE 或 datasources 模块缺失），跳过标的行情刷新');
+      return { updated: 0, failed: items.length, warnings: ['行情数据源不可用，未能刷新行情'] };
+    }
+
+    let updated = 0;
+    let failed = 0;
+    for (const item of items) {
+      try {
+        const quote = await bridge.quote(item.market, item.code, item.type);
+        const price = round4(toNumber(quote?.price));
+        if (!(price > 0)) {
+          failed += 1;
+          continue;
+        }
+        const prevClose = toNumber(quote?.prevClose, item.prevClose) || price;
+        const dayChangePct =
+          quote?.dayChangePct !== undefined
+            ? toNumber(quote.dayChangePct)
+            : prevClose > 0
+              ? round4(((price - prevClose) / prevClose) * 100)
+              : 0;
+        const spark = await bridge.series(item.market, item.code, item.type);
+        repo.updateWatchItem(item.id, {
+          price,
+          prevClose,
+          dayChangePct,
+          priceAt: nowIso(),
+          spark: spark.length > 0 ? spark : undefined,
+        });
+        updated += 1;
+      } catch (error) {
+        failed += 1;
+        request.log.warn(
+          `标的行情刷新失败 ${item.code}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return { updated, failed, warnings: failed > 0 ? [`${failed} 个标的行情刷新失败`] : [] };
+  });
 
   app.get('/api/watchlist/:id', async (request) => {
     const { id } = request.params as { id: string };

@@ -6,6 +6,7 @@
  */
 import type {
   AdviceAction,
+  AdviceOutcomeStatus,
   AdviceStatus,
   AgentRunKind,
   AgentRunStatus,
@@ -87,6 +88,11 @@ export interface RunMessageRow {
   toolCalls: string | null;
   toolCallId: string | null;
   name: string | null;
+  /**
+   * Thinking-mode trace of an assistant message, persisted so a resumed run can
+   * echo it back (thinking providers require it on tool-call messages).
+   */
+  reasoningContent: string | null;
   createdAt: string;
 }
 
@@ -137,6 +143,7 @@ export interface WatchRow {
   qualityScore: number;
   targetPrice: number;
   expectedReturn: number;
+  expectedReturnHorizon: string;
   initialPrice: number;
   initialPriceAt: string | null;
   price: number;
@@ -179,10 +186,44 @@ export interface AdviceRow {
   decidedAt: string | null;
 }
 
+/**
+ * 建议结果追踪（物化缓存）：由 `services/advice-outcomes.ts` 从「建议行 + 日线序列」
+ * 确定性重算，因此永远是幂等的 —— 重跑一次会得到同样的数字。
+ */
+export interface AdviceOutcomeRow {
+  adviceId: string;
+  runId: string | null;
+  code: string;
+  market: Market;
+  type: InstrumentType;
+  action: AdviceAction;
+  currency: string;
+  advisedAt: string;
+  adviceStatus: AdviceStatus;
+  executed: boolean;
+  baselineDate: string;
+  baselinePrice: number;
+  lastDate: string;
+  lastPrice: number;
+  priceChangePct: number;
+  adviceReturnPct: number;
+  benchmarkCode: string;
+  benchmarkName: string;
+  benchmarkBase: number;
+  benchmarkChangePct: number;
+  excessPct: number;
+  maxReturnPct: number;
+  minReturnPct: number;
+  samples: number;
+  daysTracked: number;
+  status: AdviceOutcomeStatus;
+  warnings: string[];
+  updatedAt: string;
+}
+
 export interface RunRow {
   id: string;
-  kind: AgentRunKind;
-  status: AgentRunStatus;
+  kind: AgentRunKind;  status: AgentRunStatus;
   target: string | null;
   title: string;
   summary: string;
@@ -261,6 +302,7 @@ export interface NewTx {
 export interface NewWatch {
   id: string;
   name: string;
+  expectedReturnHorizon?: string;
   code: string;
   market: Market;
   type: InstrumentType;
@@ -330,6 +372,7 @@ export interface AssetPatch {
 }
 
 export interface WatchPatch {
+  expectedReturnHorizon?: string;
   name?: string;
   note?: string;
   market?: Market;

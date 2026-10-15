@@ -1,8 +1,14 @@
 /**
  * DashboardPage — 仪表盘。owner: web-core-pages
  *
- * 四个板块：持仓统计 / 计数与信号 / 持仓排名前五 / AI 持仓简报，
- * 外加全球指数、月度预算与快捷入口。
+ * 板块顺序：持仓统计 → 计数与信号 → 全球指数概览 → 持仓排名前五 →
+ * AI 持仓简报 → 月度预算 → 快捷入口。
+ *
+ * 布局约定（配合 styles.css §20）：
+ *   · 主内容区不再限制宽度，列表（表格）直接铺满整行；
+ *   · 区块（统计卡 / 指数 / 预算）统一用 auto-fit 栅格，列数随屏幕宽度动态平铺；
+ *   · AI 简报走 <Markdown> 渲染（指标条 + 语义数字 + 表格内联柱），超宽屏自动分栏。
+ *
  * 指数单独走 /api/market/indices，失败静默降级（回退 DashboardPayload.indices）。
  * 工具栏「AI一键分析」走 POST /api/agent/run-now：在同一条 SSE 流里顺序跑
  * 资产分析 → 标的分析 → AI 投资建议（因此流内有多组 run-started/run-finished）。
@@ -15,8 +21,9 @@ import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { useAsync } from '../api/hooks';
 import { fmtDateTime, fmtMoney, fmtNum, fmtPct, fmtPrice, fmtRelative, fmtShares, fmtSignedMoney, pnlClass } from '../format';
-import { Alert, Badge, Button, Card, Empty, ErrorAlert, Loading, ProgressBar, StatCard } from '../components/ui';
+import { Alert, Badge, Button, Card, Empty, ErrorAlert, Loading, MarketTag, ProgressBar, StatCard } from '../components/ui';
 import { Sparkline } from '../components/charts/Sparkline';
+import { Markdown } from '../components/markdown/Markdown';
 
 export function DashboardPage() {
   const state = useAsync<DashboardPayload>(() => api.dashboard(), []);
@@ -161,7 +168,35 @@ export function DashboardPage() {
             </div>
           </Card>
 
-          {/* ③ 持仓排名前五 */}
+          {/* ③ 全球指数概览 —— 紧跟「计数与信号」，同属市场信号类信息 */}
+          <Card
+            title="全球指数概览"
+            actions={<span className="tiny mute">{liveIndices.loading ? '刷新中…' : `${indices.length} 个指数`}</span>}
+            className="mb-3"
+          >
+            {indices.length === 0 ? (
+              <div className="mute small">指数数据源暂不可用（不影响其它板块，稍后可重试）。</div>
+            ) : (
+              // 动态平铺：列数随可用宽度自动增减，超宽屏不会只铺一列。
+              <div className="grid-3">
+                {indices.map((quote) => (
+                  <div className="panel" key={`${quote.market}-${quote.code}`}>
+                    <div className="tiny mute truncate" title={quote.name || quote.code}>
+                      {quote.name || quote.code}
+                    </div>
+                    <div className="strong" style={{ marginTop: 2 }}>
+                      {fmtPrice(quote.price, quote.currency)}
+                    </div>
+                    <div className={`tiny ${pnlClass(quote.changePct)}`}>
+                      {fmtSignedMoney(quote.change, quote.currency)} ({fmtPct(quote.changePct)})
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          {/* ④ 持仓排名前五 —— 列表类：铺满整行 */}
           <Card
             title="持仓排名前五"
             actions={
@@ -207,7 +242,9 @@ export function DashboardPage() {
                           </div>
                         </td>
                         <td className="mono tiny">{asset.code}</td>
-                        <td className="nowrap">{MARKET_LABELS[asset.market]}</td>
+                        <td className="nowrap">
+                          <MarketTag market={asset.market} />
+                        </td>
                         <td className="num">{fmtShares(asset.shares)}</td>
                         <td className="num">{fmtPrice(asset.avgCost, asset.currency)}</td>
                         <td className="num">{fmtPrice(asset.price, asset.currency)}</td>
@@ -227,7 +264,7 @@ export function DashboardPage() {
             )}
           </Card>
 
-          {/* ④ AI 持仓简报 */}
+          {/* ⑤ AI 持仓简报 —— Markdown 渲染 */}
           <Card
             title={
               <span className="center gap-2">
@@ -251,9 +288,9 @@ export function DashboardPage() {
           >
             {payload.briefing ? (
               <>
-                <div className="small" style={{ whiteSpace: 'pre-wrap' }}>
-                  {payload.briefing.text}
-                </div>
+                {/* 标题分层 + 关键指标条 + 语义数字 + 表格内联柱；超宽屏自动分两栏，
+                    避免正文被拉成一条两百字的超长行。 */}
+                <Markdown text={payload.briefing.text} columns />
                 <div className="tiny mute mt-3">
                   {fmtRelative(payload.briefing.generatedAt)}
                   {payload.briefing.runId ? ` · run ${payload.briefing.runId.slice(0, 8)}` : ''}
@@ -264,57 +301,39 @@ export function DashboardPage() {
             )}
           </Card>
 
-          {/* 额外上下文：指数 + 预算 */}
-          <div className="grid-2 mb-3">
-            <Card title="全球指数概览" actions={<span className="tiny mute">{liveIndices.loading ? '刷新中…' : `${indices.length} 个指数`}</span>}>
-              {indices.length === 0 ? (
-                <div className="mute small">指数数据源暂不可用（不影响其它板块，稍后可重试）。</div>
-              ) : (
-                <div className="grid-3">
-                  {indices.map((quote) => (
-                    <div className="panel" key={`${quote.market}-${quote.code}`}>
-                      <div className="tiny mute truncate" title={quote.name || quote.code}>
-                        {quote.name || quote.code}
-                      </div>
-                      <div className="strong" style={{ marginTop: 2 }}>
-                        {fmtPrice(quote.price, quote.currency)}
-                      </div>
-                      <div className={`tiny ${pnlClass(quote.changePct)}`}>
-                        {fmtSignedMoney(quote.change, quote.currency)} ({fmtPct(quote.changePct)})
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </Card>
-
-            <Card title={`月度预算使用（${payload.budget.month}）`} actions={<Link className="tiny" to="/settings">调整预算</Link>}>
-              <div className="flex" style={{ flexDirection: 'column', gap: 12 }}>
-                {payload.budget.markets.map((item) => (
-                  <div key={item.market}>
-                    <div className="between mb-1">
-                      <span className="small">
-                        {MARKET_LABELS[item.market]}{' '}
-                        <span className="mute tiny">
-                          {fmtMoney(item.spent, item.currency)} / {fmtMoney(item.budget, item.currency)}
-                        </span>
-                      </span>
-                      <span className="center gap-2">
-                        {item.exhausted ? (
-                          <Badge tone="warn">预算已用尽</Badge>
-                        ) : (
-                          <span className="tiny mute">剩余 {fmtMoney(item.remaining, item.currency)}</span>
-                        )}
-                        <span className="tiny mono">{fmtPct(item.usedPct, 1, false)}</span>
-                      </span>
-                    </div>
-                    <ProgressBar value={item.usedPct} max={100} />
+          {/* ⑥ 月度预算使用 —— 单独铺满整行，各市场按宽度动态平铺 */}
+          <Card
+            title={`月度预算使用（${payload.budget.month}）`}
+            actions={
+              <Link className="tiny" to="/settings">
+                调整预算
+              </Link>
+            }
+            className="mb-3"
+          >
+            <div className="grid-3">
+              {payload.budget.markets.map((item) => (
+                <div className="panel" key={item.market}>
+                  <div className="between mb-1">
+                    <MarketTag market={item.market} />
+                    <span className="center gap-2">
+                      {item.exhausted ? (
+                        <Badge tone="warn">预算已用尽</Badge>
+                      ) : (
+                        <span className="tiny mute">剩余 {fmtMoney(item.remaining, item.currency)}</span>
+                      )}
+                      <span className="tiny mono">{fmtPct(item.usedPct, 1, false)}</span>
+                    </span>
                   </div>
-                ))}
-              </div>
-              <div className="tiny mute mt-3">按自然月统计各市场买入成交额（按币种分别计算）。</div>
-            </Card>
-          </div>
+                  <div className="tiny mute mb-1">
+                    {fmtMoney(item.spent, item.currency)} / {fmtMoney(item.budget, item.currency)}
+                  </div>
+                  <ProgressBar value={item.usedPct} max={100} />
+                </div>
+              ))}
+            </div>
+            <div className="tiny mute mt-3">按自然月统计各市场买入成交额（按币种分别计算）。</div>
+          </Card>
 
           <Card title="快捷入口">
             <div className="flex wrap gap-2">

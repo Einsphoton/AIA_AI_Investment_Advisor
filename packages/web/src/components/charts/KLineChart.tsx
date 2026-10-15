@@ -5,14 +5,10 @@
 import { useMemo } from 'react';
 import type { SeriesPoint } from '@aia/shared';
 import { EChart, CHART_COLORS, baseAxisStyle, goldTooltipStyle, type EChartsCoreOption } from './EChart';
+import { markerPointTooltip, seriesTooltipFormatter, type MarkerInfo } from './tradeMarkers';
 
-export interface TradeMarker {
-  kind: 'buy' | 'sell';
-  date: string;
-  price: number;
-  shares?: number;
-  label?: string;
-}
+/** 买卖点：带成交明细，悬浮时显示完整信息（金额 / 费用 / 备注）。 */
+export type TradeMarker = MarkerInfo;
 
 export interface KLineChartProps {
   points: SeriesPoint[];
@@ -52,9 +48,9 @@ export function KLineChart({ points, markers = [], currency = '', className = 'c
           fontWeight: 'bold' as const,
           formatter: marker.kind === 'buy' ? 'B' : 'S',
         },
-        tooltip: {
-          formatter: `${marker.kind === 'buy' ? '买入' : '卖出'} ${marker.shares ?? ''} 份 @ ${marker.price}${currency ? ` ${currency}` : ''}`,
-        },
+        // 直接悬停 pin 时的面板（坐标轴面板由下方的 chart tooltip 提供）。
+        tooltip: { formatter: markerPointTooltip(marker, currency) },
+        emphasis: { scale: 1.25 },
       }));
 
     return {
@@ -68,6 +64,8 @@ export function KLineChart({ points, markers = [], currency = '', className = 'c
           label: { backgroundColor: '#1b160b', borderColor: CHART_COLORS.panelBorder, color: CHART_COLORS.inkText },
         },
         ...goldTooltipStyle(),
+        // 行情 + 当天买卖点：鼠标落在买卖标签上也能看到成交明细。
+        formatter: seriesTooltipFormatter({ points, markers, currency, kind: 'kline' }) as unknown as string,
       },
       legend: { show: false },
       grid: [

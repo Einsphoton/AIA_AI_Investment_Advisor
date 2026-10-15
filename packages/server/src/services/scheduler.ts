@@ -19,6 +19,7 @@
 import { DEFAULT_SCHEDULE, type AgentRun, type ScheduleConfig } from '@aia/shared';
 import type { Scheduler, SchedulerDeps } from '../types/agent.js';
 import { runFullPipeline, scheduleFlags } from './advice.js';
+import { trackAdviceOutcomes } from './advice-outcomes.js';
 import type { PipelineContext } from './analytics.js';
 import { PipelineBusyError, runExclusiveOrThrow } from './pipeline-lock.js';
 
@@ -133,6 +134,14 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 
   async function tick(): Promise<void> {
     try {
+      // 旁路能力：先刷新「建议结果追踪」。确定性、不调用 LLM，失败也不影响流水线。
+      try {
+        await trackAdviceOutcomes({ repo: deps.getRepo(), logger: deps.logger });
+      } catch (error) {
+        deps.logger.warn(
+          `scheduler: advice outcome tracking failed — ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       if (running) {
         deps.logger.warn('scheduler: previous run still in progress, skipping this tick');
       } else {

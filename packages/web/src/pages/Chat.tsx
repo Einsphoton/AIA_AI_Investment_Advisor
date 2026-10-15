@@ -9,6 +9,7 @@ import { api } from '../api/client';
 import { toApiError, useAgentStream, useAsync, type ToolEvent } from '../api/hooks';
 import { fmtDateTime, fmtRelative } from '../format';
 import { Alert, Button, Card, ConfirmDialog, Empty, ErrorAlert, Loading, Textarea, useToast } from '../components/ui';
+import { Markdown } from '../components/markdown/Markdown';
 
 const QUICK_COMMANDS = [
   '分析我的持仓，指出风险与机会',
@@ -223,8 +224,13 @@ export function ChatPage() {
             <div className="msg msg-assistant">
               <div className="msg-avatar">AI</div>
               <div style={{ minWidth: 0, flex: 1 }}>
-                <div className="msg-bubble">
-                  {stream.text || (stream.steps.length === 0 ? '正在思考…' : '')}
+                <div className="msg-bubble md-bubble">
+                  {/* 流式回复按 Markdown 渲染；未闭合的代码围栏也不会丢文字。 */}
+                  {stream.text ? (
+                    <Markdown text={stream.text} variant="compact" metrics={false} />
+                  ) : stream.steps.length === 0 ? (
+                    '正在思考…'
+                  ) : null}
                   {stream.running && <span className="typing-dot" style={{ marginLeft: 4 }} />}
                 </div>
                 {(stream.toolEvents.length > 0 || stream.steps.length > 0) && (
@@ -311,7 +317,14 @@ function MessageBubble({ message }: { message: ChatMessage }) {
     <div className={`msg ${isUser ? 'msg-user' : 'msg-assistant'}`}>
       <div className="msg-avatar">{isUser ? '我' : 'AI'}</div>
       <div style={{ minWidth: 0, flex: 1 }}>
-        <div className="msg-bubble">{message.content || '（空消息）'}</div>
+        {/* 用户消息是纯文本；AI 回复是 Markdown 报告，需要分层渲染。 */}
+        {isUser ? (
+          <div className="msg-bubble">{message.content || '（空消息）'}</div>
+        ) : (
+          <div className="msg-bubble md-bubble">
+            <Markdown text={message.content || '（空消息）'} variant="compact" />
+          </div>
+        )}
         <div className="tiny mute mt-1">{fmtDateTime(message.createdAt)}</div>
         {message.steps.length > 0 && (
           <details className="mt-1">

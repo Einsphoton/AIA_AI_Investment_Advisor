@@ -221,6 +221,7 @@ export function toWatchItem(row: WatchRow): WatchItem {
     qualityScore: round4(toNumber(row.qualityScore)),
     targetPrice: round4(toNumber(row.targetPrice)),
     expectedReturn: round4(toNumber(row.expectedReturn)),
+    expectedReturnHorizon: row.expectedReturnHorizon ?? '',
     initialPrice: round4(initialPrice),
     initialPriceAt: row.initialPriceAt,
     price: round4(price),
@@ -252,6 +253,9 @@ export function toAdviceItem(row: AdviceRow): AdviceItem {
     market: row.market,
     type: row.type,
     action: row.action,
+    // 来源由链接字段推导：带 assetId = 持仓；带 watchItemId = 我的标的；都没有 = 池外。
+    // 写入时 tools.ts 会按 code 反查补全链接，所以这里能如实反映建议依据的池子。
+    origin: row.assetId ? 'holding' : row.watchItemId ? 'watchlist' : 'external',
     targetShares: round4(toNumber(row.targetShares)),
     targetPrice: round4(toNumber(row.targetPrice)),
     amount: round4(toNumber(row.targetShares) * toNumber(row.targetPrice)),

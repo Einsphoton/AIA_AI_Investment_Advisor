@@ -270,7 +270,8 @@ export function sliceByRange(points: SeriesPoint[], range: RangeKey): SeriesPoin
 
 /* ───────────────────────────────── search ────────────────────────────────── */
 
-interface EmSuggestRow {
+/** One row of the eastmoney suggest response (exported for the classification tests). */
+export interface EmSuggestRow {
   Code?: unknown;
   Name?: unknown;
   MktNum?: unknown;
@@ -279,13 +280,17 @@ interface EmSuggestRow {
   Classify?: unknown;
   JYS?: unknown;
   SecurityType?: unknown;
+  /** e.g. `150.000001`（场外基金）或 `1.510300`（场内）。 */
+  QuoteID?: unknown;
 }
 
-function suggestMarket(row: EmSuggestRow): Market | null {
+/** Exported for the suggest-classification tests. */
+export function suggestMarket(row: EmSuggestRow): Market | null {
   const num = toNumber(row.MktNum ?? row.MarketType);
   if (num === 116 || num === 128 || num === 124) return 'HK';
   if (num === 105 || num === 106 || num === 107) return 'US';
-  if (num === 0 || num === 1 || num === 2) return 'CN';
+  // 150 = 场外基金（申赎，QuoteID=150.x）；MarketType 口径为 6。两者都属于 A 股挂牌范围。
+  if (num === 0 || num === 1 || num === 2 || num === 150 || num === 6) return 'CN';
   const classify = typeof row.Classify === 'string' ? row.Classify : '';
   if (/Us/i.test(classify)) return 'US';
   if (/Hk/i.test(classify)) return 'HK';
@@ -293,8 +298,19 @@ function suggestMarket(row: EmSuggestRow): Market | null {
   return null;
 }
 
-function suggestType(row: EmSuggestRow): InstrumentType {
-  const label = `${typeof row.SecurityTypeName === 'string' ? row.SecurityTypeName : ''} ${typeof row.Classify === 'string' ? row.Classify : ''}`;
+/**
+ * 类型判定。Exported for tests.
+ *
+ * 场外基金必须标成 `fund`，不能标 `etf`：同类代码在 A 股可能是股票
+ * （000001 场外基金「华夏成长」vs 股票「平安银行」），按 etf 去查报价会
+ * **静默命中同代码的股票**，写进池子的就是完全错误的价格与结论。
+ * 东财 suggest 用 `Classify/JYS = 'OTCFUND'` 区分场外基金，`'Fund'` 才是场内 ETF/LOF。
+ */
+export function suggestType(row: EmSuggestRow): InstrumentType {
+  const classify = typeof row.Classify === 'string' ? row.Classify : '';
+  const jys = typeof row.JYS === 'string' ? row.JYS : '';
+  if (/OTCFUND/i.test(classify) || /OTCFUND/i.test(jys)) return 'fund';
+  const label = `${typeof row.SecurityTypeName === 'string' ? row.SecurityTypeName : ''} ${classify}`;
   if (/基金|ETF|LOF|Fund/i.test(label)) return 'etf';
   return 'stock';
 }

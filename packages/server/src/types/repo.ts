@@ -7,9 +7,11 @@
  * every method as throwing on unexpected DB errors.
  */
 import type {
+  AdviceOutcomeStatus,
   AdviceStatus,
   AgentRunKind,
   AgentRunStatus,
+  ClearDataResult,
   Creator,
   ImportMode,
   ImportResult,
@@ -18,6 +20,7 @@ import type {
   WatchItemStatus,
 } from '@aia/shared';
 import type {
+  AdviceOutcomeRow,
   AdviceRow,
   AssetPatch,
   AssetRow,
@@ -121,6 +124,13 @@ export interface Repo {
   /** Expires every still-pending advice of an earlier batch. */
   expirePendingAdvice(exceptBatchId?: string): number;
 
+  /* ── advice outcomes（物化结果，可确定性重建） ────────────────────────────── */
+  upsertAdviceOutcome(input: AdviceOutcomeRow): AdviceOutcomeRow;
+  getAdviceOutcome(adviceId: string): AdviceOutcomeRow | undefined;
+  listAdviceOutcomes(filter?: { limit?: number; status?: AdviceOutcomeStatus }): AdviceOutcomeRow[];
+  /** 追踪窗口之外的旧结果（用于清理已删除建议的残留）。 */
+  deleteAdviceOutcomesForMissingAdvice(): number;
+
   /* ── agent runs ────────────────────────────────────────────────────────── */
   createRun(input: Omit<RunRow, 'finishedAt' | 'summary' | 'error' | 'turns' | 'promptTokens' | 'completionTokens'> & Partial<RunRow>): RunRow;
   updateRun(id: string, patch: Partial<Omit<RunRow, 'id'>>): RunRow | undefined;
@@ -146,6 +156,14 @@ export interface Repo {
   /* ── backup ────────────────────────────────────────────────────────────── */
   exportAll(): ExportBundle;
   importAll(bundle: ExportBundle, mode: ImportMode): ImportResult;
+  /**
+   * 一键清除：业务数据 + AI 历史 + 缓存，单个事务内完成，返回逐表删除行数。
+   * `keepSettings` 默认 `true`（保留 AI 配置与 API Key）；显式传 `false` 时
+   * 设置恢复为出厂默认。
+   */
+  clearAllData(options?: { keepSettings?: boolean }): ClearDataResult;
+  /** 设置恢复为出厂默认（含清空 LLM / 数据源 Key、关闭定时任务）。 */
+  resetSettings(): StoredSettings;
 
   /* ── helpers used by portfolio math ────────────────────────────────────── */
   /** Distinct (market) list of currently held instruments, for price refresh. */
@@ -176,4 +194,4 @@ export interface Repo {
 }
 
 /** Alias kept for readability in route modules. */
-export type { AssetRow, TxRow, WatchRow, AdviceRow, RunRow, StepRow };
+export type { AssetRow, TxRow, WatchRow, AdviceRow, AdviceOutcomeRow, RunRow, StepRow };

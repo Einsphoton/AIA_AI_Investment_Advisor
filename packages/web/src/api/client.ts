@@ -6,6 +6,8 @@
  */
 import type {
   AdviceItem,
+  AdviceOutcomesResponse,
+  AdviceOutcomesTrackResponse,
   AgentRun,
   AgentRunSummary,
   AgentTrace,
@@ -16,12 +18,14 @@ import type {
   BudgetStatus,
   ChatMessage,
   ChatSession,
+  ClearDataResult,
   ConfirmAdviceInput,
   CreateAssetInput,
   CreateTransactionInput,
   CreateWatchItemInput,
   DashboardPayload,
   DataSourceCatalogueEntry,
+  FinancialsResponse,
   ImportMode,
   ImportResult,
   InstrumentSearchResult,
@@ -187,6 +191,9 @@ export const api = {
     update: (id: string, input: UpdateWatchItemInput) => request<WatchItem>(`/watchlist/${encodeURIComponent(id)}`, patchBody(input)),
     remove: (id: string) => request<{ ok: boolean }>(`/watchlist/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     clear: () => request<{ ok: boolean; deleted: number }>('/watchlist', { method: 'DELETE' }),
+    /** 刷新池内标的行情（现价/涨跌/走势），让「推荐后涨跌」不再是 0。 */
+    refresh: () =>
+      request<{ updated: number; failed: number; warnings?: string[] }>('/watchlist/refresh', json({})),
     /** P3 复活：清空退役标记与累计次数。 */
     restore: (id: string) => request<WatchItem>(`/watchlist/${encodeURIComponent(id)}/restore`, json({})),
     lastAnalysis: () => request<AgentRunSummary | null>('/watchlist/analyze/last'),
@@ -200,6 +207,9 @@ export const api = {
       request<{ advice: AdviceItem; asset: AssetDetail }>(`/advice/${encodeURIComponent(id)}/confirm`, json(input)),
     last: () => request<AgentRunSummary | null>('/advice/last'),
     budget: () => request<BudgetStatus>('/budget'),
+    /** 建议结果追踪（确定性、不调用 LLM）：逐条实际表现 + 胜率统计。 */
+    outcomes: () => request<AdviceOutcomesResponse>('/advice/outcomes'),
+    trackOutcomes: () => request<AdviceOutcomesTrackResponse>('/advice/outcomes/track', json({})),
   },
 
   /* ── market ───────────────────────────────────────────────────────────── */
@@ -209,6 +219,9 @@ export const api = {
     series: (args: { market: string; code: string; type: string; range?: RangeKey; interval?: BarInterval }) =>
       request<SeriesResponse>(`/market/series${qs(args)}`),
     profile: (args: { market: string; code: string; type: string }) => request<ProfileResponse>(`/market/profile${qs(args)}`),
+    /** 财报三表（多期）：ETF/基金返回 applicable=false 而不是报错。 */
+    financials: (args: { market: string; code: string; type: string; periods?: number }) =>
+      request<FinancialsResponse>(`/market/financials${qs(args)}`),
     detail: (args: { market: string; code: string; type: string; range?: RangeKey; interval?: BarInterval }) =>
       request<{ series: SeriesResponse; profile: ProfileResponse }>(`/market/detail${qs(args)}`),
     indices: () => request<Quote[]>('/market/indices'),
@@ -274,6 +287,11 @@ export const api = {
     import: (data: BackupPayload, mode: ImportMode = 'merge') => request<ImportResult>('/backup/import', json({ data, mode })),
     files: () => request<{ name: string; size: number; createdAt: string }[]>('/backup/files'),
     snapshot: () => request<{ name: string; size: number; createdAt: string }>('/backup/files', json({})),
+    /**
+     * 一键清除所有数据。默认 `keepSettings: true`（保留 AI 配置与 API Key）；
+     * `false` 时设置一并恢复出厂默认。AI 流水线运行中服务端返回 409。
+     */
+    clear: (input?: { keepSettings?: boolean }) => request<ClearDataResult>('/backup/clear', json(input ?? {})),
   },
 };
 

@@ -4,14 +4,29 @@
  * 详情数据一次性来自 GET /api/assets/:id（含 transactions），图表与基本面复用
  * InstrumentDetailSections，避免在页面里重复拉取行情。
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { AssetDetail, Transaction } from '@aia/shared';
-import { MARKET_LABELS, INSTRUMENT_TYPE_LABELS } from '@aia/shared';
+import { INSTRUMENT_TYPE_LABELS } from '@aia/shared';
 import { api } from '../api/client';
 import { toApiError, useAsync } from '../api/hooks';
 import { fmtDate, fmtDateTime, fmtMoney, fmtPct, fmtPrice, fmtShares, fmtSignedMoney, pnlClass } from '../format';
-import { Badge, Button, Card, ConfirmDialog, Empty, ErrorAlert, Loading, Modal, useToast } from '../components/ui';
+import {
+  Badge,
+  Button,
+  Card,
+  ConfirmDialog,
+  Disclosure,
+  Empty,
+  ErrorAlert,
+  Loading,
+  MarketTag,
+  Modal,
+  Tabs,
+  useToast,
+} from '../components/ui';
 import { MarketSeriesPanel, ProfilePanel, markersFromTransactions } from '../components/InstrumentDetailSections';
+import { FinancialsPanel } from '../components/FinancialsPanel';
+import { Markdown } from '../components/markdown/Markdown';
 
 const TX_SOURCE_LABELS: Record<string, string> = {
   manual: '手动',
@@ -90,6 +105,7 @@ export function AssetDetailDialog(props: {
   const toast = useToast();
   const [pendingTx, setPendingTx] = useState<Transaction | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [tab, setTab] = useState<'overview' | 'ai'>('overview');
 
   const state = useAsync<AssetDetail | null>(
     () => (open && assetId ? api.assets.get(assetId) : Promise.resolve(null)),
@@ -97,6 +113,11 @@ export function AssetDetailDialog(props: {
   );
   const detail = open && assetId ? state.data : null;
   const markers = useMemo(() => markersFromTransactions(detail?.transactions ?? []), [detail]);
+
+  // 换资产时回到「概览」，不要停留在上一个资产的 AI 页签。
+  useEffect(() => {
+    setTab('overview');
+  }, [assetId, open]);
 
   const instrument = detail
     ? { market: detail.market, code: detail.code, type: detail.type, name: detail.name, currency: detail.currency }
@@ -143,7 +164,7 @@ export function AssetDetailDialog(props: {
                   {detail.market}/{detail.code}
                 </span>
                 <Badge tone={detail.type === 'stock' ? 'manual' : 'ai'}>{INSTRUMENT_TYPE_LABELS[detail.type]}</Badge>
-                <Badge>{MARKET_LABELS[detail.market]}</Badge>
+                <MarketTag market={detail.market} />
                 {detail.closed && <Badge tone="warn">已清仓</Badge>}
               </span>
             }
@@ -162,34 +183,56 @@ export function AssetDetailDialog(props: {
             {detail.priceAt && <div className="tiny mute mt-1">行情时间：{fmtDateTime(detail.priceAt)}</div>}
           </Card>
 
-          {/* 买卖点来自交易记录，与列表中的 AI 分析共用同一份数据。 */}
-          <MarketSeriesPanel instrument={instrument} markers={markers} />
+          <Tabs
+            ariaLabel="资产详情分页"
+            value={tab}
+            onChange={setTab}
+            options={[
+              { value: 'overview', label: '概览' },
+              {
+                value: 'ai',
+                label: 'AI 分析',
+                badge: detail.aiSummary ? <Badge tone="ai">已生成</Badge> : undefined,
+              },
+            ]}
+          />
 
-          <ProfilePanel instrument={instrument} />
+          {tab === 'overview' ? (
+            <>
+              {/* 买卖点来自交易记录，与列表中的 AI 分析共用同一份数据。 */}
+              <MarketSeriesPanel instrument={instrument} markers={markers} />
 
-          <Card
-            title={
-              <span className="center gap-2">
-                AI 分析总结
-                {detail.aiSummaryAt && <Badge tone="ai">生成于 {fmtDateTime(detail.aiSummaryAt)}</Badge>}
-              </span>
-            }
-          >
-            {detail.aiSummary ? (
-              <div className="small" style={{ whiteSpace: 'pre-wrap' }}>
-                {detail.aiSummary}
-              </div>
-            ) : (
-              <Empty title="尚未生成该资产的 AI 分析" hint="回到列表点击「AI 资产分析」，Agent 会逐项分析财报、基本面、宏观与微观环境" />
-            )}
-          </Card>
+              <ProfilePanel instrument={instrument} />
 
-          <Card
-            title={`交易记录（${detail.transactions.length} 笔）`}
-            actions={<span className="tiny mute">按日期倒序 · 删除后将重算持仓</span>}
-          >
-            <TransactionTable transactions={detail.transactions} currency={detail.currency} onDelete={setPendingTx} />
-          </Card>
+              {/* 财报体积大且不是每次都要看 → 默认折叠，避免弹窗被拉得很长。 */}
+              <Disclosure title="财务报表（三表）" summary="利润表 · 资产负债表 · 现金流量表（点击展开）">
+                <FinancialsPanel instrument={instrument} />
+              </Disclosure>
+
+              <Card
+                title={`交易记录（${detail.transactions.length} 笔）`}
+                actions={<span className="tiny mute">按日期倒序 · 删除后将重算持仓</span>}
+              >
+                <TransactionTable transactions={detail.transactions} currency={detail.currency} onDelete={setPendingTx} />
+              </Card>
+            </>
+          ) : (
+            <Card
+              title={
+                <span className="center gap-2">
+                  AI 分析总结
+                  {detail.aiSummaryAt && <Badge tone="ai">生成于 {fmtDateTime(detail.aiSummaryAt)}</Badge>}
+                </span>
+              }
+            >
+              {detail.aiSummary ? (
+                /* AI 分析以 Markdown 存储：这里渲染成带标题层级、指标条与语义数字的报告。 */
+                <Markdown text={detail.aiSummary} />
+              ) : (
+                <Empty title="尚未生成该资产的 AI 分析" hint="回到列表点击「AI 资产分析」，Agent 会逐项分析财报、基本面、宏观与微观环境" />
+              )}
+            </Card>
+          )}
         </>
       )}
 

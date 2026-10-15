@@ -233,6 +233,7 @@ test('P1-3: resumeRunId 从已存轨迹续跑（新 run 行 + 标题标注），
       toolCalls: null,
       toolCallId: null,
       name: null,
+      reasoningContent: null,
       createdAt: now,
     });
     repo.addRunMessage({
@@ -244,6 +245,7 @@ test('P1-3: resumeRunId 从已存轨迹续跑（新 run 行 + 标题标注），
       toolCalls: null,
       toolCallId: null,
       name: null,
+      reasoningContent: null,
       createdAt: now,
     });
 

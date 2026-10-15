@@ -413,6 +413,7 @@ test('GET /api/agent/runs/:id/trace：run+steps+messages+audit+pendingWrites', a
     toolCalls: null,
     toolCallId: null,
     name: null,
+    reasoningContent: null,
     createdAt: at,
   });
   repo.addRunMessage({
@@ -424,6 +425,7 @@ test('GET /api/agent/runs/:id/trace：run+steps+messages+audit+pendingWrites', a
     toolCalls: '[]',
     toolCallId: null,
     name: null,
+    reasoningContent: null,
     createdAt: at,
   });
   repo.addAudit({

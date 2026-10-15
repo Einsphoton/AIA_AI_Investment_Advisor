@@ -74,7 +74,13 @@ export function MarketSeriesPanel(props: {
       {series && series.points.length > 0 && (
         <>
           {series.kind === 'nav' ? (
-            <NavChart points={series.points} markers={markers} className={chartClass} resetKey={`${instrument.code}-${range}-${series.points.length}`} />
+            <NavChart
+              points={series.points}
+              markers={markers}
+              currency={series.currency}
+              className={chartClass}
+              resetKey={`${instrument.code}-${range}-${series.points.length}`}
+            />
           ) : (
             <KLineChart points={series.points} markers={markers} currency={series.currency} className={chartClass} resetKey={`${instrument.code}-${range}-${interval}-${series.points.length}`} />
           )}
@@ -299,14 +305,22 @@ function Metric(props: { label: string; value: string; hint?: string; tone?: num
 
 /** Convenience: convert transactions into chart markers. */
 export function markersFromTransactions(
-  transactions: { kind: string; tradeDate: string; price: number; shares: number }[],
+  transactions: { kind: string; tradeDate: string; price: number; shares: number; fee?: number; note?: string }[],
 ): TradeMarker[] {
   return transactions
     .filter((tx) => safeNumber(tx.price) > 0)
-    .map((tx) => ({
-      kind: tx.kind === 'sell' ? 'sell' : 'buy',
-      date: tx.tradeDate.slice(0, 10),
-      price: safeNumber(tx.price),
-      shares: safeNumber(tx.shares),
-    }));
+    .map((tx) => {
+      const price = safeNumber(tx.price);
+      const shares = safeNumber(tx.shares);
+      return {
+        kind: tx.kind === 'sell' ? ('sell' as const) : ('buy' as const),
+        date: tx.tradeDate.slice(0, 10),
+        price,
+        shares,
+        // 成交金额与费用一并带上，买卖点悬浮面板要显示。
+        amount: Math.round(price * shares * 100) / 100,
+        fee: safeNumber(tx.fee),
+        note: tx.note,
+      };
+    });
 }

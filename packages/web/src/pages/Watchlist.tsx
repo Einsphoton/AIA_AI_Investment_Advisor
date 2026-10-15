@@ -2,7 +2,7 @@
  * WatchlistPage — owner: web-ai-pages.
  * 我的标的：筛选/排序、添加、清空、AI 标的分析（SSE）与详情浮窗。
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   INSTRUMENT_TYPES,
@@ -15,7 +15,7 @@ import type { Creator, InstrumentType, Market, WatchItem } from '@aia/shared';
 import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { toApiError, useAsync, useDebounced } from '../api/hooks';
-import { fmtDate, fmtNum, fmtPct, fmtPrice, fmtSignedMoney, pnlClass } from '../format';
+import { fmtDate, fmtDateTime, fmtNum, fmtPct, fmtPrice, fmtSignedMoney, pnlClass } from '../format';
 import {
   Alert,
   Badge,
@@ -25,7 +25,9 @@ import {
   Empty,
   ErrorAlert,
   Input,
+  InstrumentTypeTag,
   Loading,
+  MarketTag,
   ProgressBar,
   Segmented,
   SortHeader,
@@ -58,6 +60,8 @@ export function WatchlistPage() {
   const [deleteTarget, setDeleteTarget] = useState<WatchItem | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [restoringId, setRestoringId] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const autoRefreshed = useRef(false);
 
   const debouncedQuery = useDebounced(query, 350);
   const list = useAsync(
@@ -85,6 +89,45 @@ export function WatchlistPage() {
   useAgentRefresh(() => setNonce((value) => value + 1));
 
   const items = list.data?.items ?? [];
+
+  /** 最新一次行情时间：用于「行情更新于」提示与自动刷新判断。 */
+  const quoteAt = items.reduce<string | null>(
+    (newest, item) => (item.priceAt && (!newest || item.priceAt > newest) ? item.priceAt : newest),
+    null,
+  );
+
+  /**
+   * 刷新池内行情。
+   *
+   * 「推荐后涨跌」= 现价 - 推荐时价格，以前只有跑「AI 标的分析」时才会顺带刷新，
+   * 两次分析之间永远是 0；现在进页面会自动补一次，也可以手动刷新。
+   */
+  async function refreshQuotes(reason: 'auto' | 'manual') {
+    if (reason === 'manual') setRefreshing(true);
+    try {
+      const result = await api.watchlist.refresh();
+      if (reason === 'manual') {
+        toast.success(
+          '行情已刷新',
+          `成功 ${result.updated} 个${result.failed > 0 ? `，失败 ${result.failed} 个` : ''}`,
+        );
+      }
+      setNonce((value) => value + 1);
+    } catch (error) {
+      if (reason === 'manual') toast.error('刷新行情失败', toApiError(error).message);
+    } finally {
+      if (reason === 'manual') setRefreshing(false);
+    }
+  }
+
+  useEffect(() => {
+    if (autoRefreshed.current || list.loading || !list.data || items.length === 0) return;
+    autoRefreshed.current = true;
+    // 只在行情超过 5 分钟未更新时自动刷新，避免每次进页面都打一遍数据源。
+    const ageMs = quoteAt ? Date.now() - new Date(quoteAt).getTime() : Number.POSITIVE_INFINITY;
+    if (ageMs > 5 * 60_000) void refreshQuotes('auto');
+  }, [list.loading, list.data, items.length, quoteAt]);
+
   const total = list.data?.total ?? items.length;
   const counts = list.data?.counts ?? allItems.data?.counts ?? { active: total, retired: 0 };
   const clearCount = allItems.data?.total ?? total;
@@ -158,6 +201,13 @@ export function WatchlistPage() {
           <div className="toolbar">
             <Button onClick={() => setAddOpen(true)}>添加标的</Button>
             <Button
+              loading={refreshing}
+              title="拉取最新现价 / 涨跌 / 走势（推荐后涨跌依赖它）"
+              onClick={() => void refreshQuotes('manual')}
+            >
+              刷新行情
+            </Button>
+            <Button
               variant="primary"
               loading={running}
               onClick={() => run({ path: '/watchlist/analyze', title: 'AI 标的分析' })}
@@ -227,7 +277,9 @@ export function WatchlistPage() {
           </div>
 
           <div className="tiny mute mb-2">
-            「AI 标的分析」会按当前投资性格搜索候选、深度分析并创建 / 更新标的；同时复核既有标的，
+            行情更新于 {fmtDateTime(quoteAt)}（现价与「推荐后涨跌」依赖它；进页面会自动补刷，过期超过 5 分钟才请求）。
+            <br />
+            「AI 标的分析」会按当前投资性格在 <strong>CN / HK / US 三个市场</strong> 搜索候选（含场内 ETF 与场外基金），深度分析并创建 / 更新标的；同时复核既有标的，
             把不再适合继续跟踪的标记为<strong>已退役</strong>
             {settings.data ? `（连续 ${settings.data.watchlistRetireDeleteRuns} 次确认后才会自动移除；0 = 只标记不删除）` : ''}。
             <strong>有持仓的标的不进入淘汰流程</strong>，不会因为排名落后而被移出。
@@ -309,8 +361,12 @@ export function WatchlistPage() {
                           {item.note && <div className="tiny mute truncate" style={{ maxWidth: 200 }}>{item.note}</div>}
                         </td>
                         <td className="mono tiny">{item.code}</td>
-                        <td>{INSTRUMENT_TYPE_LABELS[item.type]}</td>
-                        <td>{MARKET_LABELS[item.market]}</td>
+                        <td>
+                          <InstrumentTypeTag type={item.type} />
+                        </td>
+                        <td>
+                          <MarketTag market={item.market} />
+                        </td>
                         <td>
                           <Badge tone={item.source === 'ai' ? 'ai' : 'manual'}>{item.source === 'ai' ? 'AI' : '手动'}</Badge>
                         </td>
@@ -323,7 +379,10 @@ export function WatchlistPage() {
                           </div>
                         </td>
                         <td className="num">{fmtPrice(item.targetPrice, currency)}</td>
-                        <td className={`num ${pnlClass(item.expectedReturn)}`}>{fmtPct(item.expectedReturn)}</td>
+                        <td className={`num ${pnlClass(item.expectedReturn)}`}>
+                          <div>{fmtPct(item.expectedReturn)}</div>
+                          <div className="tiny mute nowrap">{item.expectedReturnHorizon || '未标注期限'}</div>
+                        </td>
                         <td className="num">
                           <div className={pnlClass(item.changeSinceAddedPct)}>{fmtPct(item.changeSinceAddedPct)}</div>
                           <div className={`tiny ${pnlClass(item.changeSinceAdded)}`}>

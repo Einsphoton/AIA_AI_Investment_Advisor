@@ -21,7 +21,9 @@ import {
 import { badRequest, conflict, notFound } from '../errors.js';
 import { getRepo } from '../registry.js';
 import type { AdviceRow, TxRow } from '../types/models.js';
+import type { LoggerLike } from '../types/agent.js';
 import { localDate, localMonth, nowIso, parseOrThrow, tradeDateSchema } from '../db/util.js';
+import { readAdviceOutcomes, trackAdviceOutcomes } from '../services/advice-outcomes.js';
 import {
   computeBudgetStatus,
   computePosition,
@@ -53,7 +55,22 @@ function requireAdvice(id: string): AdviceRow {
 }
 
 export async function registerAdviceRoutes(app: FastifyInstance): Promise<void> {
+  const logger = app.log as unknown as LoggerLike;
+
   app.get('/api/budget', async () => budgetStatus());
+
+  /**
+   * 建议结果追踪：确定性记录每条建议相对基准指数的实际表现。
+   * 只读——数字由 `trackAdviceOutcomes` 落库，这里不触网。
+   */
+  app.get('/api/advice/outcomes', async () => readAdviceOutcomes(getRepo()));
+
+  /** 手动触发一次重算（界面上的「刷新追踪」按钮 / 定时任务的旁路能力）。 */
+  app.post('/api/advice/outcomes/track', async () => {
+    const repo = getRepo();
+    const result = await trackAdviceOutcomes({ repo, logger });
+    return { ...readAdviceOutcomes(repo), tracked: result };
+  });
 
   app.get('/api/advice', async (request) => {
     const query = parseOrThrow(listQuerySchema, request.query, '查询参数');

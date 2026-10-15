@@ -12,7 +12,9 @@ import {
   computeBudgetStatus,
   computePosition,
   summarizePortfolio,
+  toAdviceItem,
   toAssetSummary,
+  toWatchItem,
 } from '../src/services/portfolio.js';
 
 function tx(
@@ -256,6 +258,70 @@ test('预算：超支时 remaining 为负且 exhausted=true', () => {
   assert.equal(cn.remaining, -950);
   assert.equal(cn.exhausted, true);
   assert.equal(cn.usedPct, 2000);
+});
+
+test('建议来源（origin）：持仓 / 我的标的 / 池外，由链接字段如实推导', () => {
+  const base = {
+    id: 'adv-1',
+    batchId: 'b1',
+    assetId: null as string | null,
+    watchItemId: null as string | null,
+    assetName: '国电南瑞',
+    code: '600406',
+    market: 'CN' as const,
+    type: 'stock' as const,
+    action: 'buy' as const,
+    targetShares: 50,
+    targetPrice: 25,
+    amount: 1250,
+    currency: 'CNY',
+    reason: '测试',
+    confidence: 0.7,
+    status: 'pending' as const,
+    createdAt: '2026-10-15T00:00:00.000Z',
+    decidedAt: null,
+    executedShares: null,
+    executedPrice: null,
+  };
+  assert.equal(toAdviceItem({ ...base, assetId: 'a1' }).origin, 'holding');
+  assert.equal(toAdviceItem({ ...base, watchItemId: 'w1' }).origin, 'watchlist');
+  assert.equal(toAdviceItem(base).origin, 'external', '没有链接 = 池外建议（跳过了候选池筛选）');
+  // 持仓优先：同时存在链接时以持仓为准。
+  assert.equal(toAdviceItem({ ...base, assetId: 'a1', watchItemId: 'w1' }).origin, 'holding');
+});
+
+test('toWatchItem：预期收益期限缺失时退化为空串（不是 undefined）', () => {
+  const row: Parameters<typeof toWatchItem>[0] = {
+    id: 'w1',
+    name: '国电南瑞',
+    code: '600406',
+    market: 'CN',
+    type: 'stock',
+    source: 'ai',
+    qualityScore: 74,
+    targetPrice: 25,
+    expectedReturn: 14,
+    expectedReturnHorizon: '',
+    initialPrice: 22.18,
+    initialPriceAt: '2026-10-14T00:00:00.000Z',
+    price: 22.29,
+    priceAt: '2026-10-15T00:00:00.000Z',
+    prevClose: 22.18,
+    dayChangePct: 0.5,
+    thesis: '',
+    note: '',
+    aiSummary: '',
+    aiSummaryAt: null,
+    spark: [],
+    status: 'active',
+    retiredReason: '',
+    retiredAt: null,
+    retireStreak: 0,
+    createdAt: '2026-10-14T00:00:00.000Z',
+    updatedAt: '2026-10-15T00:00:00.000Z',
+  };
+  assert.equal(toWatchItem(row).expectedReturnHorizon, '');
+  assert.equal(toWatchItem({ ...row, expectedReturnHorizon: '6-12 个月' }).expectedReturnHorizon, '6-12 个月');
 });
 
 test('预算：budget=0 表示「本月不投」（remaining<=0 → exhausted、usedPct=100）', () => {

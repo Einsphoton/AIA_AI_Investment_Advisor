@@ -41,3 +41,6 @@ Thumbs.db
 
 # scratch (probe scripts are developer-only)
 _probe/
+
+# 生成的界面预览（`npm run preview:financials`）：供人工用浏览器核对观感，不入库
+preview-financials-panel.html

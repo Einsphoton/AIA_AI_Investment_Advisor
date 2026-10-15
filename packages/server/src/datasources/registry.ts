@@ -15,6 +15,7 @@ import {
   type DataSourceChoice,
   type DataSourceConfig,
   type DividendItem,
+  type Financials,
   type Fundamentals,
   type FundInfo,
   type InstrumentType,
@@ -37,6 +38,7 @@ import {
   emSeries,
 } from './eastmoney.js';
 import { fundInfo, fundQuote, fundSearch, fundSeries } from './fund.js';
+import { emFinancials } from './financials.js';
 import { keyedFundamentals, keyedQuote, keyedSeries } from './keyed.js';
 import { macroBundle, macroReport } from './macro.js';
 import { newsSearch } from './news.js';
@@ -378,6 +380,37 @@ export async function getFundamentals(request: FundamentalsRequest): Promise<Sou
     }
   }
   return null;
+}
+
+export interface FinancialsRequest {
+  code: string;
+  market: Market;
+  type?: InstrumentType;
+  name?: string;
+  /** 需要的报告期数量（1-8），默认 4。 */
+  periods?: number;
+}
+
+/**
+ * 财报三表（利润表 / 资产负债表 / 现金流量表，多期）。
+ *
+ * 目前只有东方财富 F10 提供零 Key 的三表：A 股完整三表，港股为利润表 + 资产负债表 +
+ * 主要指标兜底的现金流总量，美股为利润表 + 资产负债表（现金流量表明细上游无接口）。
+ * 基金/ETF 没有财报，直接返回 null —— 调用方必须把「不可用」写进结论。
+ */
+export async function getFinancials(request: FinancialsRequest): Promise<Sourced<Financials> | null> {
+  const market = request.market;
+  const type = request.type ?? 'stock';
+  if (type !== 'stock') return null;
+  const code = normalizeCode(market, request.code);
+  if (!code) return null;
+  try {
+    const value = await emFinancials(market, code, request.name ?? '', request.periods ?? 4);
+    if (!value) return null;
+    return { value, sources: value.sources, warnings: value.warnings };
+  } catch {
+    return null;
+  }
 }
 
 export interface DividendsRequest {

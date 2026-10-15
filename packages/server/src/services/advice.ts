@@ -42,6 +42,7 @@ export async function runAdvice(context: PipelineContext): Promise<AgentRun> {
     qualityScore: item.qualityScore,
     targetPrice: item.targetPrice,
     expectedReturn: item.expectedReturn,
+    expectedReturnHorizon: item.expectedReturnHorizon,
     thesis: item.thesis,
     aiSummary: item.aiSummary,
   }));
@@ -59,6 +60,12 @@ export async function runAdvice(context: PipelineContext): Promise<AgentRun> {
     '2) reason 必须引用具体数据（现价、估值、K 线位置、预算剩余、成本与盈亏）。',
     '3) 建议数量精炼（3-8 条），优先处理：风险敞口过大、估值偏高/偏低、预算内的高质量机会。',
     '4) 数据缺失要说明；不要给出没有数据支撑的目标价。',
+    '4.1) 交易单位与额度（系统会机械校验，报错请按提示改正）：A 股/场内基金买入必须是 100 股（份）的整数倍，科创板最小 200 股；卖出可清掉零股；美股 1 股起。',
+    '     单笔买入金额 targetShares × targetPrice 不得超过当月该市场预算剩余，请先按剩余额度反推可买数量再落建议。',
+    // 来源纪律：让建议可追溯，并让「跳过候选池」这件事在界面与理由里都可见。
+    '5) 来源纪律：卖出建议必须来自已持仓；买入建议优先来自「我的标的」（已过质量分门槛的候选池）或已持仓的加仓。',
+    '   —— 建议针对持仓时把资产 id 填进 assetId，针对「我的标的」时填 watchItemId；系统也会按代码自动回填。',
+    '   —— 如果确实要买入「我的标的」之外的标的，这是允许的，但必须在 reason 开头写明「池外标的」并解释为什么它比池内候选更值得买（该建议会被标记为「池外」，等于跳过了候选池筛选）。',
     `持仓（含成本与盈亏）：${JSON.stringify(holdings)}`,
     `自选标的：${JSON.stringify(watchlist)}`,
   ].join('\n');

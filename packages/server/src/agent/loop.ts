@@ -47,6 +47,7 @@ import type { AgentDeps, AgentRunRequest, EventSink } from '../types/agent.js';
 import type { RunMessageRow, RunRow } from '../types/models.js';
 import { createLlmClient, LlmError, NOT_CONFIGURED_MESSAGE, type LlmClient, type LlmMessage, type LlmToolSchema } from './llm.js';
 import { compactContext } from './context.js';
+import { clearToolEvidence } from './evidence.js';
 import { buildSystemPrompt, personaSummary } from './prompts.js';
 import { executeTool, llmToolSchemas, riskOfTool, type AllowWrite, type ToolContext } from './tools.js';
 import { randomUUID } from 'node:crypto';
@@ -109,6 +110,9 @@ function runMessageToLlmMessage(row: RunMessageRow): LlmMessage {
   }
   if (row.toolCallId) message.tool_call_id = row.toolCallId;
   if (row.name) message.name = row.name;
+  // Thinking-mode providers require the trace back on assistant tool-call
+  // messages, so a resumed run must restore it or the very first turn fails.
+  if (row.reasoningContent) message.reasoning_content = row.reasoningContent;
   return message;
 }
 
@@ -140,6 +144,8 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
   const startedAt = new Date().toISOString();
   const llmConfig = resolveLlmConfig(deps);
   const client = createLlmClient(llmConfig, deps.logger);
+  // 机械接地校验的证据累积器：每个 run 一份，开始时清空（runId 唯一，防御性重置）。
+  clearToolEvidence(runId);
   const allowWrites = new Set<AllowWrite>(request.allowWrites ?? DEFAULT_WRITES[request.kind] ?? []);
   const batchId =
     request.target && request.target.startsWith('batch:') ? request.target.slice('batch:'.length) : `batch-${runId}`;
@@ -260,6 +266,7 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
         toolCalls: message.tool_calls?.length ? JSON.stringify(message.tool_calls) : null,
         toolCallId: message.tool_call_id ?? null,
         name: message.name ?? null,
+        reasoningContent: message.reasoning_content ?? null,
         createdAt: new Date().toISOString(),
       });
     } catch (error) {
@@ -463,6 +470,9 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
         role: 'assistant',
         content: result.content || null,
         tool_calls: calls,
+        // Kept in the live context so the next turn can hand the thinking trace
+        // back to the provider (see `LlmMessage.reasoning_content`).
+        ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
       });
 
       const answered = new Set<string>();
@@ -633,6 +643,9 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
   deps.logger.info(
     `agent run ${runId} finished (${runError ? 'error' : 'done'}${cancelled ? ', cancelled' : ''}) after ${turns} turns, ${compactionCount} context compaction(s)`,
   );
+
+  // 释放本次 run 的工具证据（接地校验已经用完了）。
+  clearToolEvidence(runId);
 
   return toAgentRun(finished ?? run, repo.listSteps(runId));
 }

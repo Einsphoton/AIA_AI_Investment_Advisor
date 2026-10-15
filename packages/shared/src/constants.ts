@@ -1100,9 +1100,19 @@ export const DEFAULT_ASSET_CACHE_TTL_MS = 60_000;
 export const DEFAULT_SERIES_CACHE_TTL_MS = 5 * 60_000;
 
 /** Agent guard rails. */
-export const AGENT_MAX_TURNS = 12;
+/**
+ * Turn cap. Only binds when a run genuinely needs the headroom (a converging run
+ * exits early), so raising it costs nothing for cheap runs and rescues expensive
+ * ones: production measured a `watchlist-analysis` stage using **12/12** turns and
+ * writing nothing at all, after 393k prompt tokens.
+ */
+export const AGENT_MAX_TURNS = 20;
 export const AGENT_MAX_TOOL_CALLS_PER_TURN = 6;
-export const AGENT_MAX_STEPS = 80;
+/**
+ * Step cap (one step per LLM turn **and** per tool call). The same production run
+ * used 12 + 61 = 73 of the old 80, so the step cap was about to bind as well.
+ */
+export const AGENT_MAX_STEPS = 160;
 
 /** Extra turns granted by `POST /api/agent/runs/:id/resume` (P1-3). */
 export const AGENT_RESUME_EXTRA_TURNS = 8;
@@ -1119,3 +1129,13 @@ export const AGENT_TOOL_CONCURRENCY = 4;
 export const LLM_MAX_RETRIES = 3;
 /** Base delay for that backoff (doubled per attempt, plus jitter). */
 export const LLM_RETRY_BASE_MS = 800;
+/**
+ * Retries for an **empty completion** (no content and no tool calls).
+ *
+ * A blank turn is a gateway hiccup, not an answer — production saw a 129k-token
+ * advice stage die on one blank turn and lose the whole batch. Retrying is far
+ * cheaper than throwing the stage away.
+ */
+export const LLM_MAX_EMPTY_RETRIES = 2;
+/** Base delay before retrying an empty completion (linear in the retry index). */
+export const LLM_EMPTY_RETRY_BASE_MS = 400;

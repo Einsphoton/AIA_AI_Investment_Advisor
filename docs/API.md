@@ -106,7 +106,8 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 | GET | `/api/watchlist` | `WatchlistListResponse`（`{ items, total, counts: { active, retired } }`），支持筛选/排序/搜索；`?status=active\|retired\|all`，**默认 `active`** |
 | POST | `/api/watchlist` | 入参 `CreateWatchItemInput`；自动补全名称并记录 `initialPrice` |
 | GET | `/api/watchlist/:id` | `WatchlistDetail`（持仓信息、交易记录、分红） |
-| PATCH | `/api/watchlist/:id` | 入参 `UpdateWatchItemInput`（备注/优质评估/目标价/预期收益/逻辑） |
+| PATCH | `/api/watchlist/:id` | 入参 `UpdateWatchItemInput`（备注/优质评估/目标价/预期收益/预期期限/逻辑） |
+| POST | `/api/watchlist/refresh` | **刷新行情**：拉取池内标的的现价/昨收/当日涨跌/走势 → `{ updated, failed, warnings }`；行情源不可用时如实返回 `updated:0` + warning，不伪造数值 |
 | DELETE | `/api/watchlist/:id` | `{ ok: true }`（用户手动删除不受淘汰护栏限制） |
 | DELETE | `/api/watchlist` | **清空标的** → `{ ok: true, deleted: number }` |
 | POST | `/api/watchlist/:id/restore` | **复活**：清空 `status/retiredReason/retiredAt/retireStreak` → `WatchItem` |
@@ -129,7 +130,32 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
   备份/导出会带上退役记录，恢复后状态一致。
 
 
+### 5.2 行情刷新与「推荐后涨跌」
+
+`WatchItem.changeSinceAdded(Pct)` = 现价 − 推荐时价格。此前价格只在「AI 标的分析」开跑时顺带刷新，
+两次分析之间该值恒为 0。现在：
+
+- `POST /api/watchlist/refresh` 提供随取随新的入口（界面进页面时若行情超过 5 分钟未更新会自动调一次，
+  也可以手动点「刷新行情」）；
+- 列表展示「行情更新于 …」，用户能判断数据新旧；
+- 离线（`AIA_OFFLINE=1`）或数据源不可用时返回 `failed=N` + warning，**不写任何价格**，
+  「推荐后涨跌」保持 0 而不是编造数值。
+
+### 5.3 候选覆盖度（CN / HK / US × 股票 / 场内基金 / 场外基金）
+
+标的分析的提示词会带上**当前池子的市场与类型分布**，并明确要求补齐为 0 的市场与类型
+（预算本就覆盖 CN/HK/US 三地）。跳过某个市场或类型时必须在报告里写明原因。
+
+类型判定修正：东财 suggest 对场外基金返回 `SecurityTypeName='基金'`，旧代码一律判成 `etf`；
+而 A 股同代码可能是股票（`000001` 场外基金「华夏成长」vs 股票「平安银行」），
+按 `etf` 查报价会**静默命中股票**并写入错误价格。现在按 `Classify/JYS = 'OTCFUND'` 判为 `fund`。
+
 ## 6. AI 投资建议（/api/advice）
+
+`AdviceItem` 增加 `origin`（`holding` 持仓 / `watchlist` 我的标的 / `external` 池外）：
+由 `assetId`/`watchItemId` 推导，写入时 `create_advice` 会按 `code+market+type` 反查回填链接，
+因此「池外」意味着该建议**跳过了「AI 标的分析」的质量分门槛**，界面据此提示用户先复核。
+标的的 `expectedReturn` 旁边新增 `expectedReturnHorizon`（预期多久到达，自由文本，≤40 字）。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -138,7 +164,24 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 | POST | `/api/advice/:id/reject` | 驳回（本次不采纳）→ `AdviceItem`（`status=rejected`） |
 | POST | `/api/advice/:id/confirm` | 入参 `ConfirmAdviceInput`（实际份额/单价/日期）→ `{ advice: AdviceItem, asset: AssetDetail }`，写入交易并更新持仓。**与 `/api/assets/:id/transactions` 同源校验**：卖出份额超过持仓、或卖出日期早于可用持仓形成时间 → **409 CONFLICT** |
 | GET | `/api/advice/last` | 最近一次建议生成运行 `AgentRunSummary \| null` |
+| GET | `/api/advice/outcomes` | **建议结果追踪**（只读）：`{ items: AdviceOutcome[], stats: AdviceOutcomeStats }` |
+| POST | `/api/advice/outcomes/track` | 重算一次追踪 → `{ items, stats, tracked: AdviceOutcomeTrackResult }` |
 | GET | `/api/budget` | 当月各市场预算使用情况 `BudgetStatus` |
+
+### 6.1 建议结果追踪（确定性，不经过 LLM）
+
+回答「AI 的建议到底对不对」，口径必须可核对（`services/advice-outcomes.ts`，物化在 `advice_outcomes` 表，
+**可随时删表重建，结果一致**）：
+
+| 口径 | 规则 |
+| --- | --- |
+| 基准价 | **建议日之后第一个交易日**的收盘价。刻意跳过建议当日，避免用当日收盘造成前视偏差 |
+| 方向调整收益 `adviceReturnPct` | 买入=涨幅，卖出=**跌幅**（正数代表「建议方向对」）。它衡量模型方向准确度，**不等于用户真实盈亏**（用户可能没执行） |
+| 超额 `excessPct` | `adviceReturnPct − benchmarkChangePct`，基准与标的用同一锚定规则、同一段序列 |
+| 基准 | A股 `000300` 沪深300；港股 `02800` 盈富基金（恒生指数 ETF）；美股 `SPY`（标普500 ETF）。港股/美股上游指数序列不可用（实测 HSI 502、SPX 404），故用跟踪同一指数的 ETF 代理，界面如实标注 |
+| 可度量门槛 | `samples >= 2`（至少一个「之后」的交易日）。不足者计入 `unmeasured`，**不进胜率分母** |
+| 观测窗口 | 90 自然日，到期冻结为 `status='expired'`，不再随行情漂移 |
+| 触发 | 界面「刷新追踪」按钮，或调度器 tick（`mode != off` 时每次顺带跑一次）。失败只降级为 `warnings`，不 5xx |
 
 **预算规则**（2026-10 修订，口径唯一）：
 - `spent` = 该市场**本月买入成交额**（gross，不含手续费，按市场本位币计）。
@@ -167,6 +210,7 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 | GET | `/api/market/quote?market=&code=` | `Quote` |
 | GET | `/api/market/series?market=&code=&type=&range=&interval=` | `SeriesResponse`（股票/场内基金 K 线；场外基金净值曲线） |
 | GET | `/api/market/profile?market=&code=&type=` | `ProfileResponse`（行情 + 基本面 + 基金详情 + 分红） |
+| GET | `/api/market/financials?market=&code=&type=&periods=` | `FinancialsResponse`：财报三表多期（`periods` 1-8，默认 4）。ETF/基金返回 `applicable:false`（200，不是错误）；股票取不到任何报表才 404/502。报表级缺失用 `statements[].available=false` + `reason` 表达 |
 | GET | `/api/market/detail?market=&code=&type=&range=&interval=` | 上面三者的聚合（详情浮窗一次拉全），`{ series, profile }` |
 | GET | `/api/market/indices` | 全球指数快照 `Quote[]` |
 | GET | `/api/market/macro` | 宏观 + 指数 + 要闻 `MacroSnapshot` |
@@ -245,6 +289,19 @@ MCP 工具以 **`mcp__<serverId>__<toolName>`** 命名并自动出现在 LLM 工
 | GET | `/api/backup/files` | 服务端 `data/backups` 下的导出列表 |
 | POST | `/api/backup/files` | 在服务端生成一份快照文件 → `{ name, size, createdAt }` |
 | GET | `/api/backup/files/:name` | 下载指定快照 |
+| POST | `/api/backup/clear` | **一键清除所有数据**（设置页「危险操作」）→ `ClearDataResult`；入参 `{ keepSettings?: boolean }`（默认 `true`）；AI 流水线运行中返回 **409** |
+
+### 10.1 一键清除所有数据
+
+`POST /api/backup/clear` 在**单个事务**内清空 `assets / transactions / watchlist / advice /
+advice_outcomes / agent_runs / agent_steps / agent_run_messages / chat_sessions / chat_messages /
+audit_log / pending_writes / kv`，返回逐表删除行数（`ClearDataResult`，另含总行数 `deleted`）。
+
+- `keepSettings` 省略或 `true`：设置行完全不动 —— LLM / 数据源 API Key、投资性格、预算与定时任务都保留，清完可立即继续使用；
+- `keepSettings: false`：设置恢复为**出厂默认**（等价于全新数据库：清空全部 Key、投资性格与预算回默认、定时任务回到 `off`），并刷新数据源缓存与调度器；
+- 两种情况下 `last_run_at` 都会被清空（它指向的 run 已不存在）；
+- AI 流水线正在运行时拒绝执行（**409**），否则 run 结束后会把数据重新写回来；
+- 磁盘上的备份快照（`data/backups`）**不删除**，这是不可撤销操作的恢复后路。
 
 ## 11. 前端路由
 
@@ -253,8 +310,10 @@ MCP 工具以 **`mcp__<serverId>__<toolName>`** 命名并自动出现在 LLM 工
 | `/` | Dashboard |
 | `/assets` | 我的资产 |
 | `/watchlist` | 我的标的 |
+| `/compare` | 财报对比（2-4 个标的并排看关键财务指标 + 三表明细） |
 | `/advice` | AI 投资建议 |
 | `/chat` | AI Chat |
+| `/activity` | 活动与审计 |
 | `/settings` | 设置 |
 
 生产模式下由服务端 `@fastify/static` 提供 `packages/web/dist`，并对非 `/api` 的 404 回退到 `index.html`。

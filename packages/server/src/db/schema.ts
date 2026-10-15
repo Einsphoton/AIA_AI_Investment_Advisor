@@ -89,6 +89,7 @@ export const SCHEMA_STATEMENTS: string[] = [
      quality_score REAL NOT NULL DEFAULT 0,
      target_price REAL NOT NULL DEFAULT 0,
      expected_return REAL NOT NULL DEFAULT 0,
+     expected_return_horizon TEXT NOT NULL DEFAULT '',
      initial_price REAL NOT NULL DEFAULT 0,
      initial_price_at TEXT,
      price REAL NOT NULL DEFAULT 0,
@@ -129,6 +130,38 @@ export const SCHEMA_STATEMENTS: string[] = [
      executed_price REAL,
      created_at TEXT NOT NULL,
      decided_at TEXT
+   )`,
+
+  /* ── 建议结果追踪：由序列确定性重算的物化结果（幂等，可随时重建） ──────────── */
+  `CREATE TABLE IF NOT EXISTS advice_outcomes (
+     advice_id TEXT PRIMARY KEY,
+     run_id TEXT,
+     code TEXT NOT NULL DEFAULT '',
+     market TEXT NOT NULL DEFAULT 'CN',
+     type TEXT NOT NULL DEFAULT 'stock',
+     action TEXT NOT NULL DEFAULT 'buy',
+     currency TEXT NOT NULL DEFAULT 'CNY',
+     advised_at TEXT NOT NULL,
+     advice_status TEXT NOT NULL DEFAULT 'pending',
+     executed INTEGER NOT NULL DEFAULT 0,
+     baseline_date TEXT NOT NULL DEFAULT '',
+     baseline_price REAL NOT NULL DEFAULT 0,
+     last_date TEXT NOT NULL DEFAULT '',
+     last_price REAL NOT NULL DEFAULT 0,
+     price_change_pct REAL NOT NULL DEFAULT 0,
+     advice_return_pct REAL NOT NULL DEFAULT 0,
+     benchmark_code TEXT NOT NULL DEFAULT '',
+     benchmark_name TEXT NOT NULL DEFAULT '',
+     benchmark_base REAL NOT NULL DEFAULT 0,
+     benchmark_change_pct REAL NOT NULL DEFAULT 0,
+     excess_pct REAL NOT NULL DEFAULT 0,
+     max_return_pct REAL NOT NULL DEFAULT 0,
+     min_return_pct REAL NOT NULL DEFAULT 0,
+     samples INTEGER NOT NULL DEFAULT 0,
+     days_tracked INTEGER NOT NULL DEFAULT 0,
+     status TEXT NOT NULL DEFAULT 'tracking',
+     warnings TEXT NOT NULL DEFAULT '[]',
+     updated_at TEXT NOT NULL DEFAULT ''
    )`,
 
   `CREATE TABLE IF NOT EXISTS agent_runs (
@@ -223,6 +256,7 @@ export const SCHEMA_STATEMENTS: string[] = [
      tool_calls TEXT,
      tool_call_id TEXT,
      name TEXT,
+     reasoning_content TEXT,
      created_at TEXT NOT NULL
    )`,
 ];
@@ -236,6 +270,8 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS idx_advice_status ON advice(status)',
   'CREATE INDEX IF NOT EXISTS idx_advice_batch ON advice(batch_id)',
   'CREATE INDEX IF NOT EXISTS idx_advice_created ON advice(created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_advice_outcomes_advised ON advice_outcomes(advised_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_advice_outcomes_status ON advice_outcomes(status)',
   'CREATE INDEX IF NOT EXISTS idx_runs_kind_started ON agent_runs(kind, started_at)',
   'CREATE INDEX IF NOT EXISTS idx_steps_run ON agent_steps(run_id, idx)',
   'CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id, created_at)',
@@ -266,6 +302,11 @@ export function migrateSchema(db: DatabaseSync): void {
   ensureColumn(db, 'watchlist', 'retired_at', 'TEXT');
   ensureColumn(db, 'watchlist', 'retire_streak', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'settings', 'watchlist_retire_delete_runs', 'INTEGER NOT NULL DEFAULT 3');
+  // 标的预期收益的到达期限（自由文本，如「6-12 个月」）。
+  ensureColumn(db, 'watchlist', 'expected_return_horizon', "TEXT NOT NULL DEFAULT ''");
+  // 思考模型（DeepSeek reasoning）要求把 assistant 的思考轨迹回传；老库补列，
+  // 否则续跑一个工具循环会在第一轮就 400。
+  ensureColumn(db, 'agent_run_messages', 'reasoning_content', 'TEXT');
 
   for (const statement of INDEX_STATEMENTS) db.exec(statement);
 }

@@ -31,6 +31,13 @@
                  .modal-close .toast-stack .toast .toast-success .toast-error
      charts      .chart .chart-sm .chart-md .chart-lg .chart-placeholder
                  .sparkline .marker-legend
+     markdown    .md .md-flow .md-metrics .md-metric .md-mini-bar .md-h .md-h-icon
+                 .md-p .md-list .md-quote .md-table-wrap .md-table .md-bar-cell
+                 .md-num .md-strong .md-code .md-chart .md-hr
+     overlays    .hovertip .hovertip-trigger
+     tags        .market-tag .market-CN .market-HK .market-US .type-tag .type-stock .type-etf .type-fund
+                 .tabs .tab .disclosure .disclosure-head .disclosure-body
+                 .fin-highlight .fin-highlight-label .fin-highlight-value
      agent       .run-panel .run-timeline .step-list .step .step-dot .step-label .step-detail
                  .progress .progress-bar .typing-dot
                  .agent-dock .agent-dock-pill .agent-metric（右下角全局推理面板）
@@ -318,11 +325,13 @@ ul { margin: 0; padding-left: 18px; }
 }
 .meta-row .meta-val { color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
 
+/* 主内容区铺满剩余宽度：列表（表格）直接横向扩展，区块（卡片栅格）靠 auto-fit 动态平铺。
+   旧版这里写死 max-width: 1560px，在 16:9 / 超宽屏上右侧会留下大片空白。 */
 .main {
-  flex: 1;
+  flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
-  max-width: 1560px;
-  padding: 26px 30px 64px;
+  padding: 26px clamp(16px, 2.1vw, 42px) 64px;
   position: relative;
   z-index: 1;
 }
@@ -433,7 +442,7 @@ ul { margin: 0; padding-left: 18px; }
 
 /* ── 7. stats ────────────────────────────────────────────────────────────── */
 
-.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap: 14px; }
 .stat-card {
   position: relative;
   background: var(--bg-elevated);
@@ -449,6 +458,8 @@ ul { margin: 0; padding-left: 18px; }
   letter-spacing: 0.12em;
   text-transform: uppercase;
   display: flex; align-items: center; gap: 6px;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
 }
 .stat-value {
   font-size: 25px;
@@ -457,6 +468,10 @@ ul { margin: 0; padding-left: 18px; }
   letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
   color: var(--gold-200);
+  /* 长值（例如「-1.6322亿CNY（2026中报）」）必须换行，否则会溢出卡片边框。 */
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.25;
 }
 .stat-value.pos { color: var(--pos); }
 .stat-value.neg { color: var(--neg); }
@@ -652,7 +667,7 @@ ul { margin: 0; padding-left: 18px; }
 
 /* ── 10. data tables ─────────────────────────────────────────────────────── */
 
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
 table.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 /* 液态玻璃：吸顶表头 */
 table.data-table thead th {
@@ -972,6 +987,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   white-space: pre-wrap;
   word-break: break-word;
 }
+.md-bubble { white-space: normal; }
 .msg-user .msg-bubble { background: #14120c; border-color: rgba(212, 175, 55, 0.18); }
 .msg-assistant .msg-bubble::before {
   content: '';
@@ -1002,9 +1018,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .strong { font-weight: 600; }
 .small { font-size: 12px; }
 .tiny { font-size: 11px; }
-.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-.grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+/* 动态平铺：列数随可用宽度自动增减；min(100%, …) 保证窄屏不会撑破容器。 */
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; }
+.grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); gap: 12px; }
 .mt-1 { margin-top: 4px; } .mt-2 { margin-top: 8px; } .mt-3 { margin-top: 14px; } .mt-4 { margin-top: 20px; }
 .mb-1 { margin-bottom: 4px; } .mb-2 { margin-bottom: 8px; } .mb-3 { margin-bottom: 14px; }
 .pad-0 { padding: 0; }
@@ -1068,31 +1085,595 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   table.data-table thead th { background-color: #101015; }
 }
 
-/* ── 18. responsive + reduced motion ─────────────────────────────────────── */
+/* ── 18. markdown（AI 报告渲染） ─────────────────────────────────────────────
+
+   AI 结论一律以 Markdown 存储（见 packages/server/src/agent/prompts.ts），
+   前端用 <Markdown> 渲染成有层次的版面，而不是把纯文本塞进 pre-wrap。
+
+   渲染的不是「Markdown 语法」而是「读得懂的报告」：
+     · 标题 → 编号徽标 + 语义图标 + 副标题胶囊
+     · **结论**：… → 结论卡（带 入选/回避 判定胶囊）
+     · **主要风险**：… → 风险卡（红色导轨）
+     · 两列短值表格 → 指标卡面板（.md-kv）
+     · ≥三列表格 → 数据表（表头与列对齐 + 斑马纹 + 数值右对齐 + 内联柱）
+     · 加粗涨跌幅 → 带底色的胶囊
+   阅读宽度只约束段落/列表/引用，卡片、表格与图表占满整行。 */
+
+.md {
+  /* 单行阅读宽度上限：超宽屏上正文不会拉成两百字一行。 */
+  --md-measure: 108ch;
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.68;
+  word-break: break-word;
+}
+.md-compact { font-size: 12.5px; line-height: 1.62; --md-measure: none; }
+
+.md-flow > * + * { margin-top: 10px; }
+
+.md-p, .md-list, .md-quote { max-width: var(--md-measure); }
+
+/* ── 标题 ──────────────────────────────────────────────────────────────── */
+
+.md-h {
+  display: flex; flex-direction: column; gap: 5px;
+  color: var(--gold-100);
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+.md-flow > .md-h { margin-top: 22px; }
+.md-flow > .md-h:first-child { margin-top: 0; }
+.md-h-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.md-h-title { min-width: 0; }
+.md-h1 { font-size: 18px; }
+.md-h2 { font-size: 15.5px; padding-bottom: 7px; border-bottom: 1px solid var(--border-quiet); }
+.md-h3 { font-size: 14px; color: var(--gold-200); }
+.md-h4 { font-size: 13px; color: var(--text-dim); }
+.md-h-lead { font-size: 19px; }
+
+/* 编号徽标：「一、」「3.」这类编号做成圆形徽标，扫读时定位更快。 */
+.md-h-badge {
+  flex: 0 0 auto;
+  display: grid; place-items: center;
+  min-width: 21px; height: 21px; padding: 0 5px;
+  border-radius: 7px;
+  background: rgba(212, 175, 55, 0.14);
+  border: 1px solid rgba(212, 175, 55, 0.3);
+  color: var(--gold-200);
+  font-size: 11px; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.md-h-icon { flex: 0 0 auto; color: var(--gold-400); font-size: 12px; }
+
+/* 副标题胶囊：「名称｜角色：稳健成长」里的后半段 */
+.md-h-sub { display: flex; flex-wrap: wrap; gap: 6px; }
+.md-h-subitem {
+  padding: 1px 9px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-quiet);
+  color: var(--text-dim);
+  font-size: 11px; font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+.md-h.tone-risk { color: #ffb4b8; }
+.md-h.tone-risk .md-h-icon, .md-h.tone-risk .md-h-badge { color: var(--pos); border-color: rgba(255, 90, 95, 0.35); background: rgba(255, 90, 95, 0.12); }
+.md-h.tone-target { color: #8fecd0; }
+
+/* ── 结论 / 风险 / 目标 卡片 ─────────────────────────────────────────────── */
+
+.md-callout {
+  position: relative;
+  padding: 11px 14px 12px 16px;
+  border-radius: 11px;
+  border: 1px solid var(--border-quiet);
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+.md-callout::before {
+  content: '';
+  position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--gold-500);
+}
+.md-callout-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.md-callout-icon { flex: 0 0 auto; font-size: 12px; color: var(--gold-300); }
+.md-callout-label {
+  font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--gold-200);
+}
+.md-callout-body { color: var(--text); }
+.md-callout-body > * + * { margin-top: 4px; }
+
+.md-callout.tone-verdict { background: rgba(212, 175, 55, 0.07); border-color: rgba(212, 175, 55, 0.24); }
+.md-callout.tone-target { background: rgba(47, 191, 143, 0.06); border-color: rgba(47, 191, 143, 0.22); }
+.md-callout.tone-target::before { background: var(--neg); }
+.md-callout.tone-target .md-callout-icon, .md-callout.tone-target .md-callout-label { color: #7ee7c4; }
+.md-callout.tone-risk { background: rgba(255, 90, 95, 0.07); border-color: rgba(255, 90, 95, 0.24); }
+.md-callout.tone-risk::before { background: var(--pos); }
+.md-callout.tone-risk .md-callout-icon, .md-callout.tone-risk .md-callout-label { color: #ff9ba1; }
+.md-callout.tone-info { background: rgba(255, 255, 255, 0.025); }
+
+/* 判定胶囊：买入 / 回避 / 观望 */
+.md-verdict {
+  margin-left: auto;
+  padding: 2px 11px;
+  border-radius: 99px;
+  font-size: 11.5px; font-weight: 700;
+  letter-spacing: 0.04em;
+  border: 1px solid;
+  white-space: nowrap;
+}
+.md-verdict.tone-buy { background: rgba(255, 90, 95, 0.14); border-color: rgba(255, 90, 95, 0.38); color: #ff9ba1; }
+.md-verdict.tone-sell { background: rgba(47, 191, 143, 0.14); border-color: rgba(47, 191, 143, 0.34); color: #7ee7c4; }
+.md-verdict.tone-neutral { background: rgba(200, 204, 214, 0.12); border-color: rgba(200, 204, 214, 0.3); color: #d7dbe4; }
+
+/* 行内涨跌胶囊（**+14.54%**） */
+.md-chip {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 5px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.md-chip.tone-pos { background: rgba(255, 90, 95, 0.14); color: #ff9ba1; }
+.md-chip.tone-neg { background: rgba(47, 191, 143, 0.14); color: #7ee7c4; }
+.md-chip.tone-accent { background: rgba(212, 175, 55, 0.14); color: var(--gold-100); }
+.md-chip.tone-flat { background: rgba(255, 255, 255, 0.06); color: var(--text-dim); }
+
+/* ── 指标卡面板（两列短值表格 → 卡片栅格） ──────────────────────────────── */
+
+.md-kv {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 158px), 1fr));
+  gap: 9px;
+}
+.md-kv-item {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-quiet);
+  border-radius: 10px;
+  transition: border-color 0.16s ease;
+}
+.md-kv-item:hover { border-color: var(--border-strong); }
+/* 长值（如「0.3926 + 0.15 = 0.5426 元 → 约 1.13%」）独占整行，标签与值同行排布。 */
+.md-kv-item-wide { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 12px; }
+.md-kv-item-wide .md-kv-label { flex: 0 0 auto; max-width: 40%; }
+.md-kv-item-wide .md-kv-value { margin-top: 0; flex: 1 1 auto; }
+.md-kv-item-wide .md-mini-bar { max-width: 140px; flex: 0 0 auto; align-self: center; }
+.md-kv-label {
+  font-size: 10.5px; letter-spacing: 0.06em;
+  color: var(--text-mute);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.md-kv-value {
+  margin-top: 4px;
+  font-size: 14px; font-weight: 600;
+  color: var(--gold-200);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}
+.md-kv-item.tone-pos .md-kv-value { color: var(--pos); }
+.md-kv-item.tone-neg .md-kv-value { color: var(--neg); }
+
+/* ── 列表 ──────────────────────────────────────────────────────────────── */
+
+.md-list { margin: 0; padding-left: 18px; }
+.md-list .md-list { margin-top: 4px; }
+.md-list li { margin-top: 4px; padding-left: 2px; }
+.md-list li::marker { color: var(--gold-500); }
+.md-list-lead li { margin-top: 6px; }
+.md-li-label { color: var(--gold-200); font-weight: 650; }
+
+/* ── 引用提示块 ────────────────────────────────────────────────────────── */
+
+.md-quote {
+  display: flex; gap: 9px;
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--gold-500);
+  background: rgba(212, 175, 55, 0.07);
+}
+.md-quote-icon { flex: 0 0 auto; font-size: 12px; color: var(--gold-300); line-height: 1.5; }
+.md-quote-body { min-width: 0; }
+.md-quote-body > * + * { margin-top: 6px; }
+.md-quote.tone-risk { border-left-color: var(--pos); background: rgba(255, 90, 95, 0.09); }
+.md-quote.tone-risk .md-quote-icon { color: var(--pos); }
+.md-quote.tone-target { border-left-color: var(--neg); background: rgba(47, 191, 143, 0.09); }
+.md-quote.tone-target .md-quote-icon { color: var(--neg); }
+.md-quote.tone-info { border-left-color: var(--gold-400); background: rgba(212, 175, 55, 0.08); }
+.md-quote.tone-verdict { border-left-color: var(--gold-400); background: rgba(212, 175, 55, 0.08); }
+
+/* ── 数据表 ────────────────────────────────────────────────────────────── */
+
+.md-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--border-quiet);
+  border-radius: var(--radius-sm);
+}
+.md-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+/* ⚠️ text-align 必须显式写：浏览器对 <th> 的默认值是 center，
+   漏掉这一行就会出现「表头居中、列的数值左对齐」的错位。 */
+.md-table th {
+  text-align: left;
+  padding: 9px 13px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-dim);
+  font-size: 10.5px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.md-table td {
+  position: relative;
+  padding: 8px 13px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  vertical-align: middle;
+}
+.md-table tbody tr:last-child td { border-bottom: 0; }
+.md-table tbody tr { transition: background-color 0.14s ease; }
+.md-table tbody tr:nth-child(even) { background-color: rgba(255, 255, 255, 0.014); }
+.md-table tbody tr:hover { background-color: rgba(212, 175, 55, 0.06); }
+.md-table th.align-left, .md-table td.align-left { text-align: left; }
+.md-table th.align-right, .md-table td.align-right { text-align: right; }
+.md-table th.align-center, .md-table td.align-center { text-align: center; }
+.md-table td.num { font-variant-numeric: tabular-nums; }
+
+/* 内联柱：绝对定位 → 不参与排版，数值与表头永远对齐。 */
+.md-bar-fill {
+  position: absolute; left: 0; top: 50%;
+  transform: translateY(-50%);
+  height: 18px; border-radius: 4px;
+  background: rgba(212, 175, 55, 0.15);
+  z-index: 0;
+}
+.md-table td.align-right .md-bar-fill { left: auto; right: 0; }
+.md-cell { position: relative; z-index: 1; }
+
+/* ── 顶部指标条 ────────────────────────────────────────────────────────── */
+
+.md-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 132px), 1fr));
+  gap: 9px;
+  margin-bottom: 14px;
+}
+.md-metric {
+  min-width: 0;
+  padding: 9px 11px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-quiet);
+  border-radius: 10px;
+  transition: border-color 0.16s ease;
+}
+.md-metric:hover { border-color: var(--border-strong); }
+.md-metric-label {
+  font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-mute);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.md-metric-value {
+  margin-top: 3px;
+  font-size: 16px; font-weight: 650;
+  color: var(--gold-200);
+  font-variant-numeric: tabular-nums;
+}
+.md-metric-hint {
+  margin-top: 2px;
+  font-size: 10.5px; color: var(--text-mute);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.md-metric.tone-pos .md-metric-value { color: var(--pos); }
+.md-metric.tone-neg .md-metric-value { color: var(--neg); }
+.md-mini-bar { margin-top: 7px; height: 4px; border-radius: 99px; background: rgba(255, 255, 255, 0.07); overflow: hidden; }
+.md-mini-bar span { display: block; height: 100%; border-radius: 99px; background: var(--gold-400); }
+.md-mini-bar.tone-pos span { background: var(--pos); }
+.md-mini-bar.tone-neg span { background: var(--neg); }
+
+/* ── 行内元素 ──────────────────────────────────────────────────────────── */
+
+.md-strong { color: var(--gold-100); font-weight: 650; }
+.md-em { color: var(--text); font-style: italic; }
+.md-del { color: var(--text-mute); }
+.md-link { color: var(--gold-300); border-bottom: 1px solid rgba(212, 175, 55, 0.35); }
+.md-link:hover { color: var(--gold-100); }
+.md-inline-code {
+  padding: 1px 5px; border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-quiet);
+  font-family: var(--mono); font-size: 0.9em;
+  color: var(--gold-200);
+}
+/* 语义数字：沿用 A 股惯例（红涨绿跌） */
+.md-num { font-variant-numeric: tabular-nums; font-weight: 600; }
+.md-num.tone-pos { color: var(--pos); }
+.md-num.tone-neg { color: var(--neg); }
+.md-num.tone-accent { color: var(--gold-200); }
+
+/* ── 代码块 / 图表块 / 分割线 ───────────────────────────────────────────── */
+
+.md-code-wrap { border: 1px solid var(--border-quiet); border-radius: var(--radius-sm); background: #08080b; overflow: hidden; }
+.md-code-lang {
+  padding: 4px 10px;
+  font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--text-mute);
+  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--border-quiet);
+}
+.md-code {
+  margin: 0; padding: 10px 12px;
+  overflow-x: auto;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.6;
+  color: var(--text-dim); white-space: pre;
+}
+.md-chart { margin: 0; }
+.md-chart-title { margin-bottom: 4px; font-size: 11.5px; color: var(--text-dim); }
+.md-hr { height: 1px; border: 0; margin: 18px 0; background: var(--gold-hair); }
+
+/* 超宽屏：长报告分两栏，避免正文拉成一条超长行 */
+@media (min-width: 1400px) {
+  .md-flow-cols { column-count: 2; column-gap: 34px; }
+  .md-flow-cols > * { break-inside: avoid; }
+}
+
+/* ── 19. hover tip（悬浮浮窗：列表里只留摘要，全文按需弹出） ─────────────── */
+
+.hovertip-trigger {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: help;
+}
+.hovertip-trigger:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.35); border-radius: 6px; }
+.hovertip-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--text-dim);
+}
+.hovertip-more { display: block; margin-top: 3px; font-size: 10.5px; letter-spacing: 0.06em; color: var(--gold-400); }
+
+.hovertip {
+  position: fixed;
+  z-index: 70;
+  max-width: min(460px, calc(100vw - 24px));
+  max-height: min(60vh, 520px);
+  overflow-y: auto;
+  padding: 12px 14px;
+  background-color: rgba(16, 16, 20, 0.96);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 20px 50px -24px rgba(0, 0, 0, 0.95), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  animation: hovertip-in 0.12s ease-out;
+}
+@keyframes hovertip-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.hovertip-title { margin-bottom: 7px; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-mute); }
+
+/* ── 20. 分类标签 / 页签 / 折叠区 / 财报指标卡 ─────────────────────────── */
+
+/* 资产类型标签：空心 + 彩色圆点，与实心市场色标刻意区分开。
+   股票（银）/ 场内基金（金）/ 场外基金（粉，全站唯一）。 */
+.type-tag {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 1px 8px 1px 7px;
+  border-radius: 99px;
+  font-size: 11px; font-weight: 500;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-quiet);
+}
+.type-tag::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-radius: 99px;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+.type-tag.type-stock { color: #c8ccd6; }
+.type-tag.type-etf { color: #e2ba55; border-color: rgba(212, 175, 55, 0.3); }
+.type-tag.type-fund { color: #f0a6c0; border-color: rgba(240, 166, 192, 0.3); }
+
+/* 市场色标：A股（金）/ 港股（青）/ 美股（紫）。
+   这是分类编码而非涨跌语义，所以避开红涨绿跌那套配色，长列表里一眼分市场。 */
+.market-tag {
+  display: inline-flex; align-items: center;
+  padding: 1px 8px;
+  border-radius: 99px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  border: 1px solid;
+}
+.market-tag.market-CN { background: rgba(212, 175, 55, 0.15); border-color: rgba(212, 175, 55, 0.34); color: #f0d894; }
+.market-tag.market-HK { background: rgba(56, 189, 248, 0.14); border-color: rgba(56, 189, 248, 0.32); color: #7dd3fc; }
+.market-tag.market-US { background: rgba(167, 139, 250, 0.14); border-color: rgba(167, 139, 250, 0.32); color: #c4b5fd; }
+
+/* 详情弹窗页签 */
+.tabs {
+  display: flex; gap: 4px;
+  padding: 3px;
+  margin-bottom: 14px;
+  border-radius: var(--radius-sm);
+  background: #0b0b0f;
+  border: 1px solid var(--border-quiet);
+}
+.tab {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 13px;
+  border: 0; border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit; font-size: 13px;
+  cursor: pointer;
+  transition: background-color 0.16s ease, color 0.16s ease;
+}
+.tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+.tab.active { background: rgba(212, 175, 55, 0.16); color: var(--gold-100); }
+
+/* 可折叠区块（默认收起），用于财报这类「大但不常看」的内容 */
+.disclosure { border: 1px solid var(--border-quiet); border-radius: var(--radius); background: var(--bg-soft); overflow: hidden; }
+.disclosure-head {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; padding: 12px 16px;
+  background: transparent; border: 0;
+  color: var(--text); font: inherit; font-size: 13px; font-weight: 600;
+  letter-spacing: 0.03em; text-align: left; cursor: pointer;
+}
+.disclosure-head:hover { background: rgba(255, 255, 255, 0.03); }
+.disclosure-caret { color: var(--gold-400); transition: transform 0.16s ease; }
+.disclosure.open .disclosure-caret { transform: rotate(90deg); }
+.disclosure-summary { margin-left: auto; color: var(--text-mute); font-size: 11.5px; font-weight: 400; }
+.disclosure-body { padding: 0 16px 16px; }
+/* 折叠区里嵌的是完整 Card：去掉外框与内边距，避免双层边框。 */
+.disclosure-body > .card { border: 0; background: transparent; }
+.disclosure-body > .card > .card-header { padding-left: 0; padding-right: 0; }
+.disclosure-body > .card > .card-body { padding: 0; }
+
+/* 财报指标卡：值可能很长（-1.6322亿CNY（2026中报）），必须能换行、不许超框 */
+.fin-highlight {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-quiet);
+  border-radius: 10px;
+}
+.fin-highlight-label { font-size: 11px; line-height: 1.35; color: var(--text-dim); overflow-wrap: anywhere; }
+.fin-highlight-value {
+  margin-top: 4px;
+  font-size: 17px; font-weight: 650;
+  color: var(--gold-200);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.fin-highlight-value.pos { color: var(--pos); }
+.fin-highlight-value.neg { color: var(--neg); }
+.fin-highlight-hint { margin-top: 2px; font-size: 10.5px; color: var(--text-mute); overflow-wrap: anywhere; }
+
+/* ── 21. responsive + reduced motion ─────────────────────────────────────── */
+
+/* 超宽屏（≥1700px）：内容铺满后适当放大内边距与关键数字，
+   让被拉宽的卡片保持视觉密度，而不是显得空荡。 */
+@media (min-width: 1700px) {
+  .main { padding: 30px clamp(24px, 2vw, 52px) 76px; }
+  .card-body { padding: 20px 22px; }
+  .stat-value { font-size: 27px; }
+  .grid-2 { gap: 18px; }
+  .md { --md-measure: 118ch; }
+}
+
+/* 中等屏幕：对话页先收起会话栏，给消息区让位。 */
+@media (max-width: 1100px) {
+  .chat-layout { grid-template-columns: 1fr; }
+}
 
 @media (max-width: 900px) {
+  /* 手机 / 竖屏平板：侧边栏变成两行吸顶栏（品牌 + 可横滑导航）。 */
   .app-shell { flex-direction: column; }
   .sidebar {
-    width: 100%; flex: none; height: auto; position: sticky;
-    flex-direction: row; align-items: center;
-    overflow-x: auto;
-    padding: 12px 14px;
-    gap: 14px;
+    width: 100%; flex: none; height: auto;
+    position: sticky; top: 0;
+    flex-direction: column; align-items: stretch;
+    gap: 10px;
+    padding: 10px 12px;
+    overflow: visible;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
   }
-  .sidebar-brand { flex: 0 0 auto; }
-  .nav { flex-direction: row; gap: 6px; }
-  .nav-item { padding: 8px 10px; }
+  .sidebar-brand { padding: 0; }
+  .sidebar-logo { width: 32px; height: 32px; flex-basis: 32px; border-radius: 9px; }
+  .logo-text { font-size: 13px; }
+  .sidebar-sub { display: none; }
+  .nav {
+    flex-direction: row; gap: 6px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    padding-bottom: 1px;
+  }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav-item { flex: 0 0 auto; padding: 7px 11px; white-space: nowrap; }
   .nav-item::before { display: none; }
+  .nav-icon { width: auto; }
   .sidebar-footer { display: none; }
   .main { padding: 18px 16px 48px; }
+  .page-header { margin-bottom: 18px; }
   .page-title { font-size: 21px; }
   .chat-layout { grid-template-columns: 1fr; }
+  .chat-messages { max-height: 58vh; padding: 14px; }
   .form-grid { grid-template-columns: 1fr; }
   .form-grid .span-2 { grid-column: span 1; }
   .dropdown-panel { max-width: calc(100vw - 32px); }
   /* 窄屏：推理面板横向铺满，仍可收起。 */
   .agent-dock { right: 10px; left: 10px; bottom: 10px; width: auto; max-height: 62vh; }
   .agent-dock-pill { right: 10px; bottom: 10px; left: 10px; max-width: none; }
+}
+
+/* 手机（≤640px）：压缩留白、放大点击目标、表格改为横向滚动而不是压扁列。 */
+@media (max-width: 640px) {
+  .main { padding: 14px 12px 44px; }
+  .page-header { margin-bottom: 15px; padding-bottom: 12px; gap: 10px; }
+  .page-title { font-size: 19px; }
+  .page-subtitle { font-size: 11.5px; }
+  .page-eyebrow { font-size: 9.5px; letter-spacing: 0.24em; }
+  .page-status { display: none; }
+
+  .card-header { padding: 11px 13px; }
+  .card-body { padding: 13px; }
+  .card-title { font-size: 13px; }
+
+  .stat-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 148px), 1fr)); gap: 10px; }
+  .stat-card { padding: 12px 13px; }
+  .stat-value { font-size: 20px; margin-top: 5px; }
+  .grid-2, .grid-3, .grid-4 { gap: 10px; }
+
+  /* 表格：保留最小可读列宽 + 横向滚动，避免 9 列被压成不可读的窄条。
+     负边距只作用于有内边距的卡片（.card-body），padded={false} 的卡片本身就贴边。 */
+  .card-body .table-wrap { margin: 0 -13px; padding: 0 13px; }
+  table.data-table { min-width: 640px; font-size: 12.5px; }
+  table.data-table thead th, table.data-table tbody td { padding: 9px 10px; }
+
+  .modal-backdrop { padding: 3vh 10px; }
+  .modal { max-width: none; }
+  .modal-body { padding: 15px; }
+  .modal-header, .modal-footer { padding: 12px 15px; }
+
+  .toast-stack { left: 12px; right: 12px; max-width: none; }
+
+  .md { --md-measure: none; font-size: 13px; }
+  .md-metrics { grid-template-columns: repeat(auto-fit, minmax(min(100%, 118px), 1fr)); gap: 8px; }
+  .md-metric-value { font-size: 15px; }
+  .md-kv { grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr)); gap: 8px; }
+  .md-callout { padding: 10px 12px 11px 14px; }
+  .md-table th, .md-table td { padding: 8px 10px; }
+
+  .hovertip { max-width: calc(100vw - 20px); }
+}
+
+/* 小屏手机（≤420px）：统计卡单列，按钮更紧凑。 */
+@media (max-width: 420px) {
+  .stat-grid { grid-template-columns: 1fr; }
+  .btn { padding: 7px 12px; }
+  .btn-sm { padding: 5px 9px; }
+  .segmented-item { padding: 5px 9px; }
+  .agent-dock-metrics { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

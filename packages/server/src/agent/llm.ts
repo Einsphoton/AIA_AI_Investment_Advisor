@@ -19,7 +19,7 @@
  *
  * Owner: agent-engine.
  */
-import { DEFAULT_LLM, LLM_MAX_RETRIES, LLM_RETRY_BASE_MS, type InferenceMetrics, type LlmConfig } from '@aia/shared';
+import { DEFAULT_LLM, LLM_EMPTY_RETRY_BASE_MS, LLM_MAX_EMPTY_RETRIES, LLM_MAX_RETRIES, LLM_RETRY_BASE_MS, type InferenceMetrics, type LlmConfig } from '@aia/shared';
 import type { LoggerLike } from '../types/agent.js';
 
 export interface LlmToolCall {
@@ -34,6 +34,17 @@ export interface LlmMessage {
   tool_calls?: LlmToolCall[];
   tool_call_id?: string;
   name?: string;
+  /**
+   * Thinking-mode trace of an assistant message (DeepSeek `reasoning_content`).
+   *
+   * Thinking endpoints are inconsistent: DeepSeek-style gateways *require* the
+   * trace of an assistant message that carries `tool_calls` to be sent back on
+   * the next request ("The `reasoning_content` in the thinking mode must be
+   * passed back to the API"), while other OpenAI-compatible servers reject the
+   * unknown field. We echo it by default (that is the failure observed in
+   * production) and {@link chat} flips this off per client if a provider refuses.
+   */
+  reasoning_content?: string | null;
 }
 
 export interface LlmToolSchema {
@@ -67,6 +78,8 @@ export interface ChatRequest {
 
 export interface ChatResult {
   content: string;
+  /** Thinking-mode trace, echoed back on the next tool-loop turn. Empty when absent. */
+  reasoningContent: string;
   toolCalls: LlmToolCall[];
   promptTokens: number;
   completionTokens: number;
@@ -108,6 +121,56 @@ export const NOT_CONFIGURED_MESSAGE =
 /** P0-2: message + code used for every abort (client cancel / connection drop). */
 export const LLM_ABORTED_MESSAGE = '已取消（用户中断或连接断开）';
 export const LLM_ABORTED_CODE = 'LLM_ABORTED';
+
+/** True for the "provider returned nothing usable" error (`LLM_EMPTY`). */
+export function isEmptyResponse(error: unknown): boolean {
+  return error instanceof LlmError && error.code === 'LLM_EMPTY';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A provider complaining that the thinking trace was **missing** — the exact
+ * failure that used to kill a tool loop mid-run (see `docs/VERIFY-REPORT` era
+ * report: `watchlist-analysis` died on turn 5 with HTTP 400).
+ */
+const REASONING_REQUIRED_RE =
+  /reasoning_content[\s\S]{0,120}?(must be passed back|must be sent back|is required|required field|missing)|(must be passed back|must be sent back|is required|required field)[\s\S]{0,120}?reasoning_content/i;
+
+/** True when at least one message carries a thinking trace. */
+export function hasReasoningContent(messages: LlmMessage[]): boolean {
+  return messages.some((message) => typeof message.reasoning_content === 'string' && message.reasoning_content !== '');
+}
+
+/**
+ * Drops `reasoning_content` from every message, for providers that reject the
+ * unknown field. Returns the input untouched when there is nothing to strip, so
+ * callers can use identity as "no change".
+ */
+export function stripReasoningContent(messages: LlmMessage[]): LlmMessage[] {
+  if (!hasReasoningContent(messages)) return messages;
+  return messages.map(({ reasoning_content: _dropped, ...rest }) => rest);
+}
+
+/**
+ * Decides whether flipping the "echo the thinking trace" flag could fix `error`.
+ *
+ * Returns the new flag value, or `null` when the error is unrelated to
+ * `reasoning_content` (or the flag already points the right way). Pure so the
+ * vendor-message classification is unit-testable without a live provider.
+ */
+export function reasoningEchoFix(error: unknown, echo: boolean, messages: LlmMessage[]): boolean | null {
+  const text = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  if (!/reasoning_content/i.test(text)) return null;
+  if (REASONING_REQUIRED_RE.test(text)) {
+    // Provider wants the trace back: only fixable if we actually have one.
+    return echo || !hasReasoningContent(messages) ? null : true;
+  }
+  // Provider rejects the field we are sending.
+  return echo ? false : null;
+}
 
 function normalizeConfig(raw: Partial<LlmConfig> | undefined): Required<LlmConfig> {
   return {
@@ -473,46 +536,102 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     };
   }
 
+  /**
+   * Whether an assistant message's thinking trace is echoed back to the provider.
+   *
+   * Starts `true` because the failure we have actually seen in production is the
+   * DeepSeek-style *requirement*; a provider that rejects the field flips it off
+   * for the rest of this client (i.e. the rest of this run).
+   */
+  let echoReasoning = true;
+
   async function chat(request: ChatRequest): Promise<ChatResult> {
     if (!config.apiKey) throw new LlmError(NOT_CONFIGURED_MESSAGE, 'NOT_CONFIGURED', 400);
     const model = request.model || config.model;
-    const basePayload: Record<string, unknown> = {
-      model,
-      messages: request.messages,
-      temperature: request.temperature ?? config.temperature,
-      max_tokens: request.maxTokens ?? config.maxTokens,
-    };
-    if (request.tools && request.tools.length > 0) {
-      basePayload.tools = request.tools;
-      basePayload.tool_choice = 'auto';
-    }
-
-    // The scope keeps `request.signal` wired for the whole exchange, including
-    // the streamed body read (P0-2: cancel must stop a running answer).
-    const scope = createHttpScope(request.signal);
     const tracker = createMetricsTracker(request.onMetrics, model);
-    try {
+
+    /** One attempt with its own abort scope. `plain` skips streaming. */
+    const attempt = async (plain: boolean, messages: LlmMessage[]): Promise<ChatResult> => {
+      const payload: Record<string, unknown> = {
+        model,
+        messages: echoReasoning ? messages : stripReasoningContent(messages),
+        temperature: request.temperature ?? config.temperature,
+        max_tokens: request.maxTokens ?? config.maxTokens,
+      };
+      if (request.tools && request.tools.length > 0) {
+        payload.tools = request.tools;
+        payload.tool_choice = 'auto';
+      }
+      const scope = createHttpScope(request.signal);
       try {
-        return await streamChat(request, basePayload, model, scope, tracker);
+        return plain
+          ? await plainChat(request, payload, model, scope, tracker)
+          : await streamChat(request, payload, model, scope, tracker);
       } catch (error) {
-        const abortError = toAbortError(error, scope);
-        if (abortError) throw abortError;
+        // The scope keeps `request.signal` wired for the whole exchange, including
+        // the streamed body read (P0-2: cancel must stop a running answer).
+        throw toAbortError(error, scope) ?? error;
+      } finally {
+        scope.dispose();
+      }
+    };
+
+    /** Only these shapes are worth a second network round trip (unchanged policy). */
+    const retryable = (error: unknown): boolean =>
+      error instanceof LlmError && (error.status === 400 || error.code === 'LLM_HTTP');
+
+    /**
+     * One logical attempt: stream first, then fall back to non-streaming on a
+     * 400-class failure, flipping the thinking-trace echo flag if the vendor's
+     * complaint is about `reasoning_content`.
+     */
+    const attemptOnce = async (messages: LlmMessage[]): Promise<ChatResult> => {
+      try {
+        return await attempt(false, messages);
+      } catch (error) {
+        if (!retryable(error)) throw error;
+
+        const flipped = reasoningEchoFix(error, echoReasoning, messages);
+        if (flipped !== null) {
+          echoReasoning = flipped;
+          logger?.warn?.(
+            `llm reasoning_content mismatch, retrying with echoReasoning=${flipped}`,
+            error instanceof Error ? error.message : String(error),
+          );
+          return await attempt(false, messages);
+        }
+
         // Some OpenAI-compatible servers reject stream_options/stream; retry once, plain.
-        if (error instanceof LlmError && (error.status === 400 || error.code === 'LLM_HTTP')) {
-          logger?.warn?.('llm stream failed, retrying without streaming', error.message);
-          const retryScope = createHttpScope(request.signal);
-          try {
-            return await plainChat(request, basePayload, model, retryScope, tracker);
-          } catch (retryError) {
-            throw toAbortError(retryError, retryScope) ?? retryError;
-          } finally {
-            retryScope.dispose();
-          }
+        logger?.warn?.(
+          'llm stream failed, retrying without streaming',
+          error instanceof Error ? error.message : String(error),
+        );
+        return await attempt(true, messages);
+      }
+    };
+
+    /**
+     * An empty completion (no content **and** no tool calls) is almost always a
+     * gateway hiccup rather than a real answer: production saw a 129k-token
+     * advice stage die on one blank turn, losing the whole batch. Retry it a
+     * bounded number of times before giving up.
+     */
+    let emptyRetries = 0;
+    for (;;) {
+      try {
+        return await attemptOnce(request.messages);
+      } catch (error) {
+        if (isEmptyResponse(error) && emptyRetries < LLM_MAX_EMPTY_RETRIES) {
+          emptyRetries += 1;
+          logger?.warn?.(
+            `llm returned an empty response, retrying (${emptyRetries}/${LLM_MAX_EMPTY_RETRIES})`,
+            error instanceof Error ? error.message : String(error),
+          );
+          await sleep(LLM_EMPTY_RETRY_BASE_MS * emptyRetries);
+          continue;
         }
         throw error;
       }
-    } finally {
-      scope.dispose();
     }
   }
 
@@ -531,6 +650,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     if (!response.body) return await plainChat(request, payload, model, scope, tracker);
 
     let content = '';
+    let reasoning = '';
     let finishReason = '';
     let promptTokens = 0;
     let completionTokens = 0;
@@ -571,6 +691,13 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
         if (choice.finish_reason) finishReason = choice.finish_reason;
         const delta = choice.delta;
         if (!delta) continue;
+        // Thinking models stream the trace before any content: it counts as the
+        // first token for TTFT, and must be kept so the next tool-loop turn can
+        // hand it back (see `LlmMessage.reasoning_content`).
+        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+          tracker.firstToken(resolvedModel);
+          reasoning += delta.reasoning_content;
+        }
         if (typeof delta.content === 'string' && delta.content.length > 0) {
           // TTFT: measured on the first token of this request, not on headers.
           tracker.firstToken(resolvedModel);
@@ -602,6 +729,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     const metrics = tracker.done({ model: resolvedModel, promptTokens, completionTokens, cachedTokens });
     return {
       content,
+      reasoningContent: reasoning,
       toolCalls,
       promptTokens,
       completionTokens,
@@ -623,7 +751,10 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
   ): Promise<ChatResult> {
     const response = await sendHttp(payload, false, scope);
     const json = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | null; tool_calls?: LlmToolCall[] }; finish_reason?: string }>;
+      choices?: Array<{
+        message?: { content?: string | null; tool_calls?: LlmToolCall[]; reasoning_content?: string | null };
+        finish_reason?: string;
+      }>;
       usage?: LlmUsage;
       model?: string;
       error?: { message?: string };
@@ -631,6 +762,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     if (json.error?.message) throw new LlmError(`LLM 返回错误：${json.error.message}`, 'LLM_HTTP');
     const choice = json.choices?.[0];
     const content = choice?.message?.content ?? '';
+    const reasoning = choice?.message?.reasoning_content ?? '';
     if (content) request.onDelta?.(content);
     const promptTokens = json.usage?.prompt_tokens ?? 0;
     const completionTokens = json.usage?.completion_tokens ?? 0;
@@ -642,6 +774,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     });
     return {
       content,
+      reasoningContent: reasoning,
       toolCalls: choice?.message?.tool_calls ?? [],
       promptTokens,
       completionTokens,

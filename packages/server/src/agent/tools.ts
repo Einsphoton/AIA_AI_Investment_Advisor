@@ -25,8 +25,17 @@ import type { EventSink, LoggerLike, ToolDescriptor } from '../types/agent.js';
 import type { Repo } from '../types/repo.js';
 import type { LlmToolSchema } from './llm.js';
 import { budgetLine, computeBudgetStatus } from './budget.js';
-import { compactHolding, hasOpenPosition, round, sparkFrom } from './positions.js';
+import { compactHolding, computePosition, hasOpenPosition, round, sparkFrom } from './positions.js';
+import { recordToolEvidence, readToolEvidence } from './evidence.js';
+import {
+  checkAnalysisRanges,
+  checkBuyAmount,
+  checkShareLot,
+  checkTargetConsistency,
+  groundingWarning,
+} from './validation.js';
 import * as ds from '../datasources/registry.js';
+import { compactFinancials } from '../datasources/financials.js';
 import { fundInfo } from '../datasources/fund.js';
 import { fetchUrl } from '../datasources/websearch.js';
 import { randomUUID } from 'node:crypto';
@@ -80,6 +89,18 @@ function retireDeleteRuns(repo: Repo): number {
     return repo.getSettings().watchlistRetireDeleteRuns;
   } catch {
     return DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS;
+  }
+}
+
+/**
+ * 是否启用预算约束。与 `computeBudgetStatus` 的 fail-open 保持一致：设置读不到时
+ * 不额外拦截（既不假装有额度，也不因为读设置失败而拒绝一次合法写入）。
+ */
+function budgetEnforced(repo: Repo): boolean {
+  try {
+    return repo.getSettings().enforceBudget !== false;
+  } catch {
+    return false;
   }
 }
 
@@ -297,6 +318,63 @@ const getFundamentals: RegisteredTool = {
       sources: result.sources,
       warnings: result.warnings,
     });
+  },
+};
+
+const getFinancialsTool: RegisteredTool = {
+  descriptor: {
+    name: 'get_financials',
+    description:
+      '获取公司财报三表（利润表/资产负债表/现金流量表）多期数据。A股为东方财富 F10 完整三表；港股为利润表+资产负债表+主要指标口径的现金流总量；美股为利润表+资产负债表（现金流量表明细上游无接口，需 web_search 查 10-K/10-Q）。ETF/基金没有财报。返回高亮比率可直接引用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string' },
+        market: { type: 'string', enum: ['CN', 'HK', 'US'] },
+        type: { type: 'string', enum: ['stock', 'etf'] },
+        periods: { type: 'number', description: '需要的报告期数量，默认 4，最大 8' },
+      },
+      required: ['code', 'market'],
+    },
+  },
+  async handler(args) {
+    const code = str(args, 'code');
+    const market = marketArg(args);
+    const type = typeArg(args);
+    const periods = Math.max(1, Math.min(8, Math.trunc(optNum(args, 'periods') ?? 4)));
+    if (type !== 'stock') {
+      return fail(
+        `${market}/${code} 无财报`,
+        'not_applicable',
+        'ETF/基金没有公司财报（三表），请改用 get_fund_info / get_quote / get_series 等工具。',
+      );
+    }
+    const result = await ds.getFinancials({ code, market, type, periods });
+    if (!result) {
+      return fail(
+        `未能获取 ${market}/${code} 财报`,
+        'no_data',
+        '东方财富 F10 未返回该标的的财务报表：可能是代码或市场不匹配，或该标的无财报数据。',
+      );
+    }
+    const available = result.value.statements.filter((statement) => statement.available);
+    // 多期三表容易顶到 MAX_RESULT_CHARS：宁可少给几期，也不能把 JSON 截断成半截。
+    let used = periods;
+    let compact = compactFinancials(result.value, used);
+    while (used > 2 && JSON.stringify(compact).length > MAX_RESULT_CHARS - 500) {
+      used -= 1;
+      compact = compactFinancials(result.value, used);
+    }
+    const count = available[0]?.periods.length ?? 0;
+    const scope = used < periods ? `（按响应长度上限自动降为 ${used} 期）` : '';
+    return ok(
+      `${result.value.name} 财报 ${available.map((statement) => statement.label).join('/')} 共 ${count} 期${scope}`,
+      {
+        financials: compact,
+        sources: result.sources,
+        warnings: result.warnings,
+      },
+    );
   },
 };
 
@@ -574,6 +652,19 @@ const saveAssetAnalysis: RegisteredTool = {
     if (!assetId || !summary) return fail('缺少参数', 'bad_request', 'assetId 与 summary 必填');
     const existing = ctx.repo.getAsset(assetId);
     if (!existing) return fail('资产不存在', 'not_found', `assetId=${assetId} 不存在，请先用 list_assets 获取真实 id。`);
+    // 机械落地校验：与 upsert_watch_item 同一套取值口径（AI 路径原先完全没有上限校验）。
+    const rangeProblems = checkAnalysisRanges({
+      qualityScore: optNum(args, 'qualityScore'),
+      expectedReturn: optNum(args, 'expectedReturn'),
+      targetPrice: optNum(args, 'targetPrice'),
+    });
+    if (rangeProblems.length > 0) {
+      return fail('分析字段超出取值范围', 'bad_request', `请修正后重试：${rangeProblems.join('；')}。`);
+    }
+    const groundWarning = groundingWarning(
+      `${summary}\n${str(args, 'thesis')}`,
+      readToolEvidence(ctx.runId),
+    );
     const updated = ctx.repo.updateAsset(assetId, {
       aiSummary: summary,
       aiSummaryAt: new Date().toISOString(),
@@ -582,9 +673,17 @@ const saveAssetAnalysis: RegisteredTool = {
       ...(optNum(args, 'targetPrice') === undefined ? {} : { targetPrice: optNum(args, 'targetPrice')! }),
       ...(optNum(args, 'expectedReturn') === undefined ? {} : { expectedReturn: optNum(args, 'expectedReturn')! }),
     });
-    return ok(`已写回 ${existing.name} 分析结论`, { assetId, updatedAt: updated?.aiSummaryAt ?? new Date().toISOString() }, {
-      entity: { action: 'updated', entity: 'asset', id: assetId, label: existing.name },
-    });
+    return ok(
+      `已写回 ${existing.name} 分析结论`,
+      {
+        assetId,
+        updatedAt: updated?.aiSummaryAt ?? new Date().toISOString(),
+        ...(groundWarning ? { groundingWarning: groundWarning } : {}),
+      },
+      {
+        entity: { action: 'updated', entity: 'asset', id: assetId, label: existing.name },
+      },
+    );
   },
 };
 
@@ -592,7 +691,7 @@ const upsertWatchItem: RegisteredTool = {
   requiresWrite: 'watchlist',
   descriptor: {
     name: 'upsert_watch_item',
-    description: '新建或更新「我的标的」（优质评估、目标价、预期收益、投资逻辑、AI 总结）。已存在时不会修改初始价。',
+    description: '新建或更新「我的标的」（优质评估、目标价、预期收益、预期收益到达期限、投资逻辑、AI 总结）。已存在时不会修改初始价。',
     parameters: {
       type: 'object',
       properties: {
@@ -603,6 +702,7 @@ const upsertWatchItem: RegisteredTool = {
         qualityScore: { type: 'number', description: '0-100 优质评估，需达到该投资性格的质量分门槛' },
         targetPrice: { type: 'number' },
         expectedReturn: { type: 'number', description: '预期收益 %' },
+        expectedReturnHorizon: { type: 'string', description: '预期多久达到该收益，例如「6-12 个月」「1-3 年」；必须与预期收益一起给出' },
         thesis: { type: 'string', description: '一句话投资逻辑' },
         aiSummary: { type: 'string', description: '详细分析总结（Markdown，引用工具数据）' },
         note: { type: 'string' },
@@ -616,23 +716,47 @@ const upsertWatchItem: RegisteredTool = {
     const type = typeArg(args);
     if (!code) return fail('缺少代码', 'bad_request', 'code 必填');
 
+    const qualityScore = optNum(args, 'qualityScore');
+    const targetPrice = optNum(args, 'targetPrice');
+    const expectedReturn = optNum(args, 'expectedReturn');
+    const expectedReturnHorizon = str(args, 'expectedReturnHorizon');
+    const thesis = str(args, 'thesis');
+    const aiSummary = str(args, 'aiSummary');
+    const note = str(args, 'note');
+
+    // 机械落地校验 ①：取值范围。**放在取数之前**——参数明显不合法时不该先去打三次网络。
+    // 人类录入接口（routes/watchlist.ts）一直是校验的，AI 路径原先完全没有。
+    const rangeProblems = checkAnalysisRanges({ qualityScore, expectedReturn, targetPrice });
+    if (rangeProblems.length > 0) {
+      return fail('分析字段超出取值范围', 'bad_request', `请修正后重试：${rangeProblems.join('；')}。`);
+    }
+
     const resolved = await ds.resolveInstrument({ code, market, type });
     const name = str(args, 'name') || resolved?.value.name || code;
     const quote = await ds.getQuote({ code, market, type });
     const seriesResult = await ds.getSeries({ code, market, type, range: '6m', interval: 'day' });
     const price = quote?.value.price ?? 0;
     const now = new Date().toISOString();
-    const qualityScore = optNum(args, 'qualityScore');
-    const targetPrice = optNum(args, 'targetPrice');
-    const expectedReturn = optNum(args, 'expectedReturn');
-    const thesis = str(args, 'thesis');
-    const aiSummary = str(args, 'aiSummary');
-    const note = str(args, 'note');
+
+    // 机械落地校验 ②：目标价与预期收益的方向不能自相矛盾。盘后/取数失败时回落到标的
+    // 记录里的最近价（流水线在分析前刚刷新过），避免因为一次取数失败就放弃校验。
+    const storedPrice = ctx.repo.findWatchItem(code, market, type)?.price ?? 0;
+    const targetProblem = checkTargetConsistency({
+      price: price > 0 ? price : storedPrice,
+      targetPrice,
+      expectedReturn,
+    });
+    if (targetProblem) {
+      return fail('目标价与预期收益自相矛盾', 'inconsistent_analysis', targetProblem);
+    }
+    // 软校验：写回的长文本里的精确数字能否在本次工具返回里找到出处。只提醒、不拦截。
+    const groundWarning = groundingWarning(`${aiSummary}\n${thesis}`, readToolEvidence(ctx.runId));
     // Only provided fields are written, so a partial update never zeroes existing analysis.
     const patch = {
       ...(qualityScore === undefined ? {} : { qualityScore }),
       ...(targetPrice === undefined ? {} : { targetPrice }),
       ...(expectedReturn === undefined ? {} : { expectedReturn }),
+      ...(expectedReturnHorizon ? { expectedReturnHorizon } : {}),
       ...(thesis ? { thesis } : {}),
       ...(aiSummary ? { aiSummary } : {}),
       ...(note ? { note } : {}),
@@ -663,10 +787,12 @@ const upsertWatchItem: RegisteredTool = {
         qualityScore: updated?.qualityScore ?? existing.qualityScore,
         targetPrice: updated?.targetPrice ?? existing.targetPrice,
         expectedReturn: updated?.expectedReturn ?? existing.expectedReturn,
+        expectedReturnHorizon: updated?.expectedReturnHorizon ?? existing.expectedReturnHorizon,
         initialPrice: existing.initialPrice,
         sources: quote?.sources ?? [],
         warnings: [...(quote?.warnings ?? []), ...(seriesResult?.warnings ?? []), ...(resolved?.warnings ?? [])],
         updatedAt: updated?.updatedAt ?? now,
+        ...(groundWarning ? { groundingWarning: groundWarning } : {}),
       }, {
         entity: { action: 'updated', entity: 'watchlist', id: existing.id, label: `${name}(${code})` },
       });
@@ -679,6 +805,7 @@ const upsertWatchItem: RegisteredTool = {
       market,
       type,
       source: 'ai',
+      expectedReturnHorizon: patch.expectedReturnHorizon ?? '',
       initialPrice: price,
       initialPriceAt: price > 0 ? now : null,
       price,
@@ -711,6 +838,7 @@ const upsertWatchItem: RegisteredTool = {
       initialPrice: price,
       sources: quote?.sources ?? [],
       warnings: [...(quote?.warnings ?? []), ...(seriesResult?.warnings ?? [])],
+      ...(groundWarning ? { groundingWarning: groundWarning } : {}),
     }, {
       entity: { action: 'created', entity: 'watchlist', id: created.id, label: `${name}(${code})` },
     });
@@ -845,7 +973,11 @@ const createAdvice: RegisteredTool = {
   requiresWrite: 'advice',
   descriptor: {
     name: 'create_advice',
-    description: '写入一条待确认的买卖建议（受当月预算约束：预算耗尽的市场不得买入）。',
+    description:
+      '写入一条待确认的买卖建议（受当月预算约束：预算耗尽的市场不得买入，且单笔金额不得超过当月预算剩余）。' +
+      '若标的已在持仓或「我的标的」中，请带上 assetId / watchItemId；不带则会被视为跳过候选池的「池外建议」。' +
+      '【交易单位】A 股/场内基金买入必须是 100 股（份）的整数倍，科创板最小 200 股；卖出可按持仓清零股；港股按手、美股 1 股起。' +
+      '不符合交易单位的份额会被直接拒绝，请一次报对。',
     parameters: {
       type: 'object',
       properties: {
@@ -853,8 +985,16 @@ const createAdvice: RegisteredTool = {
         market: { type: 'string', enum: ['CN', 'HK', 'US'] },
         type: { type: 'string', enum: ['stock', 'etf', 'fund'] },
         action: { type: 'string', enum: ['buy', 'sell'] },
-        targetShares: { type: 'number', description: '建议份额/股数' },
-        targetPrice: { type: 'number', description: '建议价格（限价参考）' },
+        targetShares: {
+          type: 'number',
+          description:
+            '建议份额/股数。A 股/场内基金买入须为 100 的整数倍（科创板最小 200 股）；美股 1 股起；港股按手。',
+        },
+        targetPrice: {
+          type: 'number',
+          description:
+            '建议价格（限价参考）。买入时 targetShares × targetPrice 不得超过当月该市场预算剩余。',
+        },
         reason: { type: 'string', description: '理由，必须引用工具返回的具体数据' },
         confidence: { type: 'number', description: '0-1 置信度' },
         assetName: { type: 'string' },
@@ -876,6 +1016,7 @@ const createAdvice: RegisteredTool = {
     if (targetShares <= 0 || targetPrice <= 0 || !reason) {
       return fail('参数不完整', 'bad_request', 'targetShares / targetPrice 必须为正数，reason 必填');
     }
+    if (!code) return fail('缺少代码', 'bad_request', 'code 必填（不能为空）');
     const budget = computeBudgetStatus(ctx.repo);
     const marketBudget = budget.markets.find((m) => m.market === market);
     if (action === 'buy' && marketBudget?.exhausted) {
@@ -886,10 +1027,51 @@ const createAdvice: RegisteredTool = {
         { budget },
       );
     }
+
+    // 机械落地校验 ①：交易单位。A 股/场内基金按手申报，不可交易的份额不该落库。
+    // 卖出规则不同（允许清掉零股），因此把当前持仓一并交给校验器判断。
+    const positionAsset = ctx.repo.findAsset(code, market, type);
+    const positionShares = positionAsset
+      ? computePosition(ctx.repo.listTransactions(positionAsset.id)).shares
+      : undefined;
+    const lotProblem = checkShareLot({
+      market,
+      type,
+      code,
+      shares: targetShares,
+      action,
+      positionShares,
+    });
+    if (lotProblem) {
+      return fail('建议份额不符合交易单位', 'lot_size', lotProblem.message, {
+        suggestedShares: lotProblem.suggested,
+        rule: lotProblem.rule.label,
+      });
+    }
+
+    // 机械落地校验 ②：单笔金额不得透支当月预算。
+    // 与上面「是否用尽」互补：那条只判 0/1，这条保证单笔不透支。
+    if (action === 'buy' && marketBudget && budgetEnforced(ctx.repo)) {
+      const amountProblem = checkBuyAmount({
+        amount: targetShares * targetPrice,
+        remaining: marketBudget.remaining,
+        currency: marketBudget.currency,
+        price: targetPrice,
+      });
+      if (amountProblem) {
+        return fail('本笔金额超过当月预算剩余', 'budget_exceeded', amountProblem.message, {
+          maxShares: amountProblem.maxShares,
+          budget,
+        });
+      }
+    }
+
     // Expire the previous batch's pending advice (docs/API.md §6).
     ctx.repo.expirePendingAdvice(ctx.batchId);
-    const assetId = str(args, 'assetId') || null;
-    const watchItemId = str(args, 'watchItemId') || null;
+    // 按 code 反查补全来源链接：标的其实在持仓/我的标的里、只是模型没带 id 时，
+    // 不带链接会被界面误标成「池外新标的」。补全后来源才如实。
+    const assetId = str(args, 'assetId') || ctx.repo.findAsset(code, market, type)?.id || null;
+    const watchItemId = str(args, 'watchItemId') || ctx.repo.findWatchItem(code, market, type)?.id || null;
     const name =
       str(args, 'assetName') ||
       (assetId ? ctx.repo.getAsset(assetId)?.name : undefined) ||
@@ -914,9 +1096,11 @@ const createAdvice: RegisteredTool = {
       status: 'pending',
       createdAt: new Date().toISOString(),
     });
+    // 软校验：reason 里的精确数字能否在本次工具返回里找到出处。只提醒、不拦截。
+    const groundWarning = groundingWarning(reason, readToolEvidence(ctx.runId));
     return ok(
       `${action === 'buy' ? '买入' : '卖出'}建议已写入：${name} ${targetShares} @ ${targetPrice} ${MARKET_CURRENCY[market]}`,
-      { advice: row, budget },
+      { advice: row, budget, ...(groundWarning ? { groundingWarning: groundWarning } : {}) },
       {
         entity: { action: 'created', entity: 'advice', id: row.id, label: `${action} ${name}` },
         budget,
@@ -998,6 +1182,7 @@ export const TOOLS: RegisteredTool[] = [
   getQuote,
   getSeries,
   getFundamentals,
+  getFinancialsTool,
   getFundInfo,
   getDividends,
   getMacro,
@@ -1253,6 +1438,9 @@ export async function executeTool(name: string, argsJson: string, ctx: ToolConte
   try {
     result = builtin ? await builtin.handler(args, ctx) : await (external as ExternalTool).handler(args, ctx);
     if (!result.ok) outcome = 'failed';
+    // 机械接地校验的证据来源：只记成功返回，且**在剥离 untrusted 包装之前**记录，
+    // 这样「本次 run 到底拿到了什么数据」是干净可比的（见 agent/evidence.ts）。
+    if (result.ok) recordToolEvidence(ctx.runId, name, result.content);
     // P2: every network-sourced payload is fenced as untrusted data (covers MCP too).
     if (risk === 'external' && result.ok && result.content) {
       result = { ...result, content: wrapUntrustedContent(name, result.content) };

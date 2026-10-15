@@ -5,7 +5,7 @@
  * degrades across providers and reports `sources` / `warnings`.
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import type { BarInterval, InstrumentType, Market, RangeKey } from '@aia/shared';
+import { MARKET_CURRENCY, type BarInterval, type InstrumentType, type Market, type RangeKey } from '@aia/shared';
 import { badRequest, notFound, upstreamError } from '../errors.js';
 import * as ds from '../datasources/registry.js';
 
@@ -54,6 +54,17 @@ function parseInterval(request: FastifyRequest): BarInterval {
   const raw = query(request).interval?.trim().toLowerCase() ?? 'day';
   if (raw !== 'day' && raw !== 'week' && raw !== 'month') throw badRequest('interval 必须是 day / week / month');
   return raw;
+}
+
+/** 财报期数：默认 4，最多 8（多期趋势够用，且不撑爆响应）。 */
+function parsePeriods(request: FastifyRequest): number {
+  const raw = query(request).periods?.trim();
+  if (!raw) return 4;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || String(parsed) !== raw || parsed < 1 || parsed > 8) {
+    throw badRequest(`periods 必须是 1-8 的整数，收到「${raw}」`);
+  }
+  return parsed;
 }
 
 /** Distinguishes "no such symbol" (404) from "upstream failed" (502). */
@@ -167,6 +178,44 @@ export async function registerMarketRoutes(app: FastifyInstance): Promise<void> 
       throw await faultError('详情', market, code, [...profile.warnings, ...(seriesResult?.warnings ?? [])]);
     }
     return { series, profile };
+  });
+
+  /**
+   * 财报三表（多期）：利润表 / 资产负债表 / 现金流量表。
+   *
+   * 与 agent 工具 `get_financials` 同源（datasources/registry.getFinancials），
+   * 供标的详情页直接展示。ETF / 场外基金没有公司财报 → `applicable:false`（200，
+   * 这是「不适用」而不是错误）；股票取不到任何报表才走 404/502。
+   */
+  app.get('/api/market/financials', async (request) => {
+    const market = parseMarket(request);
+    const code = requireParam(request, 'code');
+    const type = parseType(request);
+    const periods = parsePeriods(request);
+    if (type !== 'stock') {
+      return {
+        code,
+        market,
+        name: '',
+        currency: MARKET_CURRENCY[market],
+        standard: null,
+        applicable: false,
+        statements: [],
+        highlights: [],
+        sources: [],
+        warnings: ['ETF / 场外基金没有公司财报（三表），请看基金详情或净值数据'],
+      };
+    }
+    const result = await ds.getFinancials({ code, market, type, periods });
+    if (!result) {
+      throw await faultError('财报', market, code, { warnings: ['东方财富 F10 未返回该标的的财务报表'] });
+    }
+    return {
+      ...result.value,
+      applicable: true,
+      // registry 的 warnings 与 value.warnings 可能同源（同一数组），去重后再回传。
+      warnings: [...new Set([...result.value.warnings, ...result.warnings])],
+    };
   });
 
   app.get('/api/market/indices', async () => {

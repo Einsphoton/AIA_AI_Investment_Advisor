@@ -5,7 +5,7 @@
  * so the K线/净值图与基本面渲染与其他详情页保持一致。
  */
 import { useEffect, useState } from 'react';
-import { INSTRUMENT_TYPE_LABELS, MARKET_CURRENCY, MARKET_LABELS } from '@aia/shared';
+import { INSTRUMENT_TYPE_LABELS, MARKET_CURRENCY } from '@aia/shared';
 import type { UpdateWatchItemInput, WatchlistDetail } from '@aia/shared';
 import { api } from '../api/client';
 import { toApiError, useAsync } from '../api/hooks';
@@ -22,13 +22,33 @@ import {
   pnlClass,
   safeNumber,
 } from '../format';
-import { Alert, Badge, Button, Card, ErrorAlert, Field, Input, KV, Loading, Modal, Textarea, useToast } from '../components/ui';
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Disclosure,
+  ErrorAlert,
+  Field,
+  Input,
+  KV,
+  Loading,
+  MarketTag,
+  Modal,
+  Tabs,
+  Textarea,
+  useToast,
+} from '../components/ui';
 import { MarketSeriesPanel, ProfilePanel, markersFromTransactions } from '../components/InstrumentDetailSections';
+import { FinancialsPanel } from '../components/FinancialsPanel';
+import { Markdown } from '../components/markdown/Markdown';
 
 interface EditDraft {
   qualityScore: string;
   targetPrice: string;
   expectedReturn: string;
+  /** 预期收益的到达期限（自由文本，例如「6-12 个月」）。 */
+  expectedReturnHorizon: string;
   note: string;
   thesis: string;
 }
@@ -38,6 +58,7 @@ function toEditDraft(item: WatchlistDetail): EditDraft {
     qualityScore: String(item.qualityScore ?? 0),
     targetPrice: String(item.targetPrice ?? 0),
     expectedReturn: String(item.expectedReturn ?? 0),
+    expectedReturnHorizon: item.expectedReturnHorizon ?? '',
     note: item.note ?? '',
     thesis: item.thesis ?? '',
   };
@@ -53,10 +74,16 @@ export function WatchlistDetailDialog(props: { id: string | null; onClose: () =>
   const detail = state.data;
   const [edit, setEdit] = useState<EditDraft | null>(null);
   const [saving, setSaving] = useState(false);
+  const [tab, setTab] = useState<'overview' | 'ai'>('overview');
 
   useEffect(() => {
     setEdit(detail ? toEditDraft(detail) : null);
   }, [detail]);
+
+  // 换标的时回到「概览」，不要停留在上一个标的的 AI 页签。
+  useEffect(() => {
+    setTab('overview');
+  }, [id]);
 
   const currency = detail?.holding?.currency;
   const draft = edit ?? (detail ? toEditDraft(detail) : null);
@@ -75,6 +102,9 @@ export function WatchlistDetailDialog(props: { id: string | null; onClose: () =>
     if (nextQuality !== detail.qualityScore) input.qualityScore = nextQuality;
     if (target !== detail.targetPrice) input.targetPrice = target;
     if (expected !== detail.expectedReturn) input.expectedReturn = expected;
+    if (draft.expectedReturnHorizon !== (detail.expectedReturnHorizon ?? '')) {
+      input.expectedReturnHorizon = draft.expectedReturnHorizon;
+    }
     if (draft.note !== (detail.note ?? '')) input.note = draft.note;
     if (draft.thesis !== (detail.thesis ?? '')) input.thesis = draft.thesis;
     if (Object.keys(input).length === 0) {
@@ -131,7 +161,7 @@ export function WatchlistDetailDialog(props: { id: string | null; onClose: () =>
               items={[
                 ['标的名称', detail.name || '—'],
                 ['市场代码', <span className="mono">{detail.code}</span>],
-                ['市场', `${MARKET_LABELS[detail.market]}（${detail.market}）`],
+                ['市场', <MarketTag market={detail.market} />],
                 ['类型', INSTRUMENT_TYPE_LABELS[detail.type]],
                 ['加入时间', fmtDateTime(detail.createdAt)],
                 ['加入时价格', fmtPrice(detail.initialPrice, currencyFor(detail.market))],
@@ -145,6 +175,7 @@ export function WatchlistDetailDialog(props: { id: string | null; onClose: () =>
                 ['优质评估', `${fmtNum(detail.qualityScore, 0)} / 100`],
                 ['目标价', fmtPrice(detail.targetPrice, currencyFor(detail.market))],
                 ['预期收益', fmtPct(detail.expectedReturn)],
+                ['预期期限', detail.expectedReturnHorizon || '—'],
                 ['AI 总结时间', fmtDateTime(detail.aiSummaryAt)],
               ]}
             />
@@ -173,78 +204,110 @@ export function WatchlistDetailDialog(props: { id: string | null; onClose: () =>
             )}
           </Card>
 
-          <MarketSeriesPanel
-            instrument={{ market: detail.market, code: detail.code, type: detail.type, name: detail.name }}
-            markers={markersFromTransactions(detail.transactions)}
-            initialRange="1y"
-            height="md"
+          <Tabs
+            ariaLabel="标的详情分页"
+            value={tab}
+            onChange={setTab}
+            options={[
+              { value: 'overview', label: '概览' },
+              {
+                value: 'ai',
+                label: 'AI 分析',
+                badge: detail.aiSummary ? <Badge tone="ai">已生成</Badge> : undefined,
+              },
+            ]}
           />
 
-          <ProfilePanel instrument={{ market: detail.market, code: detail.code, type: detail.type, name: detail.name }} />
+          {tab === 'overview' ? (
+            <>
+              <MarketSeriesPanel
+                instrument={{ market: detail.market, code: detail.code, type: detail.type, name: detail.name }}
+                markers={markersFromTransactions(detail.transactions)}
+                initialRange="1y"
+                height="md"
+              />
 
-          <Card
-            title={
-              <span className="center gap-2">
-                AI 分析总结
-                {detail.aiSummaryAt && <span className="tiny mute">更新于 {fmtDateTime(detail.aiSummaryAt)}</span>}
-              </span>
-            }
-          >
-            {detail.aiSummary ? (
-              <div className="small" style={{ whiteSpace: 'pre-wrap' }}>
-                {detail.aiSummary}
-              </div>
-            ) : (
-              <div className="mute small">AI 尚未生成分析总结；点击「AI 标的分析」后由 Agent 写入。</div>
-            )}
+              <ProfilePanel instrument={{ market: detail.market, code: detail.code, type: detail.type, name: detail.name }} />
 
-            <div className="divider" />
+              {/* 财报体积大且不是每次都要看 → 默认折叠，避免弹窗被拉得很长。 */}
+              <Disclosure
+                title="财务报表（三表）"
+                summary="利润表 · 资产负债表 · 现金流量表（点击展开）"
+              >
+                <FinancialsPanel instrument={{ market: detail.market, code: detail.code, type: detail.type, name: detail.name }} />
+              </Disclosure>
 
-            <div className="small strong mb-2">人工修正（保存后立即生效）</div>
-            {draft && (
-              <>
-                <div className="form-grid mb-3">
-                  <Field label="优质评估（0–100）">
-                    <Input
-                      inputMode="decimal"
-                      value={draft.qualityScore}
-                      onChange={(event) => setEdit({ ...draft, qualityScore: event.target.value })}
-                    />
-                  </Field>
-                  <Field label={`目标价（${currencyFor(detail.market)}）`}>
-                    <Input
-                      inputMode="decimal"
-                      value={draft.targetPrice}
-                      onChange={(event) => setEdit({ ...draft, targetPrice: event.target.value })}
-                    />
-                  </Field>
-                  <Field label="预期收益（%）">
-                    <Input
-                      inputMode="decimal"
-                      value={draft.expectedReturn}
-                      onChange={(event) => setEdit({ ...draft, expectedReturn: event.target.value })}
-                    />
-                  </Field>
-                </div>
-                <Field label="投资逻辑（thesis）" className="mb-3">
-                  <Textarea
-                    rows={3}
-                    value={draft.thesis}
-                    placeholder="记录买入/持有的核心逻辑，AI 后续分析会参考"
-                    onChange={(event) => setEdit({ ...draft, thesis: event.target.value })}
-                  />
-                </Field>
-                <Field label="备注">
-                  <Textarea
-                    rows={2}
-                    value={draft.note}
-                    placeholder="个人备注，例如计划买入价位、跟踪要点"
-                    onChange={(event) => setEdit({ ...draft, note: event.target.value })}
-                  />
-                </Field>
-              </>
-            )}
-          </Card>
+              <Card title="人工修正" actions={<span className="tiny mute">保存后立即生效</span>}>
+                {draft && (
+                  <>
+                    <div className="form-grid mb-3">
+                      <Field label="优质评估（0–100）">
+                        <Input
+                          inputMode="decimal"
+                          value={draft.qualityScore}
+                          onChange={(event) => setEdit({ ...draft, qualityScore: event.target.value })}
+                        />
+                      </Field>
+                      <Field label={`目标价（${currencyFor(detail.market)}）`}>
+                        <Input
+                          inputMode="decimal"
+                          value={draft.targetPrice}
+                          onChange={(event) => setEdit({ ...draft, targetPrice: event.target.value })}
+                        />
+                      </Field>
+                      <Field label="预期收益（%）">
+                        <Input
+                          inputMode="decimal"
+                          value={draft.expectedReturn}
+                          onChange={(event) => setEdit({ ...draft, expectedReturn: event.target.value })}
+                        />
+                      </Field>
+                      <Field label="预期期限" hint="多久达到上面的预期收益">
+                        <Input
+                          value={draft.expectedReturnHorizon}
+                          placeholder="例如 6-12 个月 / 1-3 年"
+                          maxLength={40}
+                          onChange={(event) => setEdit({ ...draft, expectedReturnHorizon: event.target.value })}
+                        />
+                      </Field>
+                    </div>
+                    <Field label="投资逻辑（thesis）" className="mb-3">
+                      <Textarea
+                        rows={3}
+                        value={draft.thesis}
+                        placeholder="记录买入/持有的核心逻辑，AI 后续分析会参考"
+                        onChange={(event) => setEdit({ ...draft, thesis: event.target.value })}
+                      />
+                    </Field>
+                    <Field label="备注">
+                      <Textarea
+                        rows={2}
+                        value={draft.note}
+                        placeholder="个人备注，例如计划买入价位、跟踪要点"
+                        onChange={(event) => setEdit({ ...draft, note: event.target.value })}
+                      />
+                    </Field>
+                  </>
+                )}
+              </Card>
+            </>
+          ) : (
+            <Card
+              title={
+                <span className="center gap-2">
+                  AI 分析总结
+                  {detail.aiSummaryAt && <span className="tiny mute">更新于 {fmtDateTime(detail.aiSummaryAt)}</span>}
+                </span>
+              }
+            >
+              {detail.aiSummary ? (
+                /* AI 分析以 Markdown 存储：这里渲染成带标题层级、指标条与语义数字的报告。 */
+                <Markdown text={detail.aiSummary} />
+              ) : (
+                <div className="mute small">AI 尚未生成分析总结；点击「AI 标的分析」后由 Agent 写入。</div>
+              )}
+            </Card>
+          )}
 
           <Card title={`分红情况（${detail.dividends.length}）`}>
             {detail.dividends.length === 0 ? (

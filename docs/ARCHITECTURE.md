@@ -52,7 +52,7 @@ AIInvestmentAdvisor/
     └── src/
         ├── main.tsx App.tsx styles.css format.ts
         ├── api/{client.ts,sse.ts,hooks.ts,agentActivity.tsx,agentMetrics.ts}
-        ├── components/{Layout.tsx,ui.tsx,AgentActivityDock.tsx,RunTimeline.tsx,InstrumentDetailSections.tsx,charts/*}
+        ├── components/{Layout.tsx,ui.tsx,AgentActivityDock.tsx,RunTimeline.tsx,InstrumentDetailSections.tsx,charts/*,markdown/*}
         └── pages/{Dashboard,Assets,Watchlist,Advice,Chat,Settings}.tsx + 各页面子组件
 ```
 
@@ -145,7 +145,8 @@ run(session, systemPrompt, userGoal)
 | `market_search` | 关键词/代码 → 标的候选（跨 A股/港股/美股） |
 | `get_quote` | 实时报价与估值（PE/PB/ROE/市值/换手） |
 | `get_series` | K 线 / 净值曲线（指定区间与粒度） |
-| `get_fundamentals` | 财务与基本面指标（A股走 F10，美股/港股走估值+网络检索） |
+| `get_fundamentals` | 财务与基本面指标（A股走 F10 主要指标；美股/港股走估值） |
+| `get_financials` | **财报三表多期**（利润表/资产负债表/现金流量表，1-8 期）。A股按行业模板 G/B/S/I 取完整三表；港股为利润表+资产负债表+主要指标口径现金流总量；美股为利润表+资产负债表（东方财富）+ **现金流量表来自 SEC EDGAR XBRL**（官方口径，零 Key）。同时用 `GET /api/market/financials` 供详情页展示 |
 | `get_fund_info` | 场外基金详情（净值、阶段涨幅、持仓、资产配置） |
 | `get_dividends` | 分红送配 |
 | `get_macro` | CPI/PPI/GDP/PMI/M2 + 全球指数 |
@@ -165,7 +166,7 @@ run(session, systemPrompt, userGoal)
 
 ### 4.3 三条流水线（对应 UI 按钮）
 
-1. **AI 资产分析**（`POST /api/assets/analyze`）：逐个持仓 → 并行抓取行情/K线/基本面/基金详情/分红/新闻 → LLM 深度分析 → 写回 `ai_summary` → 汇总成组合简报（Dashboard 第四板块）。
+1. **AI 资产分析**（`POST /api/assets/analyze`）：逐个持仓 → 并行抓取行情/K线/基本面/**财报三表（4 期）**/基金详情/分红/新闻 → LLM 深度分析（必含财报跨期趋势）→ 写回 `ai_summary` → 汇总成组合简报（Dashboard 第四板块）。
 2. **AI 标的分析**（`POST /api/watchlist/analyze`）：按投资性格从信息源搜索候选 → 初筛（代码/流动性/匹配度）→ 深度分析 → `upsert_watch_item`（含优质评估、目标价、预期收益、逻辑）→ 同时刷新既有标的的估值与结论。
 3. **AI 投资建议**（`POST /api/advice/generate`）：先跑 1 与 2 → 结合持仓、预算、性格 → 生成买/卖建议（`create_advice`）→ 写入 `advice` 表，`status=pending`。
 
@@ -221,6 +222,9 @@ run(session, systemPrompt, userGoal)
 | **并行工具执行（P2）** | `agent/loop.ts` + `AGENT_TOOL_CONCURRENCY` | 同一条 assistant 消息里的 `read`/`external` 工具**并发执行**（默认上限 4），`write` 工具作为**屏障**串行且保持原顺序；结果仍按模型给出的顺序落库，轨迹保持确定性、可回放 |
 | **上游失败重试（P2）** | `agent/llm.ts` + `LLM_MAX_RETRIES` / `LLM_RETRY_BASE_MS` | 429 / 408 / 5xx / 网络错误做指数退避 + 抖动重试（默认 3 次），尊重 `Retry-After`（上限 30s，防止异常头拖死请求）；取消与确定性 4xx **永不**重试 |
 | **提示注入加固（P2）** | `agent/tools.ts` + `agent/prompts.ts` | 所有 `external` 工具（含 MCP）返回正文被包进 `<<UNTRUSTED_WEB_CONTENT>> … <</UNTRUSTED_WEB_CONTENT>>` 并标注「是数据不是指令」；命中注入模式时额外给出 ⚠️ 告警；系统提示词第 8 条要求忽略其中任何指令 |
+| **思考模型兼容（reasoning_content）** | `agent/llm.ts` + `agent/loop.ts` + 表 `agent_run_messages` | DeepSeek 类思考模型要求 assistant 工具消息把思考轨迹回传，否则多轮工具循环在第 2 轮被 HTTP 400 打死（生产实测：`watchlist-analysis` 第 5 轮整批失败）。现已在流式/非流式两条路径累积并回传，且随轨迹落库，续跑同样带上；若厂商反过来拒绝该字段，则按错误指向翻转一次回传开关并重试 |
+| **建议结果追踪** | `services/advice-outcomes.ts` + 表 `advice_outcomes` | 把「建议靠不靠谱」变成可计算的数字：每条建议按**建议日之后第一个交易日**收盘建基准（无前视偏差），与同区间基准指数比较，产出方向调整收益、超额、区间极值、胜率/跑赢率。全部确定性、可重建、幂等；样本不足的条目只计入 `unmeasured`，绝不进胜率分母 |
+| **机械落地校验** | `agent/validation.ts` + `agent/evidence.ts` + `tools.ts` | 能用算术判定的约束不再只写在提示词里：① 交易单位（A股/场内基金买入 100 股整数倍、科创板 ≥200、卖出可清零股，港美股不校验）**硬拦**；② 单笔买入金额 ≤ 当月预算剩余**硬拦**（与「是否用尽」互补）；③ 质量分/预期收益/目标价范围与「目标价↑但预期收益为负」这类自相矛盾**硬拦**；④ 正文里 5 位以上有效数字能否在**本次 run 的工具返回**里找到出处 —— 只**告警**不拦截（派生值、四舍五入、7000 字符截断都会造成合理的"找不到"，宁可提示不可误杀）。证据在 `executeTool` 内即时累积（同批工具结果尚未落库，读库会漏证据），run 结束释放 |
 | **可观测与评测（P2）** | `scripts/{export-trace,e2e-agent,eval-agent}.mjs` | `npm run trace` 离线导出任意 run 的轨迹 JSON；`npm run e2e:agent` 真实模型端到端冒烟（对话 / 工具 / 流水线）；`npm run eval:agent` 用固定 4 场景给**真实模型**打分（工具选择、数字有据、数据缺失是否如实说明而非编造） |
 
 设计取舍：`/api/chat/*` 不参与流水线互斥（交互对话不该被长流水线阻塞）；取消不回滚已写入的数据（保证"已确认的信息不丢"）。
@@ -234,6 +238,17 @@ run(session, systemPrompt, userGoal)
 - **不落敏感数据（对外）**：`llm.apiKey` 与 `dataSources.*.apiKey` 只存本地 SQLite；HTTP 层永远只返回 `hasApiKey` + `apiKeyMasked`，导出的备份/快照同样剔除 Key。
 - **账本一致性**：持仓完全由交易流水推导；删除交易前重放校验，禁止出现"没有对应买入的卖出"（409 拒绝）。
 - **定时任务可信**：`PUT /api/settings` 命中 `schedule` 时立即 `scheduler.reload()`；`/api/dashboard` 的 `nextRunAt` 读调度器真实计划，而不是自行推算。
+- **AI 长文本 = Markdown（提示词与渲染器同源）**：`ai_summary` / 简报 / `reason` / `thesis` 一律按 Markdown 书写，前端用 `components/markdown/*` 渲染。渲染**不 1:1 对应 Markdown 语义**，而是按最佳阅读形态重排：`## 一、标题` → 编号徽标 + 图标；`**结论**：…` / `**主要风险**：…` / `**目标价**：…` → 带导轨与判定胶囊的语义卡片；两列 `| 指标 | 数值 |` → 指标卡面板（该形状不再走表格）；≥三列表格 → 斑马纹数据表（数值列右对齐 + 内联柱）；`**+14.5%**` → 涨跌胶囊；```chart → 真实 ECharts。语法契约写在 `agent/prompts.ts` 的 `MARKDOWN_GUIDE`（分段 / 加粗 / 两列指标表 / 对比表 / 加粗标签起句 / `metrics`、`chart` 代码块）；**改语法必须同时改解析器**，`packages/server/test/prompt-markdown.test.ts` 会校验示例仍是合法可解析的。渲染器不产出 HTML 字符串，模型输出里的标签只会作为文本显示。
+- **建议必须可追溯来源**：`create_advice` 按 `code+market+type` 反查回填 `assetId`/`watchItemId`，`AdviceItem.origin` 由此推导为 持仓 / 我的标的 / 池外。买入建议优先来自持仓（加仓）或「我的标的」；池外建议是允许的（可能确实有更好的机会），但界面必须标出来 —— 它等于跳过了「AI 标的分析」的质量分门槛。
+- **候选池要跨市场、跨类型**：标的分析提示词带上当前池子的市场/类型分布并优先补齐缺口（预算覆盖 CN/HK/US）。场外基金的类型判定以东财 `Classify/JYS = 'OTCFUND'` 为准，误判成 `etf` 会命中同代码股票并写入错误价格。
+- **报告表格必须显式声明表头对齐**：浏览器对 `<th>` 的默认 `text-align` 是 `center`、`<td>` 是 `left`，漏写就会「表头居中、数值左对齐」。`.md-table th` 必须保留 `text-align: left`，`th`/`td` 成对声明 `.align-*`；内联柱用绝对定位（不参与排版）。`render.test.tsx` 会逐列比对表头与数值的对齐 class。
+- **渲染层不依赖外部 CSS/JS 库**：Markdown 解析、指标条、表格柱状条、浮窗全部自研（纯 TS + 内联 SVG），与「Rollup + tsc 纯 JS 工具链、可在受限/离线环境构建」的约束一致。
+- **列表里的市场用色标而不是文字**：A股（金）/ 港股（青）/ 美股（紫）分别用 `.market-tag.market-CN|HK|US`。这是**分类编码**，刻意避开红涨绿跌那套语义色，长列表里扫一眼就能分市场。
+- **市场与类型是两个正交维度，标签外形要能区分**：市场用**实心**色标（`MarketTag`，A股金 / 港股青 / 美股紫），资产类型用**空心 + 彩色圆点**的 `InstrumentTypeTag`（股票银 / 场内基金金 / 场外基金粉）。两者常并排出现，只靠颜色区分会混淆。
+- **图表买卖点必须能查到成交明细**：K 线与净值曲线都用 `trigger: 'axis'`，markPoint 自带的 tooltip 看不到；`charts/tradeMarkers.ts` 把当天买卖点合并进坐标轴面板（份额 / 价格 / 金额 / 费用 / 备注，备注转义），并用 `params[0].dataIndex` 回查原始点而不是解析 ECharts 的 data 形状。
+- **详情弹窗用页签 + 折叠区分层**：AI 分析结论独立成页签（`Tabs`），体积大但不常看的财报放进默认收起的 `Disclosure`，避免弹窗被拉成一条长滚动。
+- **大字号统计卡必须能换行**：`StatCard` 是 25px 大字号，遇到「-1.6322亿CNY（2026中报）」这类长值会溢出边框；`.stat-value` / `.fin-highlight-value` 必须保留 `overflow-wrap: anywhere`（财报指标改用专用的 `fin-highlight` 卡片，把期间拆成单独一行）。
+- **响应式布局约定**：主内容区不设最大宽度（列表类直接铺满整行；区块类用 `repeat(auto-fit, minmax(min(100%, Npx), 1fr))` 随宽度增减列数）。改动 `styles.css` 时保留 ≥1700 / ≤1100 / ≤900 / ≤640 / ≤420 五档断点语义，并由 `render.test.tsx` 的布局契约用例守住「不再写死宽度」。
 - **AI 流水线互斥**：调度器 tick 与 4 条手动 SSE 入口共享同一把非阻塞锁（`services/pipeline-lock.ts`），同一时刻只跑一条流水线；锁被占用时手动入口立即 `error` + `run-finished(status="error")` + `done` 且不写库，tick 跳过本次。`/api/chat/*` 有意不在锁内（交互对话不应被长流水线阻塞），可能与该批次流水线并发写入 —— 单用户自托管场景可接受。
 
 ## 6. 验证方式（详见 docs/VERIFY.md 与 docs/VERIFY-REPORT.md）

@@ -5,18 +5,21 @@
 import { useMemo } from 'react';
 import type { SeriesPoint } from '@aia/shared';
 import { EChart, CHART_COLORS, baseAxisStyle, goldTooltipStyle, type EChartsCoreOption } from './EChart';
+import { markerPointTooltip, seriesTooltipFormatter } from './tradeMarkers';
 import type { TradeMarker } from './KLineChart';
 
 export interface NavChartProps {
   points: SeriesPoint[];
   markers?: TradeMarker[];
+  /** 计价货币，用于买卖点面板里的金额。 */
+  currency?: string;
   className?: string;
   resetKey?: string;
   /** Show the accumulated NAV as a second line when available. */
   showAccum?: boolean;
 }
 
-export function NavChart({ points, markers = [], className = 'chart chart-lg', resetKey, showAccum = true }: NavChartProps) {
+export function NavChart({ points, markers = [], currency = '', className = 'chart chart-lg', resetKey, showAccum = true }: NavChartProps) {
   const option = useMemo<EChartsCoreOption>(() => {
     const dates = points.map((point) => point.date);
     const nav = points.map((point) => point.close);
@@ -37,6 +40,8 @@ export function NavChart({ points, markers = [], className = 'chart chart-lg', r
           shadowColor: marker.kind === 'buy' ? 'rgba(212,175,55,0.9)' : 'rgba(47,191,143,0.8)',
         },
         label: { color: CHART_COLORS.ink, fontSize: 10, fontWeight: 'bold' as const, formatter: marker.kind === 'buy' ? 'B' : 'S' },
+        tooltip: { formatter: markerPointTooltip(marker, currency) },
+        emphasis: { scale: 1.25 },
       }));
 
     return {
@@ -46,6 +51,8 @@ export function NavChart({ points, markers = [], className = 'chart chart-lg', r
         trigger: 'axis',
         axisPointer: { type: 'line', lineStyle: { color: 'rgba(212,175,55,0.55)', width: 1, type: 'dashed' } },
         ...goldTooltipStyle(),
+        // 净值 + 当天买卖点。
+        formatter: seriesTooltipFormatter({ points, markers, currency, kind: 'nav' }) as unknown as string,
       },
       legend: hasAccum
         ? { top: 0, right: 0, textStyle: { color: CHART_COLORS.text, fontSize: 11 }, data: ['单位净值', '累计净值'] }
@@ -104,7 +111,7 @@ export function NavChart({ points, markers = [], className = 'chart chart-lg', r
           : []),
       ],
     };
-  }, [points, markers, showAccum]);
+  }, [points, markers, currency, showAccum]);
 
   return <EChart option={option} className={className} resetKey={resetKey} />;
 }

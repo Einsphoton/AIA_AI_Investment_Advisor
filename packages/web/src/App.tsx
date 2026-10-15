@@ -15,6 +15,7 @@ import { Layout } from './components/Layout';
 import { DashboardPage } from './pages/Dashboard';
 import { AssetsPage } from './pages/Assets';
 import { WatchlistPage } from './pages/Watchlist';
+import { FinancialComparePage } from './pages/FinancialCompare';
 import { AdvicePage } from './pages/Advice';
 import { ChatPage } from './pages/Chat';
 import { ActivityPage } from './pages/Activity';
@@ -28,6 +29,7 @@ export function App() {
           <Route path="/" element={<DashboardPage />} />
           <Route path="/assets" element={<AssetsPage />} />
           <Route path="/watchlist" element={<WatchlistPage />} />
+          <Route path="/compare" element={<FinancialComparePage />} />
           <Route path="/advice" element={<AdvicePage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/activity" element={<ActivityPage />} />

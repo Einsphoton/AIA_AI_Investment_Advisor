@@ -20,6 +20,7 @@
     "typecheck": "npm run build -w @aia/shared && npm run typecheck -w @aia/shared && npm run typecheck -w @aia/server && npm run typecheck -w @aia/web",
     "test": "npm run build:server && npm run test -w @aia/server && npm run test -w @aia/web",
     "smoke": "npm run build:server && node scripts/smoke-api.mjs",
+    "preview:financials": "npm run build:server && node node_modules/rollup/dist/bin/rollup -c packages/web/rollup.preview.config.mjs && node packages/web/dist-test/preview-financials.js",
     "e2e:agent": "npm run build:server && node scripts/e2e-agent.mjs",
     "eval:agent": "npm run build:server && node scripts/eval-agent.mjs",
     "trace": "node scripts/export-trace.mjs",

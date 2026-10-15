@@ -378,6 +378,20 @@ try {
   record('GET /api/market/series 日K序列', series.status === 200 && (series.json?.points?.length ?? 0) > 20 ? 'PASS' : 'WARN', `points=${series.json?.points?.length}`);
   const profile = await call('GET', '/api/market/profile?market=US&code=AAPL&type=stock');
   record('GET /api/market/profile 基本面', profile.status === 200 && Boolean(profile.json?.quote) ? 'PASS' : 'WARN', `status=${profile.status}`);
+  // 财报三表：A 股应能拿到利润表 + 资产负债表 + 现金流量表。
+  const financials = await call('GET', '/api/market/financials?market=CN&code=600519&type=stock&periods=4');
+  const available = (financials.json?.statements ?? []).filter((statement) => statement.available);
+  record(
+    'GET /api/market/financials 三表',
+    financials.status === 200 && available.length === 3 && (available[0]?.periods?.length ?? 0) >= 2 ? 'PASS' : 'WARN',
+    `status=${financials.status} 可用表=${available.length} 期数=${available[0]?.periods?.length ?? 0} 高亮=${(financials.json?.highlights ?? []).length}`,
+  );
+  const etfFinancials = await call('GET', '/api/market/financials?market=US&code=SCHD&type=etf');
+  check(
+    'ETF 财报走「不适用」而不是报错',
+    etfFinancials.status === 200 && etfFinancials.json?.applicable === false,
+    `status=${etfFinancials.status} applicable=${etfFinancials.json?.applicable}`,
+  );
   const macro = await call('GET', '/api/market/macro');
   record('GET /api/market/macro 宏观', macro.status === 200 ? 'PASS' : 'WARN', `status=${macro.status}`);
 
@@ -422,6 +436,32 @@ try {
     '仍提供掩码与 hasApiKey（不是一刀切删掉）',
     settingsAfter.json?.hasApiKey === true && typeof settingsAfter.json?.apiKeyMasked === 'string',
     `hasApiKey=${settingsAfter.json?.hasApiKey} masked=${settingsAfter.json?.apiKeyMasked}`,
+  );
+
+  /* ── 一键清除（设置页「危险操作」）：放最后，避免影响上面的数据断言 ────── */
+  const clearedAll = await call('POST', '/api/backup/clear', {});
+  check(
+    'POST /api/backup/clear 清空数据并给出逐表计数',
+    clearedAll.status === 200 && typeof clearedAll.json?.deleted === 'number' && clearedAll.json.deleted >= 0 && clearedAll.json.settingsReset === false,
+    JSON.stringify(clearedAll.json).slice(0, 180),
+  );
+  const assetsAfterClear = await call('GET', '/api/assets');
+  check('清除后资产列表为空', assetsAfterClear.json?.items?.length === 0, `items=${assetsAfterClear.json?.items?.length}`);
+  const settingsAfterClear = await call('GET', '/api/settings');
+  check(
+    '默认保留 AI 配置与 API Key',
+    settingsAfterClear.json?.hasApiKey === true,
+    `hasApiKey=${settingsAfterClear.json?.hasApiKey}`,
+  );
+  const resetAll = await call('POST', '/api/backup/clear', { keepSettings: false });
+  const afterReset = await call('GET', '/api/settings');
+  check(
+    'keepSettings:false 恢复出厂设置（清空 Key、定时任务关闭）',
+    resetAll.status === 200 &&
+      resetAll.json?.settingsReset === true &&
+      afterReset.json?.hasApiKey === false &&
+      afterReset.json?.schedule?.mode === 'off',
+    `status=${resetAll.status} hasApiKey=${afterReset.json?.hasApiKey} mode=${afterReset.json?.schedule?.mode}`,
   );
 } catch (error) {
   record('未预期异常', 'FAIL', error.stack ?? String(error));

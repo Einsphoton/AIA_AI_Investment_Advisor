@@ -381,6 +381,32 @@ test('D1: 建议确认复用账本一致性校验（倒填/超卖 → 409）', a
   for (const id of [backdatedId, overId, okSellId]) repo.updateAdvice(id, { status: 'rejected' });
 });
 
+test('market/financials: 参数校验 + ETF 走「不适用」而不是报错（离线可测）', async () => {
+  const missingCode = await app.inject({ method: 'GET', url: '/api/market/financials?market=CN' });
+  assert.equal(missingCode.statusCode, 400);
+
+  const badMarket = await app.inject({ method: 'GET', url: '/api/market/financials?market=XX&code=600519' });
+  assert.equal(badMarket.statusCode, 400);
+
+  const badPeriods = await app.inject({ method: 'GET', url: '/api/market/financials?market=CN&code=600519&periods=99' });
+  assert.equal(badPeriods.statusCode, 400);
+  const floatPeriods = await app.inject({ method: 'GET', url: '/api/market/financials?market=CN&code=600519&periods=4.5' });
+  assert.equal(floatPeriods.statusCode, 400);
+
+  // ETF 没有公司财报：判定为「不适用」（200 + applicable:false），不是 502。
+  const etf = await app.inject({ method: 'GET', url: '/api/market/financials?market=US&code=SCHD&type=etf' });
+  assert.equal(etf.statusCode, 200);
+  const body = json(etf);
+  assert.equal(body.applicable, false);
+  assert.deepEqual(body.statements, []);
+  assert.equal(body.currency, 'USD');
+  assert.ok(body.warnings.length > 0, '不适用时必须给出原因');
+
+  const fund = await app.inject({ method: 'GET', url: '/api/market/financials?market=CN&code=000001&type=fund' });
+  assert.equal(fund.statusCode, 200);
+  assert.equal(json(fund).applicable, false);
+});
+
 test('assets: 建仓写首笔买入、摊薄成本、超卖 409、CRUD 与预算', async () => {
   await app.inject({ method: 'PUT', url: '/api/settings', payload: { budget: { CN: 5000, HK: 5000, US: 1000 } } });
 
@@ -711,12 +737,26 @@ test('watchlist: 新增/筛选/补全/更新/详情/清空', async () => {
   const patched = await app.inject({
     method: 'PATCH',
     url: `/api/watchlist/${item.id}`,
-    payload: { qualityScore: 80, targetPrice: 400, expectedReturn: 25, thesis: '社交护城河' },
+    payload: {
+      qualityScore: 80,
+      targetPrice: 400,
+      expectedReturn: 25,
+      expectedReturnHorizon: '6-12 个月',
+      thesis: '社交护城河',
+    },
   });
   assert.equal(patched.statusCode, 200);
   assert.equal(json(patched).qualityScore, 80);
   assert.equal(json(patched).targetPrice, 400);
+  assert.equal(json(patched).expectedReturnHorizon, '6-12 个月', '预期期限必须随标的一起往返');
   assert.equal(json(patched).thesis, '社交护城河');
+
+  const tooLongHorizon = await app.inject({
+    method: 'PATCH',
+    url: `/api/watchlist/${item.id}`,
+    payload: { expectedReturnHorizon: 'x'.repeat(41) },
+  });
+  assert.equal(tooLongHorizon.statusCode, 400, '期限超过 40 字应被拒绝');
 
   const invalid = await app.inject({
     method: 'PATCH',
@@ -741,6 +781,22 @@ test('watchlist: 新增/筛选/补全/更新/详情/清空', async () => {
   assert.equal(cleared.ok, true);
   assert.equal(cleared.deleted, 2);
   assert.equal(json(await app.inject({ method: 'GET', url: '/api/watchlist' })).total, 0);
+});
+
+test('watchlist: 行情刷新接口（离线时如实降级，不伪造 0 涨跌）', async () => {
+  await app.inject({ method: 'POST', url: '/api/watchlist', payload: { code: '600519', market: 'CN', type: 'stock' } });
+  const refreshed = await app.inject({ method: 'POST', url: '/api/watchlist/refresh' });
+  assert.equal(refreshed.statusCode, 200);
+  const body = json(refreshed);
+  // 测试环境 AIA_OFFLINE=1：行情源不可用 → updated=0、failed=N，并给出 warning。
+  assert.equal(body.updated, 0);
+  assert.equal(body.failed, 1);
+  assert.ok(Array.isArray(body.warnings) && body.warnings.length > 0, '数据源不可用必须给出 warning');
+
+  const item = json(await app.inject({ method: 'GET', url: '/api/watchlist' })).items[0];
+  assert.equal(item.price, 0, '离线时不得写入任何价格');
+  assert.equal(item.changeSinceAddedPct, 0, '没有行情时推荐后涨跌为 0（而不是编造数值）');
+  await app.inject({ method: 'DELETE', url: '/api/watchlist' });
 });
 
 test('advice: 列表+预算、驳回、确认写入交易', async () => {
@@ -1144,4 +1200,206 @@ test('settings/test-llm: 未保存的草稿 baseUrl/model 必须生效', async (
   } finally {
     await new Promise<void>((resolve) => mock.close(() => resolve()));
   }
+});
+
+/* ── 建议结果追踪（只读接口 + 追踪计数） ─────────────────────────────────── */
+
+test('advice/outcomes: 无追踪结果时返回空列表与零统计，不假装有数据', async () => {
+  const body = json(await app.inject({ method: 'GET', url: '/api/advice/outcomes' }));
+  assert.deepEqual(body.items, []);
+  assert.equal(body.stats.total, 0);
+  assert.equal(body.stats.measured, 0);
+  assert.equal(body.stats.unmeasured, 0);
+  assert.equal(body.stats.winRate, 0);
+  assert.equal(body.stats.beatRate, 0);
+  assert.equal(body.stats.windowDays, 90, '观测窗口必须显式暴露，否则用户不知道口径');
+  assert.equal(body.stats.updatedAt, null, '从未追踪过时 updatedAt 为 null，不能假装有数据');
+});
+
+test('advice/outcomes: 物化结果按条返回，统计只吃可度量样本', async () => {
+  const adviceId = crypto.randomUUID();
+  const runId = crypto.randomUUID();
+  const advisedAt = new Date(Date.now() - 5 * 86_400_000).toISOString();
+  repo.createAdvice({
+    id: adviceId,
+    batchId: `batch-${runId}`,
+    assetId: null,
+    watchItemId: null,
+    assetName: '紫金矿业',
+    code: '601899',
+    market: 'CN',
+    type: 'stock',
+    action: 'buy',
+    targetShares: 50,
+    targetPrice: 29.98,
+    currency: 'CNY',
+    reason: '测试用建议',
+    confidence: 0.72,
+    status: 'pending',
+    createdAt: advisedAt,
+  });
+  repo.upsertAdviceOutcome({
+    adviceId,
+    runId,
+    code: '601899',
+    market: 'CN',
+    type: 'stock',
+    action: 'buy',
+    currency: 'CNY',
+    advisedAt,
+    adviceStatus: 'pending',
+    executed: false,
+    baselineDate: '2026-10-06',
+    baselinePrice: 100,
+    lastDate: '2026-10-15',
+    lastPrice: 107.5,
+    priceChangePct: 7.5,
+    adviceReturnPct: 7.5,
+    benchmarkCode: '000300',
+    benchmarkName: '沪深300指数',
+    benchmarkBase: 4000,
+    benchmarkChangePct: 2,
+    excessPct: 5.5,
+    maxReturnPct: 9,
+    minReturnPct: -1.5,
+    samples: 8,
+    daysTracked: 9,
+    status: 'tracking',
+    warnings: [],
+    updatedAt: new Date().toISOString(),
+  });
+
+  const body = json(await app.inject({ method: 'GET', url: '/api/advice/outcomes' }));
+  const item = body.items.find((row: { adviceId: string }) => row.adviceId === adviceId);
+  assert.ok(item, '已落库的结果必须能被接口读回');
+  assert.equal(item.code, '601899');
+  assert.equal(item.adviceReturnPct, 7.5);
+  assert.equal(item.excessPct, 5.5);
+  assert.equal(item.benchmarkName, '沪深300指数');
+  assert.equal(item.runId, runId, 'runId 由 batch- 前缀反查，保证可回放');
+  assert.equal(item.executed, false);
+  assert.equal(item.status, 'tracking');
+
+  assert.equal(body.stats.measured, 1);
+  assert.equal(body.stats.unmeasured, 0);
+  assert.equal(body.stats.winRate, 100);
+  assert.equal(body.stats.beatRate, 100);
+  assert.equal(body.stats.avgReturnPct, 7.5);
+  const cn = body.stats.byMarket.find((row: { market: string }) => row.market === 'CN');
+  assert.ok(cn);
+  assert.equal(cn.measured, 1);
+});
+
+/**
+ * 追踪入口的**契约**：200、结构完整、计数自洽。
+ *
+ * 刻意不断言具体条数：本文件前面的用例已经写入了 advice 行，而追踪器会去取真实
+ * 行情序列（离线环境里失败会被降级成 warning），因此这里只钉住「计数内部一致」
+ * 与「已落库结果都能读回」这两条与外部数据无关的不变量。
+ */
+test('advice/outcomes/track: 返回结构完整的追踪计数且计数自洽', async () => {
+  const res = await app.inject({ method: 'POST', url: '/api/advice/outcomes/track' });
+  assert.equal(res.statusCode, 200, '追踪失败只能降级为 warning，不得 5xx');
+  const body = json(res);
+
+  assert.ok(typeof body.tracked.ranAt === 'string' && body.tracked.ranAt.length > 0);
+  assert.equal(
+    body.tracked.measured + body.tracked.unmeasurable,
+    body.tracked.tracked,
+    '每条被重算的建议要么可度量、要么不可度量',
+  );
+  assert.equal(body.stats.total, body.items.length, '统计口径必须覆盖全部已落库结果');
+  assert.equal(body.stats.measured + body.stats.unmeasured, body.stats.total);
+  assert.equal(typeof body.tracked.pruned, 'number');
+  assert.ok(Array.isArray(body.tracked.warnings));
+
+  // 再读一次：GET 与 POST 返回的结果集合必须一致（POST 只是「重算 + 读取」）。
+  const readBack = json(await app.inject({ method: 'GET', url: '/api/advice/outcomes' }));
+  assert.deepEqual(
+    readBack.items.map((row: { adviceId: string }) => row.adviceId).sort(),
+    body.items.map((row: { adviceId: string }) => row.adviceId).sort(),
+  );
+});
+
+/* ───────────────── 一键清除所有数据（设置页「危险操作」） ───────────────── */
+
+/**
+ * 本用例会清空整库，因此必须放在文件最后：前面的用例都依赖已写入的数据。
+ */
+test('backup/clear: 一键清除所有数据（默认保留 AI 配置，可恢复出厂设置）', async () => {
+  await app.inject({ method: 'PUT', url: '/api/settings', payload: { apiKey: RAW_API_KEY, persona: 'value' } });
+  const bought = await app.inject({
+    method: 'POST',
+    url: '/api/assets',
+    payload: { code: 'CLEARME', market: 'CN', type: 'stock', shares: 10, price: 10, tradeDate: day(1) },
+  });
+  assert.equal(bought.statusCode, 200);
+  const watched = await app.inject({
+    method: 'POST',
+    url: '/api/watchlist',
+    payload: { code: 'CLEARW', market: 'US', type: 'stock' },
+  });
+  assert.equal(watched.statusCode, 200);
+  const session = await app.inject({ method: 'POST', url: '/api/chat/sessions', payload: { title: '清除测试' } });
+  assert.equal(session.statusCode, 200);
+  repo.addMessage({
+    id: crypto.randomUUID(),
+    sessionId: json(session).id,
+    role: 'user',
+    content: '你好',
+    toolCalls: null,
+    toolCallId: null,
+    runId: null,
+    createdAt: new Date().toISOString(),
+  });
+  const runId = crypto.randomUUID();
+  repo.createRun({ id: runId, kind: 'custom', status: 'done', target: null, title: '清除测试', startedAt: new Date().toISOString() });
+  repo.addStep({ id: crypto.randomUUID(), runId, index: 0, label: '步骤', status: 'done' });
+  repo.setKv('clear.test', '1');
+
+  // 参数非布尔 → 400，且不得清掉任何东西。
+  const bad = await app.inject({ method: 'POST', url: '/api/backup/clear', payload: { keepSettings: 'yes' } });
+  assert.equal(bad.statusCode, 400);
+  assert.equal(json(bad).error.code, 'BAD_REQUEST');
+  assert.ok(repo.listAssets().length > 0, '参数校验失败不得清库');
+
+  const cleared = await app.inject({ method: 'POST', url: '/api/backup/clear', payload: {} });
+  assert.equal(cleared.statusCode, 200);
+  const body = json(cleared);
+  assert.ok(body.assets >= 1, '资产必须被清空并计数');
+  assert.ok(body.transactions >= 1);
+  assert.ok(body.watchlist >= 1);
+  assert.ok(body.runs >= 1);
+  assert.ok(body.steps >= 1);
+  assert.ok(body.chatSessions >= 1);
+  assert.ok(body.chatMessages >= 1);
+  assert.ok(body.kvEntries >= 1);
+  assert.equal(body.settingsReset, false);
+  assert.ok(body.deleted >= body.assets + body.transactions + body.watchlist + body.runs);
+
+  assert.deepEqual(repo.exportAll(), { assets: [], transactions: [], watchlist: [], advice: [] });
+  assert.equal(repo.listRuns().length, 0);
+  assert.equal(repo.listSessions().length, 0);
+  assert.equal(repo.listAudit().length, 0);
+  assert.equal(repo.getKv('clear.test'), undefined);
+
+  // 默认保留 AI 配置（含 API Key）与投资性格：清完可直接继续用。
+  assert.equal(repo.getSettings().llm.apiKey, RAW_API_KEY);
+  assert.equal(repo.getSettings().persona, 'value');
+  const kept = json(await app.inject({ method: 'GET', url: '/api/settings' }));
+  assert.equal(kept.hasApiKey, true, '默认不得清掉 API Key');
+
+  // 空库再清一次是安全幂等的。
+  const again = json(await app.inject({ method: 'POST', url: '/api/backup/clear', payload: {} }));
+  assert.equal(again.deleted, 0);
+
+  // 可选：恢复出厂设置（清空 Key、定时任务回 off）。
+  const reset = json(await app.inject({ method: 'POST', url: '/api/backup/clear', payload: { keepSettings: false } }));
+  assert.equal(reset.settingsReset, true);
+  const fresh = json(await app.inject({ method: 'GET', url: '/api/settings' }));
+  assert.equal(fresh.hasApiKey, false);
+  assert.equal(fresh.apiKeyMasked, '');
+  assert.equal(fresh.persona, 'balanced');
+  assert.equal(fresh.schedule.mode, 'off');
+  assert.ok(!JSON.stringify(fresh).includes(RAW_API_KEY), '响应中不得出现明文 API Key');
 });

@@ -62,7 +62,7 @@
 | 用途 | 端点 | 实测 |
 | --- | --- | --- |
 | 主要财务指标 | `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_F10_FINANCE_MAINFINADATA&columns=ALL&filter=(SECUCODE="{code}.SH")&pageNumber=1&pageSize=20&sortTypes=-1&sortColumns=REPORT_DATE&source=HSF10&client=PC` | ✅ |
-| 利润表 | 同上，`reportName=RPT_F10_FINANCE_GINCOME` | ✅ |
+| 利润表 | 见 §2.3：`RPT_F10_FINANCE_{T}INCOME`，`{T}` 按行业取 G/B/S/I | ✅ |
 | 公司概况 | `https://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/PageAjax?code=SH600519` | ✅ |
 | 分红送配 | `https://emweb.securities.eastmoney.com/PC_HSF10/BonusFinancing/PageAjax?code=SH600519` | ✅ |
 | 历史分红（通用） | `https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_SHAREBONUS_DET&columns=ALL&filter=(SECURITY_CODE="600519")&pageNumber=1&pageSize=20&sortColumns=REPORT_DATE&sortTypes=-1` | ✅ |
@@ -75,7 +75,64 @@
 ### 2.2 港股 / 美股基本面
 - 实测 `PC_HKF10` / `PC_USF10` 的 PageAjax 与 MainTargetAjax 均返回 **404 / 无F10资料** ❌。
 - 可用替代：`push2` 报价接口已返回 PE/PB/ROE(f173)/营收(f183)/净利率(f188)/市值/行业 —— 作为港美股的**结构化基本面主源** ✅。
+- 三表走 datacenter（见 §2.3）：港股 ✅ 利润表 + 资产负债表 + 主要指标；美股 ✅ 利润表 + 资产负债表。
 - 更深入的内容（研报、财报解读、国际局势）走 `web_search` + `get_news` 由 Agent 汇总。
+
+### 2.3 财报三表（东方财富 datacenter，零 Key）
+实测 2026-10-15，全部返回 HTTP 200 + 业务 `result.data`。
+
+**A 股：按行业分四套模板**（同一 `reportName` 前缀只差一个字母，取错模板会得到「返回数据为空」）：
+
+| 行业模板 | `{T}` | 利润表 | 资产负债表 | 现金流量表 |
+| --- | --- | --- | --- | --- |
+| 通用（茅台等） | `G` | `RPT_F10_FINANCE_GINCOME` ✅ | `RPT_F10_FINANCE_GBALANCE` ✅ | `RPT_F10_FINANCE_GCASHFLOW` ✅ |
+| 银行（工行/招行等） | `B` | `RPT_F10_FINANCE_BINCOME` ✅ | `RPT_F10_FINANCE_BBALANCE` ✅ | `RPT_F10_FINANCE_BCASHFLOW` ✅ |
+| 证券（中信等） | `S` | `RPT_F10_FINANCE_SINCOME` ✅ | `RPT_F10_FINANCE_SBALANCE` ✅ | `RPT_F10_FINANCE_SCASHFLOW` ✅ |
+| 保险（平安等） | `I` | `RPT_F10_FINANCE_IINCOME` ✅ | `RPT_F10_FINANCE_IBALANCE` ✅ | `RPT_F10_FINANCE_ICASHFLOW` ✅ |
+
+- URL 形如 `https://datacenter.eastmoney.com/securities/api/data/v1/get?reportName=RPT_F10_FINANCE_{T}BALANCE&columns=ALL&filter=(SECUCODE="601398.SH")&pageNumber=1&pageSize=8&sortTypes=-1&sortColumns=REPORT_DATE&source=HSF10&client=PC`，需 `Referer: https://emweb.securities.eastmoney.com/`。
+- **宽表**：一条记录一个报告期（200-320 列），`pages≈100`，即近 100 期；金额单位为元，字段带 `_YOY` 同比。命名规律 `{描述}_{YOY}`。
+- 金融行业模板缺 `TOTAL_OPERATE_INCOME`（用 `OPERATE_INCOME` + `OPERATE_INCOME_YOY` 回退），也没有 `OPERATE_COST`/销售/管理/研发费用等通用科目 —— 缺失即不输出，不补 0。
+- ⚠️ 以茅台实测时 `ASSET_BALANCE=0` 而 `TOTAL_ASSETS` 有值：同义字段必须按优先级取第一个非空**非零**值。
+
+**港股：长表 + 主要指标**
+
+| 用途 | `reportName` | 形状 | 实测 |
+| --- | --- | --- | --- |
+| 利润表 | `RPT_HKF10_FN_INCOME` | 长表（`STD_ITEM_CODE`/`ITEM_NAME`/`AMOUNT`/`YOY_RATIO`，约 27 科目/期） | ✅ |
+| 资产负债表 | `RPT_HKF10_FN_BALANCE` | 长表（约 55 科目/期） | ✅ |
+| 主要财务指标 | `RPT_HKF10_FN_MAININDICATOR` | 宽表（89 列，含 `NETCASH_OPERATE`/`NETCASH_INVEST`/`NETCASH_FINANCE`/`END_CASH`） | ✅ |
+| 现金流量表明细 | `RPT_HKF10_FN_CASHFLOW*`（试了 20+ 命名） | — | ❌ 一律「报表配置不存在」 |
+
+**美股：长表，`SECUCODE` 必须带交易所后缀**
+
+| 用途 | `reportName` | 实测 |
+| --- | --- | --- |
+| 利润表 | `RPT_USF10_FN_INCOME` | ✅ `AAPL.O` |
+| 资产负债表 | `RPT_USF10_FN_BALANCE` | ✅ `AAPL.O` |
+| 现金流量表 | `RPT_USF10_FN_CASHFLOW*` | ❌ 全部「报表配置不存在」→ 改用 §2.4 SEC EDGAR |
+| 主要财务指标 | `RPT_USF10_FN_MAININDICATOR` | ❌「报表配置不存在」 |
+
+- 裸代码（如 `AAPL`、`BABA`）一律「返回数据为空」；`.O`=纳斯达克、`.N`=纽交所（实测 AAPL/TSLA/MSFT/NVDA/META/PDD → `.O`，BABA/KO/JPM → `.N`）。ETF（SPY/SCHD/VOO/AGG）无 F10 财报 → 返回空，属预期。
+- ⚠️ **同一报告期有「单季报」与「累计季报」两套行**（数值不同，科目名/`STD_ITEM_CODE` 重复）。解析必须按 `REPORT_TYPE` 二选一（本项目取 `累计季报` 以对齐 A 股/港股口径），否则同一科目会出现两个互相矛盾的数值。
+- ⚠️ 长表分页按 `STD_REPORT_DATE` 倒序；窗口被打满时最旧一组会缺科目（实测港股资产负债表出现「有总资产/没有流动资产」的半张表），必须整组丢弃。
+
+**不可用时的口径**：美股现金流量表明细由 SEC EDGAR 提供（见 §2.4）；若 EDGAR 也没有该发行人数据，代码把该表标为 `available=false` + `reason`，由提示词要求 Agent 用 `web_search` 检索 10-K/10-Q 原文补足，并在结论中写明「数据缺失」。
+
+### 2.4 美股现金流量表：SEC EDGAR XBRL（官方、零 Key）
+
+实测 2026-10-15：
+
+| 用途 | 端点 | 实测 |
+| --- | --- | --- |
+| ticker → CIK | `https://www.sec.gov/files/company_tickers.json`（约 1MB，24h 缓存） | ✅ |
+| 按科目取全部报告期 | `https://data.sec.gov/api/xbrl/companyconcept/CIK{10 位}/us-gaap/{Tag}.json` | ✅ AAPL 134 个数据点 |
+| IFRS 发行人回退 | 同上，taxonomy 换 `ifrs-full` | ✅（BABA 实测走 us-gaap 即可） |
+
+- ⚠️ **User-Agent 必须带联系方式**：只带网址的 UA 实测一律 **403**（`+https://…` 与 `(https://…)` 都被拒）；带 `contact: xxx@example.com` 或浏览器式 UA 才 200。默认值见 `datasources/edgar.ts`，建议用 `AIA_EDGAR_USER_AGENT` 填自己的邮箱（见 `.env.example`）。
+- 使用的 Tag：`NetCashProvidedByUsedInOperatingActivities` / `…InvestingActivities` / `…FinancingActivities`、`PaymentsToAcquirePropertyPlantAndEquipment`、`PaymentsOfDividendsCommonStock`、`DepreciationDepletionAndAmortization`、`CashAndCashEquivalentsAtCarryingValue`；IFRS 回退 `CashFlowsFromUsedInOperatingActivities` 等。
+- 口径：同一 `end` 同时存在「单季」与「年初至今」两种 duration，取**最长（≤400 天）**= 累计口径，与 A 股/港股对齐；`≥300 天` 标为年报，其余按 `fp` 标一季报/中报/三季报；同期限取最近申报（处理重述）；只接受 `10-K/10-Q/20-F/40-F`。
+- 覆盖实测：15 只大盘股中 **13 只有数据**（AAPL/MSFT/XOM/JNJ/WMT/PG/JPM/NVDA/TSLA/META/GOOGL/BABA/NKE）。**KO（可口可乐）与 V（Visa）在 companyconcept 里返回空的 `units.USD`**（同一 Tag 在 companyfacts 里有 155 个事实，属带维度事实未被该接口暴露的情形），`frames` 接口同样取不到 → 这两类标的按「数据缺失」处理。用 `companyfacts`（单只 10MB+）兜底不划算，未采纳。
 
 ## 3. 场外基金（天天基金，零 Key）
 
@@ -92,6 +149,10 @@
 
 ## 4. 宏观与资讯
 
+> 复核记录（2026-10-15）：此前把 LPR 也列进「报表不存在」是**错的** —— LPR 走 `RPTA_WEB_RATE`
+> （页面 `data.eastmoney.com/cjsj/globalRateLPR.html` 的 JS 里写明），已接入 `macro.ts`。
+> 社会融资规模确实没有可用零 Key 报表（对 `RPT_ECONOMY_*` / `RPTA_WEB_*` 共 48 种命名做了穷举探测）。
+
 | 用途 | 端点 | 实测 |
 | --- | --- | --- |
 | CPI | `https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_ECONOMY_CPI&columns=ALL&pageNumber=1&pageSize=12&sortColumns=REPORT_DATE&sortTypes=-1` | ✅ |
@@ -101,7 +162,8 @@
 | 货币供应 M2 | `reportName=RPT_ECONOMY_CURRENCY_SUPPLY` | ✅ |
 | 全球指数 | `push2.eastmoney.com/api/qt/ulist.np/get?secids=1.000001,1.000300,0.399001,100.HSI,100.NDX,100.DJIA,100.SPX` | ✅ |
 | 财经资讯搜索 | `https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param={JSON}`（JSONP，需剥壳；`type:["cmsArticleWebOld"]`，`sort:"time"`） | ✅ |
-| LPR / 社融 | `RPT_ECONOMY_LPR` / `RPT_ECONOMY_TOTAL_SOCIETY_FINANCE` | ❌ 报表不存在，改用 web_search |
+| **LPR（贷款市场报价利率）** | `reportName=RPTA_WEB_RATE&columns=ALL&sortColumns=TRADE_DATE&sortTypes=-1`（**注意排序字段是 TRADE_DATE**，没有 REPORT_DATE；无需 token） | ✅ 2026-10-15 实测：`LPR1Y=3`、`LPR5Y=3.5`、`RATE_1=4.35`、`RATE_2=4.9` @2026-09-20 |
+| 社会融资规模 | `RPT_ECONOMY_LPR` / `RPT_ECONOMY_TOTAL_SOCIETY_FINANCE` / `RPTA_WEB_SHRZGM` 等 48 种命名 | ❌ 2026-10-15 复核：报表均不存在；维持 web_search 兜底 |
 
 ## 5. 网页检索（Agent 挖掘信息用）
 

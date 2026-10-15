@@ -1,8 +1,12 @@
 /**
- * 宏观数据中心 provider — zero-key CPI / PPI / GDP / PMI / M2 + global indices.
+ * 宏观数据中心 provider — zero-key CPI / PPI / GDP / PMI / M2 / LPR + global indices.
  *
- * Endpoint shapes verified 2026-10-14 (docs/SOURCES.md §4). LPR / 社融 reports do
- * not exist upstream; the agent is expected to use `web_search` for those.
+ * Endpoint shapes verified 2026-10-14 / 2026-10-15 (docs/SOURCES.md §4).
+ *
+ * LPR 走 `RPTA_WEB_RATE`（贷款市场报价利率，字段 LPR1Y / LPR5Y）—— 2026-10-15
+ * 复核确认可用，此前注释里「上游没有 LPR 报表」的结论是错的，已修正。
+ * 社会融资规模确实没有可用的零 Key 报表（已核对 RPT_ECONOMY_* / RPTA_WEB_* 的常见
+ * 命名），仍然如实报 warning，由模型按硬性规则用 `web_search` 补充并注明来源。
  *
  * Owner: agent-engine.
  */
@@ -20,26 +24,34 @@ interface EmDataResponse {
   result?: { data?: Array<Record<string, unknown>> | null } | null;
 }
 
-async function macroRows(reportName: string, pageSize: number): Promise<Array<Record<string, unknown>>> {
+async function macroRows(
+  reportName: string,
+  pageSize: number,
+  sortColumn = 'REPORT_DATE',
+): Promise<Array<Record<string, unknown>>> {
   const url =
     `https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=${reportName}` +
-    `&columns=ALL&pageNumber=1&pageSize=${pageSize}&sortColumns=REPORT_DATE&sortTypes=-1`;
+    `&columns=ALL&pageNumber=1&pageSize=${pageSize}&sortColumns=${sortColumn}&sortTypes=-1`;
   const json = await tryJson<EmDataResponse>(url, {
     headers: { Referer: REFERER },
     cacheTtlMs: MACRO_TTL_MS,
-    cacheKey: `macro:${reportName}:${pageSize}`,
+    cacheKey: `macro:${reportName}:${pageSize}:${sortColumn}`,
   });
   return json?.result?.data ?? [];
 }
 
-const periodOf = (row: Record<string, unknown> | undefined): string => {
+/** Exported for tests: report period label from whichever date column exists. */
+export const periodOf = (row: Record<string, unknown> | undefined): string => {
   if (!row) return '';
   if (typeof row.TIME === 'string' && row.TIME.trim()) return row.TIME.trim();
   if (typeof row.REPORT_DATE === 'string') return row.REPORT_DATE.slice(0, 7);
+  // LPR（RPTA_WEB_RATE）只有 TRADE_DATE，精确到报价日（每月 20 日）。
+  if (typeof row.TRADE_DATE === 'string' && row.TRADE_DATE.trim()) return row.TRADE_DATE.slice(0, 10);
   return '';
 };
 
-function item(
+/** Exported for tests: one report row → one macro item. */
+export function item(
   key: string,
   label: string,
   row: Record<string, unknown> | undefined,
@@ -70,12 +82,14 @@ function item(
  */
 export async function macroBundle(): Promise<MacroBundle> {
   const warnings: string[] = [];
-  const [cpi, ppi, gdp, pmi, money, indices] = await Promise.all([
+  const [cpi, ppi, gdp, pmi, money, lpr, indices] = await Promise.all([
     macroRows('RPT_ECONOMY_CPI', 3),
     macroRows('RPT_ECONOMY_PPI', 3),
     macroRows('RPT_ECONOMY_GDP', 3),
     macroRows('RPT_ECONOMY_PMI', 3),
     macroRows('RPT_ECONOMY_CURRENCY_SUPPLY', 3),
+    // LPR 按报价日（每月 20 日）排序，没有 REPORT_DATE 列。
+    macroRows('RPTA_WEB_RATE', 3, 'TRADE_DATE'),
     emIndices(),
   ]);
 
@@ -99,14 +113,20 @@ export async function macroBundle(): Promise<MacroBundle> {
   push(item('m2', 'M2 余额', latest(money), 'BASIC_CURRENCY', '亿元', 'BASIC_CURRENCY_SAME'));
   push(item('m1', 'M1 余额', latest(money), 'CURRENCY', '亿元', 'CURRENCY_SAME'));
   push(item('m0', 'M0 余额', latest(money), 'FREE_CASH', '亿元', 'FREE_CASH_SAME'));
+  // 贷款市场报价利率（LPR）：每月 20 日公布，是判断利率环境的直接指标。
+  push(item('lpr_1y', 'LPR 1 年期', latest(lpr), 'LPR1Y', '%'));
+  push(item('lpr_5y', 'LPR 5 年期以上', latest(lpr), 'LPR5Y', '%'));
 
   if (cpi.length === 0) warnings.push('宏观：CPI 报表不可用');
   if (ppi.length === 0) warnings.push('宏观：PPI 报表不可用');
   if (gdp.length === 0) warnings.push('宏观：GDP 报表不可用');
   if (pmi.length === 0) warnings.push('宏观：PMI 报表不可用');
   if (money.length === 0) warnings.push('宏观：货币供应报表不可用');
+  if (lpr.length === 0) warnings.push('宏观：LPR 报表不可用（RPTA_WEB_RATE）');
   if (indices.length === 0) warnings.push('宏观：全球指数快照不可用');
-  warnings.push('LPR / 社会融资规模无可用零 Key 报表，需要时请使用 web_search 联网获取');
+  warnings.push(
+    '社会融资规模：东财数据中心无可用零 Key 报表（已核对 RPT_ECONOMY_* / RPTA_WEB_* 常见命名），如需引用请用 web_search 检索并注明来源与发布日期',
+  );
 
   return { items, indices, warnings };
 }

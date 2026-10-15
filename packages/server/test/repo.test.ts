@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { DEFAULT_DATA_SOURCES, DEFAULT_LLM } from '@aia/shared';
+import { DEFAULT_DATA_SOURCES, DEFAULT_LLM, DEFAULT_PERSONA } from '@aia/shared';
 
 import { createRepo } from '../src/db/repo.js';
 import { settingsPatch } from '../src/db/util.js';
@@ -252,6 +252,8 @@ test('repo: watchlist CRUD + clear', () => {
   try {
     const item = repo.createWatchItem(newWatch({ code: '00700', market: 'HK', type: 'stock' }));
     assert.equal(item.initialPrice, 20);
+    // 老库补列后默认空串（不是 undefined），前端才能安全渲染。
+    assert.equal(item.expectedReturnHorizon, '');
     assert.deepEqual(item.spark, [20, 21, 22]);
     assert.equal(repo.findWatchItem('00700', 'HK', 'stock')?.id, item.id);
     assert.throws(
@@ -259,9 +261,16 @@ test('repo: watchlist CRUD + clear', () => {
       (error: unknown) => error instanceof AppError && error.statusCode === 409,
     );
 
-    const patched = repo.updateWatchItem(item.id, { qualityScore: 82, targetPrice: 300, expectedReturn: 25, thesis: '护城河' });
+    const patched = repo.updateWatchItem(item.id, {
+      qualityScore: 82,
+      targetPrice: 300,
+      expectedReturn: 25,
+      expectedReturnHorizon: '1-3 年',
+      thesis: '护城河',
+    });
     assert.equal(patched?.qualityScore, 82);
     assert.equal(patched?.targetPrice, 300);
+    assert.equal(patched?.expectedReturnHorizon, '1-3 年', '预期期限必须落库并可读回');
     assert.equal(patched?.code, '00700', '未传字段保持不变');
     assert.equal(repo.updateWatchItem('missing', { note: 'x' }), undefined);
 
@@ -539,5 +548,156 @@ test('repo: export → import 往返一致（merge 去重 / replace 覆盖）', 
     fs.rmSync(source.dir, { recursive: true, force: true });
     fs.rmSync(target.dir, { recursive: true, force: true });
     fs.rmSync(replaced.dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 一键清除（设置页「危险操作」）的存储层契约：逐表清空 + 计数自洽，
+ * 默认保留设置与 API Key，`keepSettings: false` 时恢复出厂默认。
+ */
+test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重置', () => {
+  const { repo, dir } = tempRepo();
+  try {
+    // 铺满所有会被清空的表，确保没有表被漏掉。
+    const asset = repo.createAsset(newAsset());
+    repo.addTransaction(newTx(asset.id));
+    repo.createWatchItem(newWatch());
+    repo.createAdvice(newAdvice());
+    repo.upsertAdviceOutcome({
+      adviceId: 'adv-1',
+      runId: 'run-1',
+      code: 'AAPL',
+      market: 'US',
+      type: 'stock',
+      action: 'buy',
+      currency: 'USD',
+      advisedAt: '2026-10-01T10:00:00.000+08:00',
+      adviceStatus: 'pending',
+      executed: false,
+      baselineDate: '2026-10-02',
+      baselinePrice: 100,
+      lastDate: '2026-10-10',
+      lastPrice: 110,
+      priceChangePct: 10,
+      adviceReturnPct: 10,
+      benchmarkCode: 'SPX',
+      benchmarkName: '标普500',
+      benchmarkBase: 4000,
+      benchmarkChangePct: 2,
+      excessPct: 8,
+      maxReturnPct: 12,
+      minReturnPct: -1,
+      samples: 6,
+      daysTracked: 7,
+      status: 'tracking',
+      warnings: [],
+      updatedAt: '2026-10-10T10:00:00.000+08:00',
+    });
+    repo.createRun({ id: 'run-1', kind: 'advice', status: 'done', target: null, title: '建议', startedAt: '2026-10-01T10:00:00.000+08:00' });
+    repo.addStep({ id: 'step-1', runId: 'run-1', index: 0, label: '生成建议', status: 'done' });
+    repo.addRunMessage({
+      id: 'msg-1',
+      runId: 'run-1',
+      index: 0,
+      role: 'user',
+      content: '你好',
+      toolCalls: null,
+      toolCallId: null,
+      name: null,
+      reasoningContent: null,
+      createdAt: '2026-10-01T10:00:00.000+08:00',
+    });
+    const session = repo.createSession('sess-1', '会话', '2026-10-01T10:00:00.000+08:00');
+    repo.addMessage({
+      id: 'chat-1',
+      sessionId: session.id,
+      role: 'user',
+      content: '你好',
+      toolCalls: null,
+      toolCallId: null,
+      runId: null,
+      createdAt: '2026-10-01T10:00:00.000+08:00',
+    });
+    repo.addAudit({
+      id: 'audit-1',
+      at: '2026-10-01T10:00:00.000+08:00',
+      runId: 'run-1',
+      sessionId: null,
+      tool: 'upsert_asset',
+      risk: 'write',
+      outcome: 'executed',
+      entity: 'asset',
+      entityId: asset.id,
+      summary: '新建资产',
+      args: '{}',
+    });
+    repo.addPendingWrite({
+      id: 'pending-1',
+      runId: 'run-1',
+      sessionId: null,
+      tool: 'upsert_asset',
+      args: '{}',
+      summary: '待批准',
+      risk: 'write',
+      status: 'pending',
+      createdAt: '2026-10-01T10:00:00.000+08:00',
+      decidedAt: null,
+      result: null,
+    });
+    repo.setKv('fx.rates', '{"USD":7.1}');
+    repo.saveSettings(
+      settingsPatch({ llm: { apiKey: 'sk-keep-me' }, persona: 'steady', dataSources: { stockUS: { apiKey: 'fh-keep-me' } } }),
+    );
+    repo.saveSettings(settingsPatch({ lastRunAt: '2026-10-01T10:00:00.000+08:00' }));
+
+    const result = repo.clearAllData();
+    assert.deepEqual(result, {
+      assets: 1,
+      transactions: 1,
+      watchlist: 1,
+      advice: 1,
+      adviceOutcomes: 1,
+      runs: 1,
+      steps: 1,
+      runMessages: 1,
+      chatSessions: 1,
+      chatMessages: 1,
+      auditEntries: 1,
+      pendingWrites: 1,
+      kvEntries: 1,
+      settingsReset: false,
+      deleted: 13,
+    });
+
+    // 每张表都真的空了。
+    assert.deepEqual(repo.exportAll(), { assets: [], transactions: [], watchlist: [], advice: [] });
+    assert.equal(repo.listAdviceOutcomes().length, 0);
+    assert.equal(repo.listRuns().length, 0);
+    assert.equal(repo.listRunMessages('run-1').length, 0);
+    assert.equal(repo.listSessions().length, 0);
+    assert.equal(repo.listAudit().length, 0);
+    assert.equal(repo.listPendingWrites().length, 0);
+    assert.equal(repo.getKv('fx.rates'), undefined);
+    assert.equal(repo.getSettings().lastRunAt, null, 'last_run_at 不再指向已删除的 run');
+
+    // 默认保留 AI 配置（含两个 Key）。
+    assert.equal(repo.getSettings().llm.apiKey, 'sk-keep-me');
+    assert.equal(repo.getSettings().dataSources.stockUS.apiKey, 'fh-keep-me');
+    assert.equal(repo.getSettings().persona, 'steady');
+
+    // 空库再清一次是安全幂等的。
+    assert.equal(repo.clearAllData().deleted, 0);
+
+    // `keepSettings: false` → 恢复出厂默认（Key 全清、定时任务关闭）。
+    const reset = repo.clearAllData({ keepSettings: false });
+    assert.equal(reset.settingsReset, true);
+    const fresh = repo.getSettings();
+    assert.equal(fresh.llm.apiKey, '');
+    assert.equal(fresh.dataSources.stockUS.apiKey, undefined, '出厂默认的数据源槽位不含 Key');
+    assert.equal(fresh.persona, DEFAULT_PERSONA);
+    assert.equal(fresh.schedule.mode, 'off');
+  } finally {
+    repo.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

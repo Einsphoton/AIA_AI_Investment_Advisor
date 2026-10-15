@@ -6,6 +6,7 @@
  */
 import type { AgentStreamApi } from '../api/hooks';
 import { ProgressBar } from './ui';
+import { Markdown } from './markdown/Markdown';
 
 export function RunTimeline(props: { stream: AgentStreamApi; maxTextHeight?: number }) {
   const { stream } = props;
@@ -49,12 +50,10 @@ export function RunTimeline(props: { stream: AgentStreamApi; maxTextHeight?: num
       {stream.error && <div className="alert alert-error mt-2 small">{stream.error}</div>}
 
       {stream.text && (
-        <pre
-          className="mt-2 small"
-          style={{ whiteSpace: 'pre-wrap', maxHeight: maxTextHeight, overflowY: 'auto', margin: 0, color: 'var(--text-dim)' }}
-        >
-          {stream.text}
-        </pre>
+        <div className="mt-2" style={{ maxHeight: maxTextHeight, overflowY: 'auto' }}>
+          {/* 流式正文按 Markdown 渲染：未闭合的代码围栏也能容错显示。 */}
+          <Markdown text={stream.text} variant="compact" metrics={false} />
+        </div>
       )}
     </div>
   );

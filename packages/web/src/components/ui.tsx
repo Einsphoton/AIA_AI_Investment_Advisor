@@ -19,6 +19,7 @@ import {
   type TextareaHTMLAttributes,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { INSTRUMENT_TYPE_LABELS, type InstrumentType } from '@aia/shared';
 
 /* ──────────────────────────────── Card ───────────────────────────────────── */
 
@@ -525,6 +526,236 @@ export function useToast(): ToastApi {
   const context = useContext(ToastContext);
   if (!context) throw new Error('useToast must be used inside <ToastProvider>');
   return context;
+}
+
+/* ─────────────────────────────── hover tip ───────────────────────────────── */
+
+/**
+ * 悬浮浮窗（hover / focus / 点击均可触发）。
+ *
+ * 用于「列表里只留摘要、全文按需展开」的场景（例如 AI 投资建议的理由列）：
+ * 触发区渲染被截断的摘要，浮窗用 portal 挂到 body 上，因此不会被
+ * .table-wrap 的横向滚动或卡片的 overflow 裁掉。
+ *
+ * 交互：
+ *   · 鼠标移入 / 键盘聚焦 → 延迟 120ms 弹出（避免扫过列表时闪烁）；
+ *   · 鼠标移入浮窗本身 → 保持打开，浮窗内可滚动、可选中文字；
+ *   · 点击 / 回车 → 切换（触屏设备没有 hover，靠它展开）；
+ *   · Esc、滚动、缩放、失焦 → 收起。
+ * 位置：默认在触发区下方左对齐，空间不足时翻到上方，并夹紧在视口内。
+ */
+export function HoverTip(props: {
+  /** 浮窗内容（通常是 <Markdown>）。 */
+  content: ReactNode;
+  /** 触发区里显示的摘要。 */
+  children: ReactNode;
+  /** 浮窗顶部的小标题。 */
+  title?: string;
+  /** 触发区的无障碍名称。 */
+  label?: string;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const openTimer = useRef<number | undefined>(undefined);
+  const closeTimer = useRef<number | undefined>(undefined);
+
+  const clearTimers = useCallback(() => {
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+  }, []);
+
+  const place = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const panel = panelRef.current?.getBoundingClientRect();
+    const width = panel?.width || 360;
+    const height = panel?.height || 180;
+    const margin = 12;
+    const left = Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin));
+    let top = rect.bottom + 8;
+    if (top + height > window.innerHeight - margin) {
+      const above = rect.top - height - 8;
+      top = above >= margin ? above : Math.max(margin, window.innerHeight - height - margin);
+    }
+    setPos({ left, top });
+  }, []);
+
+  const show = useCallback((delay = 120) => {
+    window.clearTimeout(closeTimer.current);
+    window.clearTimeout(openTimer.current);
+    openTimer.current = window.setTimeout(() => setOpen(true), delay);
+  }, []);
+
+  const hide = useCallback((delay = 140) => {
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+    closeTimer.current = window.setTimeout(() => setOpen(false), delay);
+  }, []);
+
+  useEffect(() => clearTimers, [clearTimers]);
+
+  // 打开后定位，并跟随滚动 / 缩放重新贴回触发区。
+  useEffect(() => {
+    if (!open) {
+      setPos(null);
+      return;
+    }
+    place();
+    const onMove = () => place();
+    const onKey = (event: WindowEventMap['keydown']) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    // 触屏没有 hover：点到浮窗和触发区之外就收起，避免一直挂在屏幕上。
+    const onOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || panelRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    window.addEventListener('scroll', onMove, true);
+    window.addEventListener('resize', onMove);
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onOutside);
+    return () => {
+      window.removeEventListener('scroll', onMove, true);
+      window.removeEventListener('resize', onMove);
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onOutside);
+    };
+  }, [open, place]);
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`hovertip-trigger ${props.className ?? ''}`}
+        aria-label={props.label}
+        aria-expanded={open}
+        onMouseEnter={() => show()}
+        onMouseLeave={() => hide()}
+        onFocus={() => show(0)}
+        onBlur={() => hide(0)}
+        onClick={() => {
+          clearTimers();
+          setOpen((previous) => !previous);
+        }}
+      >
+        {props.children}
+      </button>
+      {open &&
+        createPortal(
+          <div
+            ref={panelRef}
+            className="hovertip"
+            role="tooltip"
+            style={pos ? { left: pos.left, top: pos.top } : { left: -9999, top: -9999 }}
+            onMouseEnter={() => show(0)}
+            onMouseLeave={() => hide()}
+          >
+            {props.title && <div className="hovertip-title">{props.title}</div>}
+            {props.content}
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
+/* ──────────────────────────── market tag ─────────────────────────────────── */
+
+/**
+ * 市场色标：A股 / 港股 / 美股各用一种颜色。
+ *
+ * 这是**分类编码**，不是涨跌语义，所以用金 / 青 / 紫，避开红涨绿跌那套配色，
+ * 在「我的资产」「我的标的」这类长列表里扫一眼就能分出市场。
+ */
+export function MarketTag(props: { market: string; className?: string }) {
+  const key = (props.market ?? '').toUpperCase();
+  const label = MARKET_TAG_LABELS[key] ?? props.market;
+  return (
+    <span className={`market-tag market-${key} ${props.className ?? ''}`} title={`${label}（${key}）`}>
+      {label}
+    </span>
+  );
+}
+
+export const MARKET_TAG_LABELS: Record<string, string> = { CN: 'A股', HK: '港股', US: '美股' };
+
+/**
+ * 资产类型标签：股票 / 场内基金（ETF·LOF）/ 场外基金。
+ *
+ * 与市场色标刻意做**外形区分**：市场是实心胶囊，类型是「空心 + 彩色圆点」，
+ * 两者并排时不会因为都用了某种颜色而混淆。场外基金用粉色（全站唯一）。
+ */
+export function InstrumentTypeTag(props: { type: string; className?: string }) {
+  const key = (props.type ?? '').toLowerCase();
+  const label = INSTRUMENT_TYPE_LABELS[key as InstrumentType] ?? props.type;
+  return (
+    <span className={`type-tag type-${key} ${props.className ?? ''}`} title={`资产类型：${label}`}>
+      {label}
+    </span>
+  );
+}
+
+/* ─────────────────────────────── tabs ────────────────────────────────────── */
+
+export interface TabOption<T extends string> {
+  value: T;
+  label: ReactNode;
+  /** 右侧小徽标（例如 AI 是否已生成）。 */
+  badge?: ReactNode;
+}
+
+/** 详情弹窗里的分页签（概览 / AI 分析）。 */
+export function Tabs<T extends string>(props: {
+  value: T;
+  options: TabOption<T>[];
+  onChange: (value: T) => void;
+  ariaLabel?: string;
+}) {
+  return (
+    <div className="tabs" role="tablist" aria-label={props.ariaLabel}>
+      {props.options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          role="tab"
+          aria-selected={props.value === option.value}
+          className={`tab${props.value === option.value ? ' active' : ''}`}
+          onClick={() => props.onChange(option.value)}
+        >
+          <span>{option.label}</span>
+          {option.badge}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ───────────────────────────── disclosure ────────────────────────────────── */
+
+/**
+ * 可折叠区块（默认收起）。用于详情页里「体积大但不是每次都要看」的内容
+ * （例如财报三表），避免把弹窗拉得很长。
+ */
+export function Disclosure(props: { title: ReactNode; summary?: ReactNode; children: ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(props.defaultOpen ?? false);
+  return (
+    <section className={`disclosure${open ? ' open' : ''}`}>
+      <button type="button" className="disclosure-head" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+        <span className="disclosure-caret" aria-hidden="true">
+          ▸
+        </span>
+        <span className="disclosure-title">{props.title}</span>
+        {props.summary && <span className="disclosure-summary">{props.summary}</span>}
+      </button>
+      {open && <div className="disclosure-body">{props.children}</div>}
+    </section>
+  );
 }
 
 /* ──────────────────────────────── misc bits ──────────────────────────────── */

@@ -5,7 +5,7 @@
  * 排序与「按市场 / 按资产类型分列」在客户端完成：分组行只在渲染期插入，
  * 这样切换视图不会重新请求，也不会让服务端排序破坏分组顺序。
  */
-import { Fragment, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { AssetSummary, Creator, InstrumentType, Market } from '@aia/shared';
 import { INSTRUMENT_TYPES, INSTRUMENT_TYPE_LABELS, MARKETS, MARKET_LABELS } from '@aia/shared';
@@ -13,7 +13,23 @@ import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { toApiError, useAsync, useDebounced } from '../api/hooks';
 import { fmtDate, fmtMoney, fmtPct, fmtPrice, fmtShares, fmtSignedMoney, pnlClass } from '../format';
-import { Alert, Badge, Button, Card, ConfirmDialog, Dropdown, Empty, ErrorAlert, Input, Loading, Segmented, SortHeader, useToast } from '../components/ui';
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  ConfirmDialog,
+  Dropdown,
+  Empty,
+  ErrorAlert,
+  Input,
+  InstrumentTypeTag,
+  Loading,
+  MarketTag,
+  Segmented,
+  SortHeader,
+  useToast,
+} from '../components/ui';
 import { Sparkline } from '../components/charts/Sparkline';
 import { AssetDetailDialog } from './AssetDetailDialog';
 import { AssetCreateDialog, AssetEditDialog } from './AssetFormDialog';
@@ -101,6 +117,7 @@ export function AssetsPage() {
   const [deleteTarget, setDeleteTarget] = useState<AssetSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const autoRefreshed = useRef(false);
 
   const state = useAsync(() => api.assets.list({ market, type, source, q: query }), [market, type, source, query]);
 
@@ -134,18 +151,40 @@ export function AssetsPage() {
     setSearchText('');
   };
 
-  const refreshQuotes = async () => {
-    setRefreshing(true);
+  /**
+   * 刷新持仓行情（现价 / 当日涨跌 / 走势缩略图）。
+   *
+   * 「当前走势」取的是 `asset.spark`，它只在刷新行情时写入；若某次刷新时序列
+   * 接口失败，价格会更新而走势仍为空 —— 列表里那一列就什么都没有。所以进页面
+   * 时按新鲜度自动补刷一次，同时保留手动按钮兜底。
+   */
+  async function refreshQuotes(reason: 'auto' | 'manual' = 'manual') {
+    if (reason === 'manual') setRefreshing(true);
     try {
       const result = await api.assets.refresh();
-      toast.success(`已刷新 ${result.updated} 个标的行情`, result.failed > 0 ? `${result.failed} 个标的刷新失败` : undefined);
+      if (reason === 'manual') {
+        toast.success(`已刷新 ${result.updated} 个标的行情`, result.failed > 0 ? `${result.failed} 个标的刷新失败` : undefined);
+      }
       state.reload();
     } catch (error) {
-      toast.error('刷新行情失败', toApiError(error).message);
+      if (reason === 'manual') toast.error('刷新行情失败', toApiError(error).message);
     } finally {
-      setRefreshing(false);
+      if (reason === 'manual') setRefreshing(false);
     }
-  };
+  }
+
+  useEffect(() => {
+    if (autoRefreshed.current || state.loading || !state.data || rows.length === 0) return;
+    autoRefreshed.current = true;
+    const newest = rows.reduce<string | null>(
+      (acc, row) => (row.priceAt && (!acc || row.priceAt > acc) ? row.priceAt : acc),
+      null,
+    );
+    // 缺走势（或走势过期）时自动补刷，避免每次进页面都打一遍数据源。
+    const missingSpark = rows.some((row) => !Array.isArray(row.spark) || row.spark.length < 2);
+    const ageMs = newest ? Date.now() - new Date(newest).getTime() : Number.POSITIVE_INFINITY;
+    if (missingSpark || ageMs > 5 * 60_000) void refreshQuotes('auto');
+  }, [state.loading, state.data, rows]);
 
   const confirmDelete = async () => {
     if (!deleteTarget) return;
@@ -216,7 +255,11 @@ export function AssetsPage() {
               { value: 'type', label: '按资产类型分列' },
             ]}
           />
-          <Button onClick={refreshQuotes} loading={refreshing}>
+          <Button
+            onClick={() => void refreshQuotes('manual')}
+            loading={refreshing}
+            title="拉取最新现价 / 当日涨跌 / 走势缩略图（「当前走势」列依赖它）"
+          >
             刷新行情
           </Button>
           <Button onClick={() => setCreateOpen(true)}>添加资产</Button>
@@ -314,9 +357,11 @@ export function AssetsPage() {
                           </td>
                           <td className="mono tiny">{asset.code}</td>
                           <td>
-                            <Badge>{INSTRUMENT_TYPE_LABELS[asset.type]}</Badge>
+                            <InstrumentTypeTag type={asset.type} />
                           </td>
-                          <td className="nowrap">{MARKET_LABELS[asset.market]}</td>
+                          <td className="nowrap">
+                          <MarketTag market={asset.market} />
+                        </td>
                           <td>
                             <Badge tone={asset.source === 'ai' ? 'ai' : 'manual'}>{asset.source === 'ai' ? 'AI 建仓' : '手动'}</Badge>
                           </td>
@@ -334,7 +379,13 @@ export function AssetsPage() {
                             <div className={`tiny ${pnlClass(asset.unrealizedPnlPct)}`}>{fmtPct(asset.unrealizedPnlPct)}</div>
                           </td>
                           <td>
-                            <Sparkline values={asset.spark} />
+                            {asset.spark.length > 1 ? (
+                              <Sparkline values={asset.spark} />
+                            ) : (
+                              <span className="tiny mute" title="暂无走势数据：点上方「刷新行情」重新拉取价格序列">
+                                待刷新
+                              </span>
+                            )}
                           </td>
                           <td>
                             <div className="truncate tiny muted" style={{ maxWidth: 220 }} title={asset.aiSummary || '尚未生成 AI 分析'}>

@@ -27,7 +27,7 @@ const STATUS_TEXT: Record<DockStatus, string> = { running: '推理中', done: '�
 
 export function AgentActivityDock() {
   const stream = useAgentStreamState();
-  const { title, running, startedAt, collapsed, setCollapsed, dismissed, dismiss } = useAgentActivity();
+  const { title, running, startedAt, collapsed, setCollapsed, dismissed } = useAgentActivity();
   const [now, setNow] = useState(() => Date.now());
   const [rootEl, setRootEl] = useState<HTMLElement | null>(null);
 
@@ -107,13 +107,10 @@ export function AgentActivityDock() {
               中断
             </Button>
           ) : (
-            <Button size="sm" variant="ghost" onClick={() => setCollapsed(true)} title="收起为右下角小条">
+            <Button size="sm" variant="ghost" onClick={() => setCollapsed(true)} title="收起为右下角小条（再次点击右下角小条可展开）">
               收起
             </Button>
           )}
-          <Button size="sm" variant="ghost" onClick={dismiss} title="清除并关闭面板" aria-label="清除并关闭面板">
-            ✕
-          </Button>
         </span>
       </header>
 

@@ -30,9 +30,15 @@ import {
   DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
   MARKET_CURRENCY,
   type AuditEntry,
+  type AdviceAction,
+  type AdviceOutcomeStatus,
+  type AdviceStatus,
+  type ClearDataResult,
   type Creator,
   type ImportMode,
   type ImportResult,
+  type InstrumentType,
+  type Market,
   type McpServerConfig,
   type PendingWrite,
   type PendingWriteStatus,
@@ -43,6 +49,7 @@ import {
 import { badRequest, conflict } from '../errors.js';
 import type { ExportBundle, Repo, WatchlistStatusFilter } from '../types/repo.js';
 import type {
+  AdviceOutcomeRow,
   AdviceRow,
   AssetPatch,
   AssetRow,
@@ -128,6 +135,7 @@ function rowToWatch(row: Row): WatchRow {
     qualityScore: toNumber(row.quality_score),
     targetPrice: toNumber(row.target_price),
     expectedReturn: toNumber(row.expected_return),
+    expectedReturnHorizon: str(row.expected_return_horizon),
     initialPrice: toNumber(row.initial_price),
     initialPriceAt: nullableStr(row.initial_price_at),
     price: toNumber(row.price),
@@ -318,11 +326,54 @@ function rowToRunMessage(row: Row): RunMessageRow {
     toolCalls: nullableStr(row.tool_calls),
     toolCallId: nullableStr(row.tool_call_id),
     name: nullableStr(row.name),
+    reasoningContent: nullableStr(row.reasoning_content),
     createdAt: str(row.created_at),
   };
 }
 
-function mergeDataSources(
+function rowToAdviceOutcome(row: Row): AdviceOutcomeRow {
+  return {
+    adviceId: str(row.advice_id),
+    runId: nullableStr(row.run_id),
+    code: str(row.code),
+    market: str(row.market, 'CN') as Market,
+    type: str(row.type, 'stock') as InstrumentType,
+    action: str(row.action, 'buy') as AdviceAction,
+    currency: str(row.currency, 'CNY'),
+    advisedAt: str(row.advised_at),
+    adviceStatus: str(row.advice_status, 'pending') as AdviceStatus,
+    executed: bool(row.executed, false),
+    baselineDate: str(row.baseline_date),
+    baselinePrice: toNumber(row.baseline_price),
+    lastDate: str(row.last_date),
+    lastPrice: toNumber(row.last_price),
+    priceChangePct: toNumber(row.price_change_pct),
+    adviceReturnPct: toNumber(row.advice_return_pct),
+    benchmarkCode: str(row.benchmark_code),
+    benchmarkName: str(row.benchmark_name),
+    benchmarkBase: toNumber(row.benchmark_base),
+    benchmarkChangePct: toNumber(row.benchmark_change_pct),
+    excessPct: toNumber(row.excess_pct),
+    maxReturnPct: toNumber(row.max_return_pct),
+    minReturnPct: toNumber(row.min_return_pct),
+    samples: int(row.samples),
+    daysTracked: int(row.days_tracked),
+    status: str(row.status, 'tracking') as AdviceOutcomeStatus,
+    warnings: toStringArray(row.warnings),
+    updatedAt: str(row.updated_at),
+  };
+}
+
+function toStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string');
+  if (typeof value !== 'string' || value.trim() === '') return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}function mergeDataSources(
   base: StoredSettings['dataSources'],
   patch?: Partial<StoredSettings['dataSources']> | null,
 ): StoredSettings['dataSources'] {
@@ -364,6 +415,28 @@ const DEFAULT_CURRENCY = (market: string): string => MARKET_CURRENCY[market as k
 
 /** D7: per-message cap for persisted run transcripts (see `addRunMessage`). */
 const MAX_RUN_MESSAGE_CHARS = 20_000;
+
+/**
+ * `clearAllData` 清空的表。数组顺序即删除顺序：子表在父表之前，避免外键约束
+ * （`transactions.asset_id → assets.id`）。表名来自本常量而非请求参数。
+ */
+const CLEARED_TABLES = [
+  'transactions',
+  'assets',
+  'watchlist',
+  'advice',
+  'advice_outcomes',
+  'agent_steps',
+  'agent_run_messages',
+  'agent_runs',
+  'chat_messages',
+  'chat_sessions',
+  'audit_log',
+  'pending_writes',
+  'kv',
+] as const;
+
+type ClearedTable = (typeof CLEARED_TABLES)[number];
 
 /* ───────────────────────────────── factory ────────────────────────────────── */
 
@@ -706,16 +779,17 @@ class SqliteRepo implements Repo {
     try {
       this.run(
         `INSERT INTO watchlist (
-           id, name, code, market, type, source, quality_score, target_price, expected_return, initial_price,
-           initial_price_at, price, price_at, price_prev_close, day_change_pct, thesis, note, ai_summary,
+           id, name, code, market, type, source, quality_score, target_price, expected_return, expected_return_horizon,
+           initial_price, initial_price_at, price, price_at, price_prev_close, day_change_pct, thesis, note, ai_summary,
            ai_summary_at, spark, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, '', ?, '', NULL, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, '', ?, '', NULL, ?, ?, ?)`,
         input.id,
         input.name ?? '',
         input.code,
         input.market,
         input.type,
         input.source ?? 'manual',
+        input.expectedReturnHorizon ?? '',
         input.initialPrice ?? 0,
         input.initialPriceAt ?? null,
         input.price ?? 0,
@@ -744,6 +818,7 @@ class SqliteRepo implements Repo {
       ['qualityScore', 'quality_score'],
       ['targetPrice', 'target_price'],
       ['expectedReturn', 'expected_return'],
+      ['expectedReturnHorizon', 'expected_return_horizon'],
       ['thesis', 'thesis'],
       ['aiSummary', 'ai_summary'],
       ['aiSummaryAt', 'ai_summary_at'],
@@ -893,6 +968,73 @@ class SqliteRepo implements Repo {
       exceptBatchId ?? null,
       exceptBatchId ?? null,
     ).changes;
+  }
+
+  /* ── advice outcomes（物化结果：整行由序列重算，因此可整体 REPLACE） ───────── */
+
+  upsertAdviceOutcome(input: AdviceOutcomeRow): AdviceOutcomeRow {
+    this.run(
+      `INSERT OR REPLACE INTO advice_outcomes (
+         advice_id, run_id, code, market, type, action, currency, advised_at, advice_status, executed,
+         baseline_date, baseline_price, last_date, last_price, price_change_pct, advice_return_pct,
+         benchmark_code, benchmark_name, benchmark_base, benchmark_change_pct, excess_pct,
+         max_return_pct, min_return_pct, samples, days_tracked, status, warnings, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      input.adviceId,
+      input.runId ?? null,
+      input.code,
+      input.market,
+      input.type,
+      input.action,
+      input.currency,
+      input.advisedAt,
+      input.adviceStatus,
+      input.executed ? 1 : 0,
+      input.baselineDate,
+      input.baselinePrice,
+      input.lastDate,
+      input.lastPrice,
+      input.priceChangePct,
+      input.adviceReturnPct,
+      input.benchmarkCode,
+      input.benchmarkName,
+      input.benchmarkBase,
+      input.benchmarkChangePct,
+      input.excessPct,
+      input.maxReturnPct,
+      input.minReturnPct,
+      input.samples,
+      input.daysTracked,
+      input.status,
+      stringifyJson(input.warnings),
+      input.updatedAt,
+    );
+    return input;
+  }
+
+  getAdviceOutcome(adviceId: string): AdviceOutcomeRow | undefined {
+    const row = this.get('SELECT * FROM advice_outcomes WHERE advice_id = ?', adviceId);
+    return row ? rowToAdviceOutcome(row) : undefined;
+  }
+
+  listAdviceOutcomes(filter: { limit?: number; status?: AdviceOutcomeStatus } = {}): AdviceOutcomeRow[] {
+    const limit = Math.max(1, Math.min(filter.limit ?? 500, 5000));
+    if (filter.status) {
+      return this.all(
+        'SELECT * FROM advice_outcomes WHERE status = ? ORDER BY advised_at DESC LIMIT ?',
+        filter.status,
+        limit,
+      ).map(rowToAdviceOutcome);
+    }
+    return this.all('SELECT * FROM advice_outcomes ORDER BY advised_at DESC LIMIT ?', limit).map(rowToAdviceOutcome);
+  }
+
+  /**
+   * Drops tracked rows whose advice no longer exists (e.g. the user cleared the
+   * advice list). The table is a rebuildable cache, so nothing of value is lost.
+   */
+  deleteAdviceOutcomesForMissingAdvice(): number {
+    return this.run('DELETE FROM advice_outcomes WHERE advice_id NOT IN (SELECT id FROM advice)').changes;
   }
 
   /* ── agent runs ────────────────────────────────────────────────────────── */
@@ -1194,8 +1336,58 @@ class SqliteRepo implements Repo {
     });
   }
 
-  /* ── full-fidelity row inserts used by importAll ────────────────────────── */
+  /* ── one-click wipe（设置页「一键清除所有数据」） ────────────────────────── */
 
+  /**
+   * 清空全部业务数据、AI 历史与缓存，单个事务内完成。
+   *
+   * `keepSettings` 默认 `true`：AI 配置（含 LLM / 数据源 Key、投资性格、预算、
+   * 定时任务）保持不动，用户清完可直接继续用；传 `false` 时设置回到出厂默认
+   * （等价于全新数据库）。无论哪种，`last_run_at` 都会清空 —— 它指向的 run
+   * 已经不存在了。
+   *
+   * 磁盘上的备份快照（`data/backups`）不属于数据库数据，不在此方法范围内。
+   */
+  clearAllData(options: { keepSettings?: boolean } = {}): ClearDataResult {
+    const keepSettings = options.keepSettings !== false;
+    return this.transaction(() => {
+      const counts = {} as Record<ClearedTable, number>;
+      for (const table of CLEARED_TABLES) {
+        counts[table] = int(this.get(`SELECT COUNT(*) AS n FROM ${table}`)?.n, 0);
+      }
+      for (const table of CLEARED_TABLES) this.run(`DELETE FROM ${table}`);
+      if (!keepSettings) this.resetSettings();
+      // 运行历史已清空：时间戳不再对应任何 run。
+      this.run('UPDATE settings SET last_run_at = NULL WHERE id = 1');
+      const deleted = CLEARED_TABLES.reduce((total, table) => total + counts[table], 0);
+      return {
+        assets: counts.assets,
+        transactions: counts.transactions,
+        watchlist: counts.watchlist,
+        advice: counts.advice,
+        adviceOutcomes: counts.advice_outcomes,
+        runs: counts.agent_runs,
+        steps: counts.agent_steps,
+        runMessages: counts.agent_run_messages,
+        chatSessions: counts.chat_sessions,
+        chatMessages: counts.chat_messages,
+        auditEntries: counts.audit_log,
+        pendingWrites: counts.pending_writes,
+        kvEntries: counts.kv,
+        settingsReset: !keepSettings,
+        deleted,
+      };
+    });
+  }
+
+  resetSettings(): StoredSettings {
+    // 删行 + 重新播种：拿到的就是全新数据库的默认值（含清空全部 Key）。
+    this.run('DELETE FROM settings WHERE id = 1');
+    this.seedSettings();
+    return this.getSettings();
+  }
+
+  /* ── full-fidelity row inserts used by importAll ────────────────────────── */
   private insertAssetRow(row: AssetRow): void {
     this.createAsset(row);
     this.updateAsset(row.id, {
@@ -1390,9 +1582,15 @@ class SqliteRepo implements Repo {
       input.content.length > MAX_RUN_MESSAGE_CHARS
         ? `${input.content.slice(0, MAX_RUN_MESSAGE_CHARS)}…（已截断，原始 ${input.content.length} 字符）`
         : input.content;
+    // The thinking trace is echoed back to the provider verbatim on resume; a gate
+    // is still needed because reasoning models can emit tens of KB per turn.
+    const reasoning =
+      input.reasoningContent && input.reasoningContent.length > MAX_RUN_MESSAGE_CHARS
+        ? `${input.reasoningContent.slice(0, MAX_RUN_MESSAGE_CHARS)}…（思考轨迹已截断，原始 ${input.reasoningContent.length} 字符）`
+        : (input.reasoningContent ?? null);
     this.run(
-      `INSERT INTO agent_run_messages (id, run_id, idx, role, content, tool_calls, tool_call_id, name, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agent_run_messages (id, run_id, idx, role, content, tool_calls, tool_call_id, name, reasoning_content, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       input.id,
       input.runId,
       input.index,
@@ -1401,6 +1599,7 @@ class SqliteRepo implements Repo {
       input.toolCalls,
       input.toolCallId,
       input.name,
+      reasoning,
       input.createdAt,
     );
     return input;
