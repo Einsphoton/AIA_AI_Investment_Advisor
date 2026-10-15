@@ -15,7 +15,10 @@
     "dist"
   ],
   "scripts": {
+    "guard": "node ../../scripts/guard-running-pipeline.mjs",
+    "prebuild": "node ../../scripts/guard-running-pipeline.mjs",
     "build": "tsc -p tsconfig.build.json",
+    "pretypecheck": "node ../../scripts/guard-running-pipeline.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   }
 }

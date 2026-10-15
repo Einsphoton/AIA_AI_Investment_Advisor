@@ -4,9 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "guard": "node ../../scripts/guard-running-pipeline.mjs",
+    "prebuild": "node ../../scripts/guard-running-pipeline.mjs",
     "build": "node ../../node_modules/rollup/dist/bin/rollup -c rollup.config.mjs",
     "build:watch": "node ../../node_modules/rollup/dist/bin/rollup -c rollup.config.mjs --watch",
+    "pretypecheck": "node ../../scripts/guard-running-pipeline.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "pretest": "node ../../scripts/guard-running-pipeline.mjs",
     "test": "node ../../node_modules/rollup/dist/bin/rollup -c rollup.test.config.mjs && node ../../scripts/run-tests.mjs dist-test"
   },
   "dependencies": {

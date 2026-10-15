@@ -16,7 +16,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { renderToString } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
-import type { AssetSummary, InferenceMetrics, SeriesPoint } from '@aia/shared';
+import type { AgentRunSummary, AssetSummary, InferenceMetrics, SeriesPoint } from '@aia/shared';
 import {
   DEFAULT_LLM,
   LLM_PROVIDER_CUSTOM_ID,
@@ -57,6 +57,7 @@ import { extractMetrics, parseChartSpec, parseMarkdown } from '../src/components
 import { LlmProviderField } from '../src/pages/SettingsLlmProvider';
 import { ModelField } from '../src/pages/SettingsModelField';
 import { DangerZoneCard } from '../src/pages/SettingsDangerZone';
+import { selectResumableRuns } from '../src/components/InterruptedRunsAlert';
 
 const ROUTES: { path: string; expect: string[] }[] = [
   { path: '/', expect: ['Dashboard'] },
@@ -1332,4 +1333,50 @@ test('推理进度：完成后不再显示「第 4/20 轮推理」，进度条�
   for (const tone of ['ok', 'error', 'muted']) {
     assert.ok(css.includes(`.progress-${tone} .progress-bar`), `缺少终态进度条配色：progress-${tone}`);
   }
+});
+
+/* ─────────── 未完成的运行：Dashboard 顶部提示 + 一键续跑 ─────────── */
+
+test('selectResumableRuns：只挑 error 的 run，且尊重用户「忽略」', () => {
+  const run = (id: string, status: AgentRunSummary['status']): AgentRunSummary => ({
+    id,
+    kind: 'asset-analysis',
+    status,
+    title: `run ${id}`,
+    summary: '',
+    error: status === 'error' ? '运行被中断（服务进程在本次分析结束前退出，重启后已标记为失败）。' : null,
+    turns: 1,
+    stepCount: 2,
+    startedAt: '2026-10-15T10:01:57.734Z',
+    finishedAt: '2026-10-15T10:04:36.834Z',
+  });
+
+  const runs = [run('a', 'error'), run('b', 'done'), run('c', 'error'), run('d', 'running')];
+  assert.deepEqual(
+    selectResumableRuns(runs, []).map((item) => item.id),
+    ['a', 'c'],
+    '只有 error 的 run 需要续跑（done 会被服务端 409 拒绝，running 还在跑）',
+  );
+  assert.deepEqual(
+    selectResumableRuns(runs, ['a']).map((item) => item.id),
+    ['c'],
+    '被忽略的 run 不再提示',
+  );
+  assert.deepEqual(selectResumableRuns([], ['a']), []);
+});
+
+test('Dashboard 顶部挂载「未完成运行」提示条，并指向续跑接口', () => {
+  const dashboard = readSource('pages', 'Dashboard.tsx');
+  assert.ok(
+    /<InterruptedRunsAlert \/>/.test(dashboard),
+    'Dashboard 必须挂载未完成运行提示条（服务重启打断的分析要能一键续跑）',
+  );
+
+  const alert = readSource('components', 'InterruptedRunsAlert.tsx');
+  assert.ok(/status === 'error'/.test(alert), '提示条只应基于 status=error 判定');
+  assert.ok(
+    /\/agent\/runs\/\$\{encodeURIComponent\(target\.id\)\}\/resume/.test(alert),
+    '提示条必须调用 P1-3 的续跑接口 /api/agent/runs/:id/resume',
+  );
+  assert.ok(/api\.agent\.runs\(20\)/.test(alert), '提示条应复用现有的运行列表接口，不新增服务端接口');
 });

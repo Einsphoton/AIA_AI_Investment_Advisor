@@ -5,11 +5,15 @@
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
+    "guard": "node ../../scripts/guard-running-pipeline.mjs",
+    "prebuild": "node ../../scripts/guard-running-pipeline.mjs",
     "build": "tsc -p tsconfig.build.json",
     "build:watch": "tsc -p tsconfig.build.json --watch --preserveWatchOutput",
     "start": "node --enable-source-maps dist/index.js",
     "start:watch": "node --watch --watch-preserve-output --enable-source-maps dist/index.js",
+    "pretypecheck": "node ../../scripts/guard-running-pipeline.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "pretest": "node ../../scripts/guard-running-pipeline.mjs",
     "test": "tsc -p tsconfig.test.json && node --enable-source-maps ../../scripts/run-tests.mjs dist-test/test"
   },
   "dependencies": {

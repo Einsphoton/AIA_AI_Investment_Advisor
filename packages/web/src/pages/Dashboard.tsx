@@ -22,6 +22,7 @@ import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { useAsync } from '../api/hooks';
 import { fmtDateTime, fmtMoney, fmtNum, fmtPct, fmtPrice, fmtRelative, fmtShares, fmtSignedMoney, pnlClass } from '../format';
 import { Alert, Badge, Button, Card, Empty, ErrorAlert, Loading, MarketTag, ProgressBar, StatCard } from '../components/ui';
+import { InterruptedRunsAlert } from '../components/InterruptedRunsAlert';
 import { Sparkline } from '../components/charts/Sparkline';
 import { Markdown } from '../components/markdown/Markdown';
 
@@ -85,6 +86,10 @@ export function DashboardPage() {
           尚未配置 LLM API Key，AI 分析不可用，请到 <Link to="/settings">设置页</Link> 填写 API Key。
         </Alert>
       )}
+
+      {/* 未跑完的 AI 运行：服务进程重启 / 上游超时都会留下 error 状态的 run，
+          轨迹已落库，可以一键续跑而不是从头再点一次。 */}
+      <InterruptedRunsAlert />
 
       {state.loading && !payload && <Loading label="正在汇总持仓…" />}
 

@@ -5,10 +5,15 @@
  * file, which fails in restricted environments (EPERM on spawn) and is slower.
  * Importing the compiled test files directly registers the `node:test` suites,
  * which the runtime then executes in-process.
+ *
+ * Accepts `*.test.js` (compiled `dist-test`) and `*.test.mjs` (`scripts/test`,
+ * plain JavaScript that needs no build step).
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+
+const TEST_SUFFIXES = ['.test.js', '.test.mjs'];
 
 const target = path.resolve(process.argv[2] ?? 'dist-test');
 if (!fs.existsSync(target)) {
@@ -18,7 +23,7 @@ if (!fs.existsSync(target)) {
 
 const files = collect(target).sort();
 if (files.length === 0) {
-  console.error(`[test] 未找到 *.test.js：${target}`);
+  console.error(`[test] 未找到 ${TEST_SUFFIXES.join(' / ')}：${target}`);
   process.exit(1);
 }
 
@@ -34,7 +39,7 @@ function collect(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const absolute = path.join(dir, entry.name);
     if (entry.isDirectory()) out.push(...collect(absolute));
-    else if (entry.name.endsWith('.test.js')) out.push(absolute);
+    else if (TEST_SUFFIXES.some((suffix) => entry.name.endsWith(suffix))) out.push(absolute);
   }
   return out;
 }
