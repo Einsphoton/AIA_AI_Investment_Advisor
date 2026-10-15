@@ -136,6 +136,15 @@ export interface Repo {
   updateRun(id: string, patch: Partial<Omit<RunRow, 'id'>>): RunRow | undefined;
   getRun(id: string): RunRow | undefined;
   listRuns(filter?: { limit?: number; kind?: AgentRunKind; status?: AgentRunStatus }): RunRow[];
+  /**
+   * Boot-time reconciliation: marks every run still `running` as `error`.
+   *
+   * A run row is only finalised by the loop's own `updateRun`, so a process that
+   * dies mid-run (Ctrl-C, crash, container restart) leaves a permanent `running`
+   * row. Those zombies used to show up forever as「运行中 / 报错」in the activity
+   * list and could be resumed into a transcript that no live worker owns.
+   */
+  failStaleRuns(reason: string): number;
   listSteps(runId: string): StepRow[];
   addStep(input: NewStep): StepRow;
   updateStep(id: string, patch: Partial<Omit<StepRow, 'id' | 'runId'>>): StepRow | undefined;

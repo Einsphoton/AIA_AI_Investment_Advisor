@@ -415,6 +415,17 @@ const DEFAULT_CURRENCY = (market: string): string => MARKET_CURRENCY[market as k
 
 /** D7: per-message cap for persisted run transcripts (see `addRunMessage`). */
 const MAX_RUN_MESSAGE_CHARS = 20_000;
+/**
+ * `user` messages get a much larger cap.
+ *
+ * The first user message is the run's goal, and the pipelines embed the whole
+ * pre-fetched dataset in it as JSON. Cutting it at 20k characters left
+ * `resumeRunId` (P1-3) replaying a **half-JSON payload** — the model then answered
+ * `Unterminated string in JSON` and re-fetched everything. The producer already
+ * caps the payload (`MAX_GOAL_PAYLOAD_CHARS`, ~60k), so a 4× headroom costs
+ * nothing and keeps the transcript resumable.
+ */
+const MAX_RUN_USER_MESSAGE_CHARS = 250_000;
 
 /**
  * `clearAllData` 清空的表。数组顺序即删除顺序：子表在父表之前，避免外键约束
@@ -1120,6 +1131,24 @@ class SqliteRepo implements Repo {
     return this.all('SELECT * FROM agent_steps WHERE run_id = ? ORDER BY idx ASC, started_at ASC', runId).map(rowToStep);
   }
 
+  /**
+   * Boot-time reconciliation (see `Repo.failStaleRuns`).
+   *
+   * `turns`/token columns are left untouched on purpose: they hold whatever the
+   * run really spent before it was interrupted, and resetting them would hide the
+   * cost. Only `status`/`error`/`finished_at` change, and the `status = 'running'`
+   * predicate keeps this idempotent.
+   */
+  failStaleRuns(reason: string): number {
+    const result = this.run(
+      `UPDATE agent_runs SET status = 'error', error = ?, finished_at = ?
+       WHERE status = 'running' AND finished_at IS NULL`,
+      reason,
+      nowIso(),
+    );
+    return Number(result.changes ?? 0);
+  }
+
   addStep(input: NewStep): StepRow {
     const id = input.id ?? crypto.randomUUID();
     this.run(
@@ -1578,9 +1607,11 @@ class SqliteRepo implements Repo {
   addRunMessage(input: RunMessageRow): RunMessageRow {
     // D7: cap a single transcript body so one runaway tool result cannot grow the
     // table without bound (agent_steps.tool_result is capped for the same reason).
+    // `user` messages only get a sanity bound — see MAX_RUN_USER_MESSAGE_CHARS.
+    const cap = input.role === 'user' ? MAX_RUN_USER_MESSAGE_CHARS : MAX_RUN_MESSAGE_CHARS;
     const content =
-      input.content.length > MAX_RUN_MESSAGE_CHARS
-        ? `${input.content.slice(0, MAX_RUN_MESSAGE_CHARS)}…（已截断，原始 ${input.content.length} 字符）`
+      input.content.length > cap
+        ? `${input.content.slice(0, cap)}…（已截断，原始 ${input.content.length} 字符）`
         : input.content;
     // The thinking trace is echoed back to the provider verbatim on resume; a gate
     // is still needed because reasoning models can emit tens of KB per turn.

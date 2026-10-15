@@ -38,6 +38,8 @@ export interface ResolvedInstrument extends InstrumentRef {
 export interface SeriesQuery extends InstrumentRef {
   range: RangeKey;
   interval: BarInterval;
+  /** Receives the degradation notes even when every provider fails. */
+  onWarnings?: (warnings: string[]) => void;
 }
 
 /** A provider attempt result with provenance + degradation notes. */

@@ -5,7 +5,7 @@
 import { useMemo } from 'react';
 import type { SeriesPoint } from '@aia/shared';
 import { EChart, CHART_COLORS, baseAxisStyle, goldTooltipStyle, type EChartsCoreOption } from './EChart';
-import { markerPointTooltip, seriesTooltipFormatter, type MarkerInfo } from './tradeMarkers';
+import { markerPointData, seriesTooltipFormatter, type MarkerInfo } from './tradeMarkers';
 
 /** 买卖点：带成交明细，悬浮时显示完整信息（金额 / 费用 / 备注）。 */
 export type TradeMarker = MarkerInfo;
@@ -29,29 +29,11 @@ export function KLineChart({ points, markers = [], currency = '', className = 'c
       itemStyle: { color: point.close >= point.open ? 'rgba(255,90,95,0.5)' : 'rgba(47,191,143,0.5)' },
       index,
     }));
+    // 买卖点：直接悬停 pin 就弹成交明细（markerPointData 里显式声明了
+    // tooltip.trigger: 'item'，否则会被全局的 axis 触发器吞掉）。
     const markerData = markers
       .filter((marker) => dates.includes(marker.date.slice(0, 10)))
-      .map((marker) => ({
-        name: marker.kind === 'buy' ? '买入' : '卖出',
-        coord: [marker.date.slice(0, 10), marker.price],
-        value: marker.kind === 'buy' ? '买' : '卖',
-        symbol: 'pin',
-        symbolSize: 34,
-        itemStyle: {
-          color: marker.kind === 'buy' ? CHART_COLORS.buy : CHART_COLORS.sell,
-          shadowBlur: 14,
-          shadowColor: marker.kind === 'buy' ? 'rgba(212,175,55,0.9)' : 'rgba(47,191,143,0.8)',
-        },
-        label: {
-          color: CHART_COLORS.ink,
-          fontSize: 10,
-          fontWeight: 'bold' as const,
-          formatter: marker.kind === 'buy' ? 'B' : 'S',
-        },
-        // 直接悬停 pin 时的面板（坐标轴面板由下方的 chart tooltip 提供）。
-        tooltip: { formatter: markerPointTooltip(marker, currency) },
-        emphasis: { scale: 1.25 },
-      }));
+      .map((marker) => markerPointData(marker, currency));
 
     return {
       animation: false,

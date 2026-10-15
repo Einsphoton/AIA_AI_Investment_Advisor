@@ -31,6 +31,7 @@ import { compactFinancials } from '../datasources/financials.js';
 import { mapLimit } from '../datasources/http.js';
 import { fundInfo } from '../datasources/fund.js';
 import { computeBudgetStatus } from '../agent/budget.js';
+import { estimateTokens } from '../agent/context.js';
 import { compactHolding, computePosition, hasOpenPosition, round, sparkFrom, type CompactHolding } from '../agent/positions.js';
 import { executeTool, type AllowWrite } from '../agent/tools.js';
 import { readBriefing } from './briefing.js';
@@ -46,6 +47,21 @@ const MAX_ASSETS = 12;
 const MAX_WATCH_REFRESH = 20;
 /** 资产分析预取的财报期数（新 → 旧）：4 期足够看趋势，同时控制提示词 token。 */
 const FINANCIAL_PERIODS = 4;
+/**
+ * Hard ceiling for the pre-fetched payload handed to the model as one user
+ * message, measured in **estimated tokens** (the same estimator the context
+ * budget uses — a character cap would be misleading, since CJK costs ≈1 token per
+ * character while JSON numbers cost ≈1/4).
+ *
+ * The payload is the *first* user message and is exempt from compaction by design
+ * (see `agent/context.ts`): if it alone exceeds `llm.contextTokens` minus the
+ * output reserve, every subsequent request is over budget and no compaction can
+ * help — the model then sees a prompt it cannot fit and the run degrades. With 12
+ * holdings × (K线 + 三表 + 分红 + 资讯) the payload used to reach ≈120k tokens
+ * against a 48k window. 24k leaves room for the system prompt (~2.3k), the tool
+ * schemas (~2.2k) and the tool results the model still needs.
+ */
+const MAX_GOAL_PAYLOAD_TOKENS = 24_000;
 
 export interface SafeSettings {
   persona: Persona;
@@ -173,14 +189,47 @@ export async function collectInstrumentData(
   }
   warnings.push(...news.warnings);
 
+  return { data, warnings: [...new Set(warnings)] };
+}
+
+/**
+ * Macro snapshot, fetched **once** per pipeline run.
+ *
+ * It used to be pulled inside `collectInstrumentData`, i.e. once per holding —
+ * the same 13 indicators landed in the prompt N times (pure token waste on top of
+ * N redundant upstream calls, cached or not). The holding's industry context does
+ * not depend on the instrument, so it belongs at the top of the payload.
+ */
+export async function collectMacro(): Promise<Record<string, unknown>> {
   const macro = await ds.getMacro();
-  data.macro = {
+  return {
     items: macro.items.map((item) => `${item.label}=${item.value}${item.unit}(${item.period})`),
     indices: macro.indices.map((index) => `${index.name}=${index.price}(${index.changePct}%)`),
+    warnings: macro.warnings,
   };
-  if (macro.warnings.length > 0) warnings.push(...macro.warnings);
+}
 
-  return { data, warnings: [...new Set(warnings)] };
+/** Serializes the pre-fetched payload, dropping trailing holdings if it is too big. */
+function fitGoalPayload(payload: {
+  持仓数量: number;
+  投资性格: Record<string, unknown>;
+  预算: unknown;
+  宏观: unknown;
+  持仓明细: Array<{ 标的信息: unknown; 市场数据: Record<string, unknown>; 数据缺失: string[] }>;
+}): { json: string; droppedHoldings: number } {
+  let details = payload.持仓明细;
+  let json = JSON.stringify({ ...payload, 持仓明细: details });
+  let droppedHoldings = 0;
+  // Drop from the tail (the model is told, so nothing is silently lost). Each
+  // single holding is independently bounded by `collectInstrumentData`
+  // (20 K-line points / 3 news / 10 fund holdings / 4 statement periods), so the
+  // loop always terminates with a payload that fits.
+  while (estimateTokens(json) > MAX_GOAL_PAYLOAD_TOKENS && details.length > 1) {
+    details = details.slice(0, details.length - 1);
+    droppedHoldings += 1;
+    json = JSON.stringify({ ...payload, 持仓数量: details.length, 持仓明细: details });
+  }
+  return { json, droppedHoldings };
 }
 
 /** Runs the 资产分析 pipeline (writes `assets.ai_summary` + dashboard briefing). */
@@ -202,6 +251,13 @@ export async function runAssetAnalysis(context: PipelineContext): Promise<AgentR
   const truncated = pool.length > selected.length;
 
   logger.info(`asset analysis: ${selected.length} 个持仓，并行抓取数据`);
+  // Macro starts in parallel with the per-holding pulls, but is only fetched when
+  // there is something to analyse: an empty portfolio must not make the pipeline
+  // depend on the macro upstream being reachable (that also kept this path
+  // network-free for the hermetic pipeline tests).
+  const macroPromise = selected.length > 0
+    ? collectMacro().catch(() => ({ items: [], indices: [], warnings: ['宏观数据不可用'] }))
+    : null;
   const briefs = await mapLimit(selected, 3, async (holding) => {
     const asset = assets.find((row) => row.id === holding.id)!;
     try {
@@ -215,6 +271,7 @@ export async function runAssetAnalysis(context: PipelineContext): Promise<AgentR
       };
     }
   });
+  const macro = macroPromise ? await macroPromise : { items: [], indices: [], warnings: [] as string[] };
 
   const settings = safeSettings(repo);
   const persona = PERSONA_MAP[settings.persona];
@@ -236,25 +293,32 @@ export async function runAssetAnalysis(context: PipelineContext): Promise<AgentR
       剩余: market.remaining,
       已用尽: market.exhausted,
     })),
+    宏观: macro,
     持仓明细: briefs.map((brief) => ({
       标的信息: brief.holding,
       市场数据: brief.data,
       数据缺失: brief.warnings,
     })),
   };
+  const { json: payloadJson, droppedHoldings } = fitGoalPayload(payload);
 
   const goal = [
     '请对以下持仓逐项完成深度分析，并生成组合简报。',
     truncated ? `注意：持仓数量超过单次上限，本次仅提供前 ${MAX_ASSETS} 项。` : '',
+    droppedHoldings > 0
+      ? `注意：为控制上下文体积，已再省略最后 ${droppedHoldings} 项持仓的数据；如需分析请缩小持仓范围后另行发起分析。`
+      : '',
     '要求：',
     '1) 对每一项调用 save_asset_analysis 写回 ai_summary（Markdown，200-400 字）：趋势与量价、估值水平（引用 PE/PB/ROE 等具体数值）、**财报分析（营收与归母净利同比、毛利率/ROE 的跨期变化、经营现金流与净利润是否匹配、资产负债率与商誉/应收排雷，必须引用 financials 里的多期数字）**、基金质量（场外基金看净值/阶段收益/持仓）、消息面与风险。',
     '2) 全部写回后调用 save_dashboard_briefing 写组合简报（200-500 字）：组合结构、行业集中度、风险敞口、需要关注的事件与 2-4 条可执行动作。',
     '3) 两份文本都按 Markdown 结构书写：`## 小标题` 分段、关键数字加粗、可对比的数据用表格；需要突出关键指标或数值分布时使用 metrics / chart 代码块（语法见系统提示的输出格式章节）。',
-    '4) 数据缺失（见「数据缺失」字段）必须在结论中明说，不得用 0 或编造数值填充；必要时调用工具补充（get_financials/get_series/get_fundamentals/get_fund_info/get_news/web_search/get_macro）。',
-    '5) 财报核对：market 数据里的 financials 已预取 4 期三表（A股为完整三表；港股现金流量表为总量口径；美股现金流量明细来自 SEC EDGAR）。若某张报表 available=false，必须按 unavailable 里的 reason 写明「数据缺失」，需要跨期更长趋势时再调用 get_financials（periods 最多 8）。注意 A 股/港股为年初至今累计口径，美股取的是累计季报口径，不得混用。',
-    '6) 财报趋势图：financials 里某标的的报表有 ≥3 期时，ai_summary 必须附一张 ```chart 趋势图（营业总收入 / 归母净利润 / 经营活动现金流量净额，categories 用报告期），json 合法且 categories 与各 series.data 等长；期数不足 3 期则不画。',
+    '4) **不要重复调工具抓已经给你的数据**：「市场数据」就是行情/K线/估值/财报/基金/分红/资讯工具的**真实返回结果**，「宏观」也已抓取，直接引用即可。只有下列情况才调用工具：(a) 需要更长财报期数（get_financials periods 最多 8）；(b) 需要补充分红、资讯或联网核对（get_news / web_search）；(c) 某个字段确实缺失且换个来源能补上。反复调用同一个已失败的只读工具会浪费轮次与 Token。',
+    '5) 数据缺失（见「数据缺失」字段）必须在结论中明说，不得用 0 或编造数值填充；每个缺失项只需说明一次，不要为了「补上」而反复重试同一个数据源。',
+    '6) 财报核对：market 数据里的 financials 已预取 4 期三表（A股为完整三表；港股现金流量表为总量口径；美股现金流量明细来自 SEC EDGAR）。若某张报表 available=false，必须按 unavailable 里的 reason 写明「数据缺失」。注意 A 股/港股为年初至今累计口径，美股取的是累计季报口径，不得混用。',
+    '7) 财报趋势图：financials 里某标的的报表有 ≥3 期时，ai_summary 必须附一张 ```chart 趋势图（营业总收入 / 归母净利润 / 经营活动现金流量净额，categories 用报告期），json 合法且 categories 与各 series.data 等长；期数不足 3 期则不画。',
+    '8) 轮次纪律：本运行轮次有限，请**先写回已完成的分析**再继续下一项，不要在结论写回前做无穷尽的补充检索。',
     '以下是已抓取好的市场数据 JSON：',
-    JSON.stringify(payload),
+    payloadJson,
   ]
     .filter(Boolean)
     .join('\n');
@@ -336,6 +400,21 @@ export async function refreshWatchlistPrices(context: PipelineContext): Promise<
   return { updated, failed };
 }
 
+/**
+ * Trims a long Markdown text written by the app itself before re-sending it in a
+ * prompt.
+ *
+ * The watchlist goal used to embed every item's **full previous `aiSummary`**:
+ * in a 6-item pool that was 14,813 of the payload's 25,754 characters (58%), and
+ * it is re-sent on every turn. The conclusion's first line is what the model
+ * actually reasons about; the rest is retrievable with `list_watchlist`.
+ */
+export function trimForPrompt(text: string, maxChars: number): string {
+  const clean = text.trim();
+  if (clean.length <= maxChars) return clean;
+  return `${clean.slice(0, maxChars)}…（已截断，原文 ${clean.length} 字，如需全文请调用 list_watchlist）`;
+}
+
 /** Runs the 标的分析 pipeline (search → screen → deep-dive → upsert → 淘汰复核). */
 export async function runWatchlistAnalysis(context: PipelineContext): Promise<AgentRun> {
   const { repo, agent, logger, sink } = context;
@@ -360,7 +439,7 @@ export async function runWatchlistAnalysis(context: PipelineContext): Promise<Ag
     expectedReturn: item.expectedReturn,
     expectedReturnHorizon: item.expectedReturnHorizon,
     thesis: item.thesis,
-    aiSummary: item.aiSummary,
+    aiSummary: trimForPrompt(item.aiSummary, 240),
     note: item.note,
     status: item.status,
     retiredReason: item.retiredReason,
@@ -391,6 +470,8 @@ export async function runWatchlistAnalysis(context: PipelineContext): Promise<Ag
     '2) 用 market_search 确认代码与市场，用 get_quote 初筛（流动性、估值、涨跌幅），明显不合格的直接淘汰。',
     '3) 对通过初筛的候选做深度分析（get_financials 三表至少 4 期 / get_series / get_fundamentals / get_fund_info / get_dividends / get_news）。**基本面判断必须基于财报数字**：营收与归母净利同比、毛利率与 ROE 的跨期方向、经营现金流与净利润是否匹配、资产负债率与商誉/应收风险。',
     `4) 对每个合格候选调用 upsert_watch_item（quality_score 0-100、target_price、expected_return、expected_return_horizon、thesis、ai_summary）；quality_score 低于 ${persona.qualityGate} 的不要写入；最多新增 ${settings.watchlistCandidateLimit} 个。`,
+    '4.1) **只对新候选做深度取数**：既有标的的价格与结论已在上面的「既有标的」里给出，不要为了复核它们重复调用 get_quote / get_series / get_financials；只有结论确实需要更新时才调用写工具。',
+    '4.2) **同一个只读工具连续失败两次就不要再来第三次**（尤其是 get_series / get_fundamentals 返回 no_data）：工具报错里会带「数据源尝试」列表，说明是哪个上游失败。此时应在报告中写明「数据缺失：<指标>——<失败原因>」并继续，用已有数据或其它来源（get_financials / get_news / web_search）替代。',
     '5) 给出 target_price / expected_return 时必须同时给出 expected_return_horizon（例如「6-12 个月」「1-3 年」），期限要与收益口径一致（短线题材不要写「1-3 年」）。',
     '5.1) 【重要】每确认一个候选就**立刻**调用 upsert_watch_item 写回，不要攒到最后统一写 —— 轮次预算有限，实测出现过「研究完候选但轮次用尽、一个字都没写回」的情况。先写回，再研究下一个。',
     '6) 类型判定：market_search 对场外基金可能返回 type=etf（东财 suggest 的历史问题）。名称含「混合 / 债券 / 联接 / 发起式 / 定期开放 / 货币」的一律按场外基金处理：用 type=fund 再调 get_quote 与 get_fund_info 复核；type=etf 会命中同代码的股票（000001 场外基金 vs 平安银行），写入前必须核对 get_quote 返回的名称与搜索名称一致。',

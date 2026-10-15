@@ -12,7 +12,7 @@ import { INSTRUMENT_TYPES, INSTRUMENT_TYPE_LABELS, MARKETS, MARKET_LABELS } from
 import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { toApiError, useAsync, useDebounced } from '../api/hooks';
-import { fmtDate, fmtMoney, fmtPct, fmtPrice, fmtShares, fmtSignedMoney, pnlClass } from '../format';
+import { fmtDate, fmtDateTime, fmtMoney, fmtPct, fmtPrice, fmtShares, fmtSignedMoney, pnlClass } from '../format';
 import {
   Alert,
   Badge,
@@ -22,6 +22,7 @@ import {
   Dropdown,
   Empty,
   ErrorAlert,
+  HoverTip,
   Input,
   InstrumentTypeTag,
   Loading,
@@ -31,6 +32,7 @@ import {
   useToast,
 } from '../components/ui';
 import { Sparkline } from '../components/charts/Sparkline';
+import { Markdown, markdownSummary, markdownVerdict } from '../components/markdown/Markdown';
 import { AssetDetailDialog } from './AssetDetailDialog';
 import { AssetCreateDialog, AssetEditDialog } from './AssetFormDialog';
 
@@ -98,6 +100,40 @@ function buildGroups(items: AssetSummary[], mode: GroupMode): AssetGroup[] {
         : `${groupItems.length} 个标的`;
     return { key, label: labelOf(key), caption, items: groupItems };
   });
+}
+
+/**
+ * 「AI 建议」列：判定胶囊 + 一行纯文本摘要 + 悬浮浮窗里的完整报告。
+ *
+ * 这一列以前直接把 `aiSummary` 原文塞进 `<div className="truncate">`，用户看到
+ * 的是裸露语法标记的「素 Markdown」（`**结论**：入选。`）；而列宽又放不下全文。
+ * 现在改成：列表里只留剥掉标记的摘要 + 自动提取的判定胶囊（买入 / 入选 /
+ * 观望 / 回避），全文在悬浮浮窗里复用报告渲染器（标题层级、指标条、结论卡）
+ * 按 Markdown 渲染。浮窗用 portal 挂到 body，不会被表格横向滚动裁掉。
+ */
+export function AiAdviceCell({ asset }: { asset: AssetSummary }) {
+  const summary = useMemo(() => markdownSummary(asset.aiSummary, 56), [asset.aiSummary]);
+  const verdict = useMemo(() => markdownVerdict(asset.aiSummary), [asset.aiSummary]);
+  if (!asset.aiSummary.trim()) {
+    return (
+      <span className="mute" title="尚未生成 AI 分析：可运行上方「AI 资产分析」">
+        —
+      </span>
+    );
+  }
+  return (
+    <HoverTip
+      label={`查看完整 AI 分析：${asset.name}`}
+      title={`${asset.name} · AI 分析${asset.aiSummaryAt ? ` · ${fmtDateTime(asset.aiSummaryAt)}` : ''}`}
+      content={<Markdown text={asset.aiSummary} variant="compact" />}
+    >
+      <span className="ai-brief">
+        {verdict && <span className={`md-verdict tone-${verdict.tone}`}>{verdict.text}</span>}
+        <span className="hovertip-clamp">{summary}</span>
+        <span className="hovertip-more">悬浮 / 点击查看全文</span>
+      </span>
+    </HoverTip>
+  );
 }
 
 export function AssetsPage() {
@@ -388,9 +424,7 @@ export function AssetsPage() {
                             )}
                           </td>
                           <td>
-                            <div className="truncate tiny muted" style={{ maxWidth: 220 }} title={asset.aiSummary || '尚未生成 AI 分析'}>
-                              {asset.aiSummary || '—'}
-                            </div>
+                            <AiAdviceCell asset={asset} />
                           </td>
                           <td>
                             <div className="truncate tiny muted" style={{ maxWidth: 150 }} title={asset.note || '无备注'}>

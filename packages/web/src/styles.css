@@ -866,6 +866,14 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   background: var(--gold-400);
   transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1);
 }
+/* 推理进度条的终态配色：跑完 = 绿，失败 = 红，中断 = 灰（默认金色 = 进行中）。 */
+.progress-ok .progress-bar { background: var(--neg); }
+.progress-error .progress-bar { background: var(--pos); }
+.progress-muted .progress-bar { background: var(--text-mute); }
+.run-progress-label.running { color: var(--gold-300); }
+.run-progress-label.done { color: var(--neg); }
+.run-progress-label.error { color: var(--pos); }
+.run-progress-label.stopped { color: var(--text-mute); }
 
 .typing-dot {
   display: inline-block; width: 6px; height: 6px; border-radius: 99px;
@@ -1445,6 +1453,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   color: var(--text-dim);
 }
 .hovertip-more { display: block; margin-top: 3px; font-size: 10.5px; letter-spacing: 0.06em; color: var(--gold-400); }
+
+/* 「我的资产」AI 建议列：判定胶囊 + 两行摘要（全文在浮窗里按 Markdown 渲染）。 */
+.ai-brief { display: block; max-width: 230px; }
+.ai-brief .md-verdict { margin-left: 0; margin-bottom: 3px; }
 
 .hovertip {
   position: fixed;

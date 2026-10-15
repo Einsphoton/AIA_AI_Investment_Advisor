@@ -339,6 +339,14 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
   const allTools = llmToolSchemas(request.kind, [...allowWrites]);
   const withdrawn = new Set<string>();
   const failureCounts = new Map<string, number>();
+  /**
+   * `tool\u0000args` → how many times this exact read-only call already returned
+   * a result in this run (see the dedupe branch in `runCall`). Only successful
+   * calls are recorded, so a retry after a transient failure is still executed.
+   */
+  const repeatCounts = new Map<string, number>();
+  /** Keys currently executing, so two identical calls in one batch cannot both run. */
+  const reservedKeys = new Set<string>();
 
   let turns = 0;
   let promptTokens = 0;
@@ -449,6 +457,19 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
 
       promptTokens += result.promptTokens;
       completionTokens += result.completionTokens;
+      // Flush the running totals after every turn. The loop used to persist usage
+      // only in the final `updateRun`, so a run killed mid-flight (Ctrl-C,
+      // container restart) kept `turns=0, prompt_tokens=0` forever while its steps
+      // proved the spend — three such rows hid 1.17M prompt tokens (22% of this
+      // instance's recorded cost) from the UI. Best effort: accounting must never
+      // break a run.
+      try {
+        repo.updateRun(runId, { turns, promptTokens, completionTokens });
+      } catch (error) {
+        deps.logger.warn(
+          `failed to persist token accounting of run ${runId} after turn ${turns}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       const resultText = result.content.trim();
       if (resultText) latestText = resultText;
       finishStep(
@@ -486,12 +507,52 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
         call: (typeof calls)[number],
       ): Promise<{ call: (typeof calls)[number]; content: string } | null> => {
         const name = call.function.name;
+        const rawArgs = call.function.arguments ?? '{}';
         let parsedArgs: unknown = {};
         try {
           parsedArgs = call.function.arguments ? (JSON.parse(call.function.arguments) as unknown) : {};
         } catch {
           parsedArgs = { _raw: truncate(call.function.arguments, 200) };
         }
+
+        // D5: an identical read-only call already made in this run is answered
+        // from that first result instead of being executed — and paid for — again.
+        // The model legitimately re-requests data it was handed pre-fetched
+        // (measured: 12 of 17 read calls in one asset run duplicated the payload,
+        // 41% of that run's prompt tokens), and each repeat also re-added the full
+        // body to the transcript. Write tools are never short-circuited: a second
+        // identical `create_advice` is a real (if wrong) mutation attempt.
+        //
+        // `reservedKeys` covers the *same batch*: two identical calls emitted in one
+        // assistant message both start before either finishes, so the completed
+        // counter alone would let the duplicate through.
+        const dedupeKey = `${name}\u0000${rawArgs}`;
+        const dedupeEligible = riskOfTool(name) !== 'write';
+        const alreadyDone = dedupeEligible && repeatCounts.has(dedupeKey);
+        const alreadyReserved = dedupeEligible && !alreadyDone && reservedKeys.has(dedupeKey);
+        if (alreadyDone || alreadyReserved) {
+          const seen = (repeatCounts.get(dedupeKey) ?? 0) + 1;
+          if (alreadyDone) repeatCounts.set(dedupeKey, seen);
+          const content = `[未再次执行] 本次运行中 ${name} 已用完全相同的参数调用过，结果与上文一致，不再重复执行。请直接引用上文结果；如果你需要不同的数据，请改变参数（例如不同的代码、区间或报告期）。`;
+          const repeatStep = addStep(
+            `跳过重复工具 ${name}`,
+            alreadyReserved ? '同一轮内的重复调用' : `与之前相同的调用（第 ${seen} 次）`,
+            { name, args: rawArgs },
+          );
+          safeEmit(request.sink, { type: 'tool-call', runId, id: call.id, name, args: parsedArgs });
+          safeEmit(request.sink, {
+            type: 'tool-result',
+            runId,
+            id: call.id,
+            name,
+            ok: true,
+            summary: `跳过重复调用（${name}，参数未变）`,
+          });
+          finishStep(repeatStep, 'done', '参数与之前完全相同，复用已有结果', content);
+          return { call, content };
+        }
+        if (dedupeEligible) reservedKeys.add(dedupeKey);
+
         const toolStep = addStep(
           `调用工具 ${name}`,
           typeof parsedArgs === 'object' && parsedArgs !== null
@@ -516,7 +577,14 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
 
         if (outcome.ok) {
           failureCounts.set(name, 0);
+          if (dedupeEligible) {
+            reservedKeys.delete(dedupeKey);
+            repeatCounts.set(dedupeKey, (repeatCounts.get(dedupeKey) ?? 0) + 1);
+          }
         } else {
+          // A failed call is not a reusable result: release the reservation so a
+          // later retry with the same arguments is really executed.
+          if (dedupeEligible) reservedKeys.delete(dedupeKey);
           const count = (failureCounts.get(name) ?? 0) + 1;
           failureCounts.set(name, count);
           if (count >= 3) {

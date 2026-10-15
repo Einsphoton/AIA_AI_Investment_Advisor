@@ -1133,9 +1133,11 @@ export const LLM_RETRY_BASE_MS = 800;
  * Retries for an **empty completion** (no content and no tool calls).
  *
  * A blank turn is a gateway hiccup, not an answer — production saw a 129k-token
- * advice stage die on one blank turn and lose the whole batch. Retrying is far
- * cheaper than throwing the stage away.
+ * advice stage die on one blank turn and lose the whole batch (and the same
+ * happened again on 2026-10-15: run `381bd718` died on turn 7 after 129,183
+ * prompt tokens). Retrying is far cheaper than throwing the stage away, so the
+ * retry budget is deliberately generous compared with the network retries.
  */
-export const LLM_MAX_EMPTY_RETRIES = 2;
+export const LLM_MAX_EMPTY_RETRIES = 4;
 /** Base delay before retrying an empty completion (linear in the retry index). */
 export const LLM_EMPTY_RETRY_BASE_MS = 400;

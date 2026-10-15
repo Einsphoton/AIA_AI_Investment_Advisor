@@ -42,7 +42,7 @@ import { emFinancials } from './financials.js';
 import { keyedFundamentals, keyedQuote, keyedSeries } from './keyed.js';
 import { macroBundle, macroReport } from './macro.js';
 import { newsSearch } from './news.js';
-import { tencentBatch, tencentQuote } from './tencent.js';
+import { normalizeUsTicker, tencentBatch, tencentFundamentals, tencentQuote, tencentSeries } from './tencent.js';
 import { tryText, errorMessage, clearHttpCache } from './http.js';
 import type {
   DataSourceSlot,
@@ -106,6 +106,22 @@ function usable(provider: SourceId): boolean {
   return providerKey(provider).length > 0;
 }
 
+/**
+ * Collapses an upstream failure into one readable line.
+ *
+ * `UpstreamHttpError.message` embeds up to 160 characters of the response body,
+ * and a gateway outage answers with a whole HTML error page. Those warnings are
+ * surfaced twice — in the activity timeline **and** in the `数据缺失` list of the
+ * prompt — so the raw markup was pure noise in both.
+ */
+export function condenseUpstreamError(message: string): string {
+  const flat = message.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const [head = '', ...rest] = flat.split('::');
+  const detail = rest.join(' ').trim();
+  const line = detail ? `${head.trim()}（${detail.slice(0, 90)}）` : head.trim();
+  return line.slice(0, 200);
+}
+
 function byPriority(providers: SourceId[]): SourceId[] {
   return [...providers].sort(
     (a, b) => (SOURCE_CATALOGUE_MAP[a]?.priority ?? 99) - (SOURCE_CATALOGUE_MAP[b]?.priority ?? 99),
@@ -123,9 +139,13 @@ export function providerChain(slot: DataSourceSlot, kind: 'quote' | 'series' | '
 
   let base: SourceId[];
   if (kind === 'fundamentals') {
-    base = ['eastmoney', 'alphavantage', 'finnhub', 'fmp'];
+    base = ['eastmoney', 'tencent', 'alphavantage', 'finnhub', 'fmp'];
   } else if (kind === 'series') {
-    base = ['eastmoney', 'finnhub', 'alphavantage'];
+    // `tencent` MUST be in the series chain: it is the only other zero-key K-line
+    // source, and Eastmoney's `push2his` host is unreachable from some networks
+    // (实测 HTTP 502 / 连接失败)。此前链里只有 eastmoney，该主机一挂
+    // `get_series` 就对所有标的返回 no_data。
+    base = ['eastmoney', 'tencent', 'finnhub', 'alphavantage'];
   } else if (isFundSlot) {
     base = ['eastmoney-fund'];
   } else {
@@ -148,6 +168,13 @@ export interface QuoteRequest {
   code: string;
   market: Market;
   type?: InstrumentType;
+  /**
+   * Receives the degradation notes even when **every** provider fails (the
+   * `null` return discards the `Sourced.warnings` otherwise, so the caller could
+   * not tell「代码不存在」from「数据源全部不可用」and the UI/model only ever saw
+   * a generic `no_data`).
+   */
+  onWarnings?: (warnings: string[]) => void;
 }
 
 /**
@@ -171,16 +198,19 @@ export async function getQuote(request: QuoteRequest): Promise<Sourced<Quote> | 
 
   for (const provider of providerChain(slot, 'quote')) {
     try {
-      const result = await quoteFromProvider(provider, market, code, slot);
+      const result = await quoteFromProvider(provider, market, code, slot, (message) =>
+        warnings.push(`${provider} 报价失败：${condenseUpstreamError(message)}`),
+      );
       if (result && result.quote.name) {
         sources.push(provider);
         return { value: result.quote, sources, warnings };
       }
       warnings.push(`${provider} 未返回报价（${code}/${market}）`);
     } catch (error) {
-      warnings.push(`${provider} 报价失败：${errorMessage(error)}`);
+      warnings.push(`${provider} 报价失败：${condenseUpstreamError(errorMessage(error))}`);
     }
   }
+  request.onWarnings?.(warnings);
   return null;
 }
 
@@ -189,10 +219,11 @@ async function quoteFromProvider(
   market: Market,
   code: string,
   slot: DataSourceSlot,
+  onError: (message: string) => void,
 ): Promise<ProviderQuote | null> {
   switch (provider) {
     case 'eastmoney':
-      return emQuote(market, code);
+      return emQuote(market, code, onError);
     case 'tencent':
       return tencentQuote(market, code);
     case 'finnhub':
@@ -256,7 +287,16 @@ export async function getSeries(query: SeriesQuery): Promise<Sourced<SeriesRespo
   const slot = slotFor(market, type);
   for (const provider of providerChain(slot, 'series')) {
     try {
-      const result = await seriesFromProvider(provider, market, code, type, query.range, query.interval, slot);
+      const result = await seriesFromProvider(
+        provider,
+        market,
+        code,
+        type,
+        query.range,
+        query.interval,
+        slot,
+        (message) => warnings.push(`${provider} K线失败：${condenseUpstreamError(message)}`),
+      );
       if (result && result.series.points.length > 0) {
         sources.push(provider);
         const merged = { ...result.series, warnings: [...result.series.warnings, ...warnings] };
@@ -264,9 +304,12 @@ export async function getSeries(query: SeriesQuery): Promise<Sourced<SeriesRespo
       }
       warnings.push(`${provider} 未返回 ${query.interval} K线（${code}/${market}）`);
     } catch (error) {
-      warnings.push(`${provider} K线失败：${errorMessage(error)}`);
+      warnings.push(`${provider} K线失败：${condenseUpstreamError(errorMessage(error))}`);
     }
   }
+  // Expose *why* every provider failed — otherwise the caller (and the user) only
+  // sees a generic `no_data` and cannot tell a bad symbol from a dead upstream.
+  query.onWarnings?.(warnings);
   return null;
 }
 
@@ -278,10 +321,13 @@ async function seriesFromProvider(
   range: SeriesQuery['range'],
   interval: SeriesQuery['interval'],
   _slot: DataSourceSlot,
+  onError: (message: string) => void,
 ): Promise<ProviderSeries | null> {
   switch (provider) {
     case 'eastmoney':
-      return emSeries(market, code, type, range, interval);
+      return emSeries(market, code, type, range, interval, onError);
+    case 'tencent':
+      return tencentSeries(market, code, range, interval, type);
     case 'finnhub':
     case 'alphavantage':
       return keyedSeries(provider, market, code, range, interval, providerKey(provider));
@@ -355,6 +401,8 @@ export interface FundamentalsRequest {
   market: Market;
   type?: InstrumentType;
   name?: string;
+  /** See {@link QuoteRequest.onWarnings}. */
+  onWarnings?: (warnings: string[]) => void;
 }
 
 /** Financial/fundamental indicators with provider degradation. */
@@ -367,18 +415,29 @@ export async function getFundamentals(request: FundamentalsRequest): Promise<Sou
   const warnings: string[] = [];
   for (const provider of providerChain(slot, 'fundamentals')) {
     try {
+      // Tencent derives PE/PB from its quote record, which for an ETF carries
+      // fund-scale fields (实测 510880 的「PB」=3.85，与该 ETF 的净资产口径无关).
+      // Publishing that as 市净率 would put a fabricated number into a report, so
+      // the fallback is restricted to stocks; Eastmoney F10 is still tried first.
+      if (provider === 'tencent' && type === 'etf') {
+        warnings.push('tencent 不提供 ETF 的公司基本面指标（不适用）');
+        continue;
+      }
       const value =
         provider === 'eastmoney'
           ? await emFundamentals(market, code, request.name ?? '')
-          : await keyedFundamentals(provider, market, code, providerKey(provider));
+          : provider === 'tencent'
+            ? await tencentFundamentals(market, code, request.name ?? '')
+            : await keyedFundamentals(provider, market, code, providerKey(provider));
       if (value && value.metrics.length > 0) {
         return { value, sources: [provider], warnings };
       }
       warnings.push(`${provider} 未返回基本面指标（${code}/${market}）`);
     } catch (error) {
-      warnings.push(`${provider} 基本面失败：${errorMessage(error)}`);
+      warnings.push(`${provider} 基本面失败：${condenseUpstreamError(errorMessage(error))}`);
     }
   }
+  request.onWarnings?.(warnings);
   return null;
 }
 
@@ -549,12 +608,37 @@ function exchangeLabel(market: Market, code: string, type: InstrumentType): stri
   return '深A';
 }
 
-/** HK codes are 5 digits upstream; keep the user's format but pad when needed. */
+/**
+ * Per-market code normalization.
+ *
+ * HK codes are 5 digits upstream; keep the user's format but pad when needed.
+ * US tickers are spelled inconsistently (`BRK-B` / `BRK_B` / `BRKB` / `BRK.B`) —
+ * production burned 4 `get_quote` calls on `US/BRK-B`, `US/BRK-A`, `US/BRKB` and
+ * `US/BRK_B`, all `no_data`. Any explicit separator is folded to the dotted form
+ * both providers accept.
+ *
+ * The **dashless** spelling is only mapped for an exact known set: `BRKB` and
+ * `BRKR` are indistinguishable by shape (`BRK` + one letter), and rewriting a
+ * real ticker would be far worse than leaving `BRKB` unresolved — an earlier
+ * shape-based rule turned `BRKR` (Bruker Corp, a listed Nasdaq ticker) into the
+ * nonexistent `BRK.R`.
+ */
 export function normalizeCode(market: Market, code: string): string {
   const clean = code.trim().toUpperCase();
   if (market === 'HK' && /^\d{1,4}$/.test(clean)) return clean.padStart(5, '0');
+  if (market === 'US') {
+    const dotted = normalizeUsTicker(clean);
+    if (dotted !== clean) return dotted;
+    return DASHLESS_US_CLASS_SHARES.get(clean) ?? clean;
+  }
   return clean;
 }
+
+/** Exact dashless class-share spellings seen in the wild (never guess by shape). */
+const DASHLESS_US_CLASS_SHARES = new Map([
+  ['BRKB', 'BRK.B'],
+  ['BRKA', 'BRK.A'],
+]);
 
 /* ─────────────────────────────── indices ────────────────────────────────── */
 

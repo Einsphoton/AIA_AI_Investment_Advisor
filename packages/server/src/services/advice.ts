@@ -12,7 +12,7 @@ import { AppError } from '../errors.js';
 import type { Repo } from '../types/repo.js';
 import { budgetLine, computeBudgetStatus } from '../agent/budget.js';
 import { compactHolding, round } from '../agent/positions.js';
-import { runAssetAnalysis, runWatchlistAnalysis, safeSettings, type PipelineContext } from './analytics.js';
+import { runAssetAnalysis, runWatchlistAnalysis, safeSettings, trimForPrompt, type PipelineContext } from './analytics.js';
 
 export interface FullPipelineOptions {
   skipAsset?: boolean;
@@ -44,7 +44,10 @@ export async function runAdvice(context: PipelineContext): Promise<AgentRun> {
     expectedReturn: item.expectedReturn,
     expectedReturnHorizon: item.expectedReturnHorizon,
     thesis: item.thesis,
-    aiSummary: item.aiSummary,
+    // The full previous conclusion is re-sent on every turn; only its leading
+    // judgement matters for advice generation, and 200+ characters of prose per
+    // item dominated this goal (see `trimForPrompt` in ./analytics.js).
+    aiSummary: trimForPrompt(item.aiSummary, 240),
   }));
 
   const exhausted = budget.markets.filter((market) => market.exhausted);

@@ -213,6 +213,85 @@ test('P2: 同一轮里的读/外部工具并发执行，写工具作为屏障保
   }
 });
 
+/* ── D5: identical read-only calls are not paid for twice ──────────────────── */
+
+/** Turn 1: the same read call twice (different ids) + one genuinely different call. */
+function writeRepeatedReadTurn(res: http.ServerResponse): void {
+  sseHead(res);
+  sse(res, { model: 'fake', choices: [{ delta: { content: '核查中。' }, finish_reason: null }] });
+  sse(res, {
+    model: 'fake',
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            { index: 0, id: 'call_1', type: 'function', function: { name: 'fake_rep', arguments: '{"code":"600938"}' } },
+            { index: 1, id: 'call_2', type: 'function', function: { name: 'fake_rep', arguments: '{"code":"600938"}' } },
+            { index: 2, id: 'call_3', type: 'function', function: { name: 'fake_rep', arguments: '{"code":"600519"}' } },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  });
+  sse(res, { model: 'fake', choices: [{ delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 10, completion_tokens: 5 } });
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+test('D5: 同一运行内参数完全相同的只读调用只真正执行一次（重复调用不再花 Token）', { timeout: 30_000 }, async () => {
+  setToolInterceptor(null);
+  unregisterToolProvider('fake-io');
+  registerToolProvider({
+    id: 'fake-io',
+    tools: () => [
+      {
+        name: 'fake_rep',
+        description: '测试用重复调用',
+        parameters: { type: 'object', properties: { code: { type: 'string' } } },
+        risk: 'read',
+        source: 'test:fake',
+        async handler(args) {
+          trace.push({ name: `rep:${String(args.code)}`, startedAt: Date.now(), finishedAt: Date.now() });
+          return { ok: true, content: JSON.stringify({ code: args.code, payload: 'x'.repeat(500) }), summary: `${args.code} ok` };
+        },
+      },
+    ],
+  });
+
+  const fake = await startFakeLlm((requestNo, res) => (requestNo === 1 ? writeRepeatedReadTurn(res) : writeFinalTurn(res)));
+  repo.saveSettings({ llm: { baseUrl: fake.baseUrl, apiKey: 'test-key', model: 'fake', timeoutMs: 30_000 } });
+
+  try {
+    const run = await runAgent({ getRepo: () => repo, logger: silentLogger, dataDir: dir, providerKeys: {} }, {
+      kind: 'custom',
+      title: '重复调用去重',
+      goal: '核查同一个标的',
+    });
+
+    assert.equal(run.status, 'done', `run 应正常结束，实际 ${run.status} / ${run.error ?? ''}`);
+    // Same code twice → executed once; the different code → executed once.
+    assert.deepEqual(
+      trace.map((entry) => entry.name).sort(),
+      ['rep:600519', 'rep:600938'],
+      '参数相同的重复只读调用必须只执行一次',
+    );
+
+    // Every call still gets exactly one reply, so the transcript stays API-valid.
+    const toolMessages = repo.listRunMessages(run.id).filter((message) => message.role === 'tool');
+    assert.equal(toolMessages.length, 3, '三个 tool_call 都必须有结果（含跳过的那个）');
+    assert.equal(toolMessages[1]?.name, 'fake_rep', '被跳过的调用仍要有配对的 tool 消息');
+    assert.match(
+      String(toolMessages[1]?.content),
+      /未再次执行/,
+      '重复调用必须明确告知模型「已执行过、结果同上」',
+    );
+    assert.match(String(toolMessages[2]?.content), /600519/, '参数不同的调用必须真的执行');
+  } finally {
+    await fake.stop();
+  }
+});
+
 test('P2: external 工具返回被围栏标记，疑似注入内容会被点名', { timeout: 20_000 }, async () => {
   setToolInterceptor(null);
   unregisterToolProvider('fake-io');

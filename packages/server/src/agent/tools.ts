@@ -219,9 +219,15 @@ const getQuote: RegisteredTool = {
     const code = str(args, 'code');
     const market = marketArg(args);
     const type = typeArg(args);
-    const result = await ds.getQuote({ code, market, type });
+    const attemptWarnings: string[] = [];
+    const result = await ds.getQuote({ code, market, type, onWarnings: (list) => attemptWarnings.push(...list) });
     if (!result) {
-      return fail(`未能获取 ${market}/${code} 报价`, 'no_data', `所有数据源均未返回 ${market}/${code} 的报价，请确认代码与市场是否正确。`);
+      return fail(
+        `未能获取 ${market}/${code} 报价`,
+        'no_data',
+        `所有数据源均未返回 ${market}/${code} 的报价，请确认代码与市场是否正确。`,
+        attemptWarnings.length > 0 ? { 数据源尝试: attemptWarnings } : undefined,
+      );
     }
     return ok(`${result.value.name} ${result.value.price} ${result.value.currency}（${result.value.changePct}%）`, {
       quote: result.value,
@@ -259,9 +265,22 @@ const getSeries: RegisteredTool = {
     const interval = (['day', 'week', 'month'] as const).includes(intervalRaw as never)
       ? (intervalRaw as 'day' | 'week' | 'month')
       : 'day';
-    const result = await ds.getSeries({ code, market, type, range, interval });
+    const attemptWarnings: string[] = [];
+    const result = await ds.getSeries({
+      code,
+      market,
+      type,
+      range,
+      interval,
+      onWarnings: (list) => attemptWarnings.push(...list),
+    });
     if (!result || result.value.points.length === 0) {
-      return fail(`未能获取 ${market}/${code} 行情序列`, 'no_data', '数据源未返回该区间数据（可能是停牌、代码错误或上游失败）。');
+      return fail(
+        `未能获取 ${market}/${code} 行情序列`,
+        'no_data',
+        '数据源未返回该区间数据（可能是停牌、代码错误或上游失败）。',
+        attemptWarnings.length > 0 ? { 数据源尝试: attemptWarnings } : undefined,
+      );
     }
     const points = result.value.points;
     const closes = points.map((p) => p.close);
@@ -311,8 +330,27 @@ const getFundamentals: RegisteredTool = {
   async handler(args) {
     const code = str(args, 'code');
     const market = marketArg(args);
-    const result = await ds.getFundamentals({ code, market, type: typeArg(args) });
-    if (!result) return fail(`未能获取 ${market}/${code} 基本面`, 'no_data', '数据源未返回基本面指标。');
+    const type = typeArg(args);
+    const attemptWarnings: string[] = [];
+    const result = await ds.getFundamentals({
+      code,
+      market,
+      type,
+      onWarnings: (list) => attemptWarnings.push(...list),
+    });
+    if (!result) {
+      // An ETF/open-end fund has no corporate statements; saying so plainly is
+      // what stops the model from retrying the same dead end on every turn.
+      const isFundLike = type === 'etf' || type === 'fund';
+      return fail(
+        `未能获取 ${market}/${code} 基本面`,
+        'no_data',
+        isFundLike
+          ? 'ETF/场外基金没有公司基本面指标（PE/PB/ROE 等），请改用 get_quote（估值）、get_fund_info（基金质量）与 get_series（净值/价格走势）。'
+          : '数据源未返回基本面指标，请改用 get_financials 取财报，或 get_quote 取估值。不要重复调用本工具。',
+        attemptWarnings.length > 0 ? { 数据源尝试: attemptWarnings } : undefined,
+      );
+    }
     return ok(`${result.value.name} 基本面指标 ${result.value.metrics.length} 项`, {
       fundamentals: result.value,
       sources: result.sources,

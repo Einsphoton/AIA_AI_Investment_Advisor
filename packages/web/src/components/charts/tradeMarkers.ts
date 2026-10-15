@@ -82,6 +82,40 @@ export function markerPointTooltip(marker: MarkerInfo, currency = ''): string {
 }
 
 /**
+ * markPoint 数据项（买卖 pin）。K 线图与净值曲线共用，两边不再各抄一份。
+ *
+ * **`tooltip.trigger: 'item'` 不能省。** 两个图表的全局 tooltip 都是
+ * `trigger: 'axis'`；鼠标落在 pin 上时 ECharts 走的是
+ * `TooltipView._showSeriesItemTooltip`，它会把 `[数据项模型, markPoint 模型,
+ * 坐标系模型]` 与全局 tooltip 级联，再用**级联后**的 `trigger` 判断
+ * （echarts 6.1 `TooltipView.js` 中 `if (tooltipTrigger != null && tooltipTrigger
+ * !== 'item') return;`）。只写 `formatter` 时 `trigger` 会从全局继承到 `'axis'`
+ * 并直接 return —— pin 上既没有成交明细浮窗，轴提示也因为 pin 常常伸出坐标系
+ * （`coordSys.containPoint()` 为假、`dataByCoordSys.list` 为空 → hideTip）而
+ * 什么都不显示，这就是「悬浮买卖标签没有任何浮窗」。
+ *
+ * formatter 用**函数**而不是字符串：字符串会被当成 `{a}` 模板再走一遍 formatTpl。
+ */
+export function markerPointData(marker: MarkerInfo, currency = '') {
+  const buy = marker.kind === 'buy';
+  return {
+    name: buy ? '买入' : '卖出',
+    coord: [marker.date.slice(0, 10), marker.price],
+    value: buy ? '买' : '卖',
+    symbol: 'pin',
+    symbolSize: 34,
+    itemStyle: {
+      color: buy ? BUY : SELL,
+      shadowBlur: 14,
+      shadowColor: buy ? 'rgba(212,175,55,0.9)' : 'rgba(47,191,143,0.8)',
+    },
+    label: { color: INK, fontSize: 10, fontWeight: 'bold' as const, formatter: buy ? 'B' : 'S' },
+    tooltip: { trigger: 'item' as const, formatter: () => markerPointTooltip(marker, currency) },
+    emphasis: { scale: 1.25 },
+  };
+}
+
+/**
  * axis tooltip formatter：行情明细 + 当天全部买卖点。
  *
  * 用 `params[0].dataIndex` 回查原始点，而不是解析 ECharts 塞进 `data` 的

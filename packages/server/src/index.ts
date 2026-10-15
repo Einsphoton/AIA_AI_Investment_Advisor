@@ -13,6 +13,9 @@ import { setServices, setScheduler } from './registry.js';
 import { installToolInterceptor } from './agent/policy.js';
 import { initMcp, reloadMcpServers, shutdownMcp } from './services/mcp-manager.js';
 
+/** `run.error` written by the boot-time reconciliation of interrupted runs. */
+export const STALE_RUN_MESSAGE = '运行被中断（服务进程在本次分析结束前退出，重启后已标记为失败）。';
+
 async function main(): Promise<void> {
   ensureDataDirs();
 
@@ -33,6 +36,13 @@ async function main(): Promise<void> {
     dataDir: config.dataDir,
     providerKeys: { ...config.providerKeys },
   });
+
+  // A process that died mid-run leaves `status='running'` rows behind forever:
+  // they show up as zombie「运行中 / 报错」entries in the activity list and can
+  // never be finished (production had three of them). Nothing can still be
+  // running at boot, so reconcile before serving any request.
+  const staleRuns = repo.failStaleRuns(STALE_RUN_MESSAGE);
+  if (staleRuns > 0) app.log.warn({ staleRuns }, 'marked interrupted runs as error');
 
   setServices({ repo, agent });
 

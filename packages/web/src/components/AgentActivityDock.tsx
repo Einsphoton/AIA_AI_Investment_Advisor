@@ -18,12 +18,13 @@ import {
   summarizeEntities,
   summarizeMetrics,
 } from '../api/agentMetrics';
-import { RunTimeline } from './RunTimeline';
+import { RunTimeline, runTimelineState } from './RunTimeline';
 import { Badge, Button } from './ui';
 
-type DockStatus = 'running' | 'done' | 'error';
+/** 推理面板的状态：中断（没有 run-finished）不能算「已完成」。 */
+type DockStatus = 'running' | 'done' | 'error' | 'stopped';
 
-const STATUS_TEXT: Record<DockStatus, string> = { running: '推理中', done: '已完成', error: '失败' };
+const STATUS_TEXT: Record<DockStatus, string> = { running: '推理中', done: '已完成', error: '失败', stopped: '已中断' };
 
 export function AgentActivityDock() {
   const stream = useAgentStreamState();
@@ -63,7 +64,8 @@ export function AgentActivityDock() {
   const visible = !dismissed && (running || stream.steps.length > 0 || !!stream.finished || !!stream.error);
   if (!visible) return null;
 
-  const status: DockStatus = running ? 'running' : stream.finished?.status === 'error' || stream.error ? 'error' : 'done';
+  // 与进度条共用同一套终态判断：中断的运行不能被显示成「已完成」。
+  const status: DockStatus = runTimelineState(stream);
   const label = title || stream.title || 'AI 推理过程';
   const totals = summarizeMetrics(stream.metricsEvents);
   const latest = stream.metrics;
@@ -100,7 +102,9 @@ export function AgentActivityDock() {
         <strong className="agent-dock-title truncate" title={label}>
           {label}
         </strong>
-        <Badge tone={status === 'error' ? 'warn' : status === 'done' ? 'ok' : 'ai'}>{STATUS_TEXT[status]}</Badge>
+        <Badge tone={status === 'error' ? 'warn' : status === 'done' ? 'ok' : status === 'running' ? 'ai' : 'default'}>
+          {STATUS_TEXT[status]}
+        </Badge>
         <span className="agent-dock-actions">
           {running ? (
             <Button size="sm" variant="ghost" onClick={stream.cancel} title="中断本次运行">
@@ -115,7 +119,8 @@ export function AgentActivityDock() {
       </header>
 
       <div className="agent-dock-meta tiny mute">
-        {latest && <span>第 {latest.turn} 轮推理</span>}
+        {/* 结束后不能再写「第 4 轮推理」（读起来像还在跑），改成总轮次。 */}
+        {latest && <span>{running ? `第 ${latest.turn} 轮推理` : `共 ${latest.turn} 轮推理`}</span>}
         <span>{totals.requests} 次 LLM 请求</span>
         {elapsed !== null ? (
           <span>已运行 {fmtMilliseconds(elapsed)}</span>

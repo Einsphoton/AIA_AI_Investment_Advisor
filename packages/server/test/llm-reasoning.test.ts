@@ -18,6 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { LLM_MAX_EMPTY_RETRIES } from '@aia/shared';
+
 import { createRepo } from '../src/db/repo.js';
 import { runAgent } from '../src/agent/loop.js';
 import { hasReasoningContent, reasoningEchoFix, stripReasoningContent, type LlmMessage } from '../src/agent/llm.js';
@@ -382,7 +384,7 @@ test('兜底：连续空响应超过上限后如实失败，不会无限重试',
     const run = await runAgent(deps, { kind: 'custom', title: '空响应放弃', goal: '你好' });
     assert.equal(run.status, 'error');
     assert.match(run.error ?? '', /空响应/);
-    assert.equal(fake.requests(), 3, '必须封顶在 1 + LLM_MAX_EMPTY_RETRIES 次');
+    assert.equal(fake.requests(), 1 + LLM_MAX_EMPTY_RETRIES, '必须封顶在 1 + LLM_MAX_EMPTY_RETRIES 次');
   } finally {
     await fake.stop();
     closeAndRemove(repo, dir);

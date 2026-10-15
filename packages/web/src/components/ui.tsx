@@ -438,10 +438,16 @@ export function Alert({ tone = 'info', children }: { tone?: 'info' | 'warn' | 'e
   return <div className={`alert alert-${tone}`}>{children}</div>;
 }
 
-export function ProgressBar({ value, max = 100 }: { value: number; max?: number }) {
+/**
+ * 进度条。
+ *
+ * `tone` 只在「进度条本身要表达状态」时使用（例如推理面板跑完 / 失败 / 中断），
+ * 普通用量条保持默认金色。
+ */
+export function ProgressBar({ value, max = 100, tone = 'default' }: { value: number; max?: number; tone?: 'default' | 'ok' | 'error' | 'muted' }) {
   const pct = max <= 0 ? 0 : Math.min(100, Math.max(0, (value / max) * 100));
   return (
-    <div className="progress">
+    <div className={`progress${tone === 'default' ? '' : ` progress-${tone}`}`}>
       <div className="progress-bar" style={{ width: `${pct}%` }} />
     </div>
   );

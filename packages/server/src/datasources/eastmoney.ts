@@ -24,7 +24,7 @@ import {
   type SeriesResponse,
   type SourceId,
 } from '@aia/shared';
-import { httpJson, isoOrNull, round4, toNumber, tryJson } from './http.js';
+import { errorMessage, httpJson, isoOrNull, round4, toNumber, tryJson } from './http.js';
 import type { ProviderQuote, ProviderSeries, SearchHit, SearchOptions } from './types.js';
 
 const SOURCE: SourceId = 'eastmoney';
@@ -43,6 +43,18 @@ const QUOTE_FIELDS = [
 
 /* ─────────────────────────────── secid helpers ───────────────────────────── */
 
+/**
+ * Eastmoney's US class-share spelling is the **underscore** form: 实测
+ * `ulist.np/get?secids=106.BRK_B,…` resolves 伯克希尔哈撒韦-B while
+ * `106.BRK-B` / `106.BRK.B` / `106.BRKB` resolve nothing, and the suggest index
+ * only knows `BRK_B`. The rest of the app canonicalizes US tickers to the dotted
+ * form (that is what Tencent serves), so the translation lives here — at the
+ * provider boundary — instead of in the shared `normalizeCode`.
+ */
+export function emUsCode(code: string): string {
+  return code.trim().toUpperCase().replace(/[.\-\s]+/g, '_');
+}
+
 /** Eastmoney secid for a market/code pair. */
 export function emSecid(market: Market, code: string): string {
   const clean = code.trim().toUpperCase();
@@ -52,13 +64,41 @@ export function emSecid(market: Market, code: string): string {
     return `${prefix}.${clean}`;
   }
   if (market === 'HK') return `${EASTMONEY_MARKET_PREFIX.HK}.${clean.padStart(5, '0')}`;
-  return `${EASTMONEY_MARKET_PREFIX.US}.${clean}`;
+  return `${EASTMONEY_MARKET_PREFIX.US}.${emUsCode(clean)}`;
 }
 
-/** Fallback secids to try in order (US: NASDAQ → NYSE/AMEX; CN: 沪 → 深). */
+/**
+ * secids a US code has already resolved to, so the second candidate is not
+ * re-probed on every call. NYSE tickers only answer on `106.*` (实测 `105.WFC`
+ * never resolves), and the first call of a run used to pay for both — twice over,
+ * because `get_quote` and `get_series` each walked the full list.
+ */
+const resolvedUsSecids = new Map<string, string>();
+const MAX_RESOLVED_US = 200;
+
+/** Records which secid actually answered, promoting it for later calls. */
+export function rememberEmSecid(market: Market, code: string, secid: string): void {
+  if (market !== 'US') return;
+  const key = code.trim().toUpperCase();
+  if (resolvedUsSecids.get(key) === secid) return;
+  resolvedUsSecids.delete(key);
+  resolvedUsSecids.set(key, secid);
+  while (resolvedUsSecids.size > MAX_RESOLVED_US) {
+    const oldest = resolvedUsSecids.keys().next();
+    if (oldest.done) break;
+    resolvedUsSecids.delete(oldest.value);
+  }
+}
+
+/** Fallback secids to try in order (US: remembered → NASDAQ → NYSE/AMEX; CN: 沪 → 深). */
 export function emSecidCandidates(market: Market, code: string): string[] {
+  if (market === 'US') {
+    const clean = emUsCode(code);
+    const remembered = resolvedUsSecids.get(code.trim().toUpperCase());
+    const all = [`105.${clean}`, `106.${clean}`, `107.${clean}`];
+    return remembered ? [remembered, ...all.filter((secid) => secid !== remembered)] : all;
+  }
   const primary = emSecid(market, code);
-  if (market === 'US') return [primary, `106.${code.trim().toUpperCase()}`, `107.${code.trim().toUpperCase()}`];
   if (market === 'CN') return [primary, primary.startsWith('1.') ? `0.${code}` : `1.${code}`];
   return [primary];
 }
@@ -117,17 +157,35 @@ function mapEmQuote(data: EmQuoteData, market: Market, code: string): Quote {
   };
 }
 
-/** Real-time quote with valuation fields. Returns null when the symbol is unknown. */
-export async function emQuote(market: Market, code: string): Promise<ProviderQuote | null> {
+/**
+ * Real-time quote with valuation fields. Returns null when the symbol is unknown.
+ *
+ * `onError` receives the transport failure of each attempt. Without it the error
+ * was swallowed by `tryJson`, so an upstream outage was reported as the benign
+ * 「未返回报价」 — the reader (and the UI) could not tell a dead host from a bad
+ * symbol. 实测本次生产事故里 push2 返回 502 / 连接被重置，全部被记成了后者。
+ */
+export async function emQuote(
+  market: Market,
+  code: string,
+  onError?: (message: string) => void,
+): Promise<ProviderQuote | null> {
   for (const secid of emSecidCandidates(market, code)) {
     const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${encodeURIComponent(secid)}&fields=${QUOTE_FIELDS}`;
-    const json = await tryJson<{ data?: EmQuoteData | null }>(url, {
-      headers: { Referer: REFERER },
-      cacheTtlMs: QUOTE_TTL_MS,
-      cacheKey: `em:quote:${secid}`,
-    });
+    let json: { data?: EmQuoteData | null } | null = null;
+    try {
+      json = await httpJson<{ data?: EmQuoteData | null }>(url, {
+        headers: { Referer: REFERER },
+        cacheTtlMs: QUOTE_TTL_MS,
+        cacheKey: `em:quote:${secid}`,
+      });
+    } catch (error) {
+      onError?.(errorMessage(error));
+      continue;
+    }
     const data = json?.data;
     if (!data || typeof data.f58 !== 'string' || !data.f58) continue;
+    rememberEmSecid(market, code, secid);
     return { quote: mapEmQuote(data, market, code), source: SOURCE };
   }
   return null;
@@ -199,7 +257,8 @@ function emBegDate(range: RangeKey): string {
 
 /**
  * Historical K-line. Returns null when unavailable (caller degrades to the next
- * provider and records a warning).
+ * provider and records a warning). `onError` reports transport failures instead of
+ * letting `tryJson` turn an outage into a silent「没数据」.
  */
 export async function emSeries(
   market: Market,
@@ -207,6 +266,7 @@ export async function emSeries(
   type: InstrumentType,
   range: RangeKey,
   interval: BarInterval,
+  onError?: (message: string) => void,
 ): Promise<ProviderSeries | null> {
   for (const secid of emSecidCandidates(market, code)) {
     const klt = KLT[interval];
@@ -215,12 +275,21 @@ export async function emSeries(
       `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${encodeURIComponent(secid)}` +
       `&klt=${klt}&fqt=1&fields1=f1,f2,f3,f4,f5,f6` +
       `&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&beg=${beg}&end=20500101&lmt=10000`;
-    const json = await tryJson<{
-      data?: { code?: string; market?: number; name?: string; decimal?: number; klines?: string[] } | null;
-    }>(url, { headers: { Referer: REFERER }, cacheTtlMs: SERIES_TTL_MS, cacheKey: `em:kline:${secid}:${klt}:${beg}` });
+    let json: { data?: { code?: string; market?: number; name?: string; decimal?: number; klines?: string[] } | null } | null;
+    try {
+      json = await httpJson(url, {
+        headers: { Referer: REFERER },
+        cacheTtlMs: SERIES_TTL_MS,
+        cacheKey: `em:kline:${secid}:${klt}:${beg}`,
+      });
+    } catch (error) {
+      onError?.(errorMessage(error));
+      continue;
+    }
     const data = json?.data;
     const lines = data?.klines;
     if (!data || !Array.isArray(lines) || lines.length === 0) continue;
+    rememberEmSecid(market, code, secid);
 
     const resolvedMarket: Market = data.market === 116 ? 'HK' : data.market === 105 || data.market === 106 || data.market === 107 ? 'US' : market;
     const points: SeriesPoint[] = [];

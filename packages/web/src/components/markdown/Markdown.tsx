@@ -34,6 +34,7 @@ import {
   parseMarkdown,
   plainText,
   percentOf,
+  toPlainText,
   toneOf,
   type Block,
   type ChartSpec,
@@ -152,6 +153,64 @@ function verdictOf(nodes: Inline[]): { text: string; tone: string } | null {
   for (const rule of VERDICTS) {
     const match = rule.test.exec(text);
     if (match) return { text: match[1]!, tone: rule.tone };
+  }
+  return null;
+}
+
+/* ───────────────── 列表里的「一行摘要 + 判定胶囊」 ───────────────── */
+
+/**
+ * 从 Markdown 正文抽出可放进表格单元格的一行纯文本摘要。
+ *
+ * 列表列宽有限，直接把 `**结论**：入选。` 这种原文塞进去会露出 `**` / `|`
+ * 这些标记（用户看到的「素的 Markdown」）。这里统一剥成纯文本。
+ */
+export function markdownSummary(text: string | null | undefined, maxChars = 0): string {
+  const source = (text ?? '').trim();
+  if (!source) return '';
+  const plain = toPlainText(parseMarkdown(source)).replace(/\s+/g, ' ').trim();
+  if (maxChars > 0 && plain.length > maxChars) return `${plain.slice(0, maxChars)}…`;
+  return plain;
+}
+
+/**
+ * 从一段 inline 节点里提取判定：先按「**标签**：正文」拆，再在正文里匹配动词；
+ * 没有加粗标签的「操作建议：增持」这种写法，冒号后重新匹配一次。
+ */
+function verdictFromNodes(nodes: Inline[]): { text: string; tone: string } | null {
+  const callout = parseCallout(nodes);
+  if (callout) {
+    const verdict = verdictOf(callout.body);
+    if (verdict) return verdict;
+  } else {
+    const verdict = verdictOf(nodes);
+    if (verdict) return verdict;
+  }
+  const labelled = /^\s*([^：:]{1,12})[：:]\s*(\S.*)$/s.exec(plainText(nodes).trim());
+  return labelled ? verdictOf(parseInline(labelled[2]!)) : null;
+}
+
+/**
+ * 从 Markdown 正文里提取「结论」判定（买入 / 入选 / 观望 / 回避 …）。
+ *
+ * 与正文渲染共用同一套判定词与结论卡解析：`**结论**：入选。` 会先被拆成
+ * 标签 + 正文，再在正文里匹配动词，因此列表里显示的是「入选」而不是「结论」。
+ * 段落 / 标题 / 列表项都扫，取第一条命中的判定；扫不到就返回 null（列表里不显示胶囊）。
+ */
+export function markdownVerdict(text: string | null | undefined): { text: string; tone: string } | null {
+  for (const block of parseMarkdown(text ?? '')) {
+    if (block.kind === 'paragraph') {
+      const verdict = verdictFromNodes(block.children);
+      if (verdict) return verdict;
+    } else if (block.kind === 'heading') {
+      const verdict = verdictOf(block.children);
+      if (verdict) return verdict;
+    } else if (block.kind === 'list') {
+      for (const item of block.items) {
+        const verdict = verdictFromNodes(item.children);
+        if (verdict) return verdict;
+      }
+    }
   }
   return null;
 }

@@ -3,8 +3,15 @@
  * history compaction for the agent loop.
  *
  * Contract (docs/ARCHITECTURE.md §4.4, docs/API.md §3):
- *  1. `system` messages are **never** modified or dropped.
- *  2. The most recent `minRecentTurns` user turns stay byte-for-byte intact.
+ *  1. `system` messages are **never** modified or dropped. `user` messages are
+ *     equally immutable: the first one is the run's goal, and the pipelines embed
+ *     the whole pre-fetched dataset in it as JSON — rewriting it hands the model a
+ *     truncated payload (`Unterminated string in JSON`) that it then re-fetches.
+ *     A goal that cannot fit its budget surfaces as `overflowTokens`, honestly,
+ *     until the producer shrinks it.
+ *  2. The most recent `minRecentTurns` turns stay byte-for-byte intact. A "turn"
+ *     is a user message in a chat and an assistant+tool group in a pipeline run
+ *     (which has exactly one user message) — see {@link protectBoundary}.
  *  3. When compaction runs, every older `tool` result shrinks to at most
  *     `AGENT_OLD_TOOL_RESULT_CHARS` characters and is prefixed with `[已压缩]`,
  *     keeping the tool name and the ok/fail status so the model still knows the
@@ -124,6 +131,11 @@ export function estimateTokens(text: string): number {
 function messageTokens(message: LlmMessage): number {
   let tokens = MESSAGE_OVERHEAD_TOKENS;
   if (typeof message.content === 'string') tokens += estimateTokens(message.content);
+  // Thinking-mode traces are sent back with the request (`LlmMessage.reasoning_content`)
+  // and are billed like any other text, but they used to be invisible here — the
+  // budget check under-read every request by 14–22%, so overflow was noticed one
+  // to five turns late (or never) while the request already exceeded the window.
+  if (typeof message.reasoning_content === 'string') tokens += estimateTokens(message.reasoning_content);
   if (message.name) tokens += estimateTokens(message.name);
   if (message.tool_call_id) tokens += estimateTokens(message.tool_call_id) + 2;
   for (const call of message.tool_calls ?? []) {
@@ -166,6 +178,12 @@ function cloneMessage(message: LlmMessage): LlmMessage {
   if (message.tool_calls) copy.tool_calls = message.tool_calls.map((call) => ({ ...call, function: { ...call.function } }));
   if (message.tool_call_id !== undefined) copy.tool_call_id = message.tool_call_id;
   if (message.name !== undefined) copy.name = message.name;
+  // Thinking-mode providers (DeepSeek) reject an assistant message that carries
+  // `tool_calls` without its `reasoning_content` being sent back — dropping the
+  // field here used to be invisible only because compaction never actually ran
+  // on pipeline transcripts. Now that it does, losing it would turn every
+  // compacted tool loop into HTTP 400「reasoning_content must be passed back」.
+  if (message.reasoning_content !== undefined) copy.reasoning_content = message.reasoning_content;
   return copy;
 }
 
@@ -269,11 +287,49 @@ function parseDroppedCount(content: string): number {
 }
 
 /**
+ * Index of the first message that must survive byte-for-byte — the start of the
+ * protected "recent turns" window.
+ *
+ * Two shapes have to be covered, and conflating them used to disable compaction
+ * completely in production:
+ *
+ *  - **Chat** (`kind: 'chat'`): a `user` message precedes each assistant+tool
+ *    group, so "the `minRecentTurns` newest user turns" is a real, bounded window
+ *    and stays the rule (unchanged).
+ *  - **Pipeline** (`asset-analysis` / `watchlist-analysis` / `advice` /
+ *    `scheduled`): exactly **one** user message — the goal — followed by every
+ *    assistant+tool group. The user-turn rule then degenerates to
+ *    `protectFrom = 1`, i.e. "everything after the goal is protected", which made
+ *    `compactContext` a no-op: production logged `上下文超预算` while sending
+ *    65k-token requests against a 48k budget, every turn, forever.
+ *
+ * For that shape the window follows **tool groups** instead — the model's own
+ * assistant+tool cycles, which is what "recent turns" means there. At most half
+ * of the groups stay protected, so an overflowing transcript always has older
+ * groups left to shrink or drop and compaction is guaranteed to be able to act.
+ */
+function protectBoundary(work: LlmMessage[], minRecentTurns: number): number {
+  const userIndexes: number[] = [];
+  work.forEach((message, index) => {
+    if (message.role === 'user' && !isHistoryNote(message)) userIndexes.push(index);
+  });
+  if (userIndexes.length >= minRecentTurns) {
+    return userIndexes[userIndexes.length - minRecentTurns]!;
+  }
+  const groupStarts = collectToolGroups(work).map((group) => group.assistant);
+  if (groupStarts.length === 0) return work.length;
+  const keep = Math.max(1, Math.min(minRecentTurns, Math.floor(groupStarts.length / 2) || 1));
+  return groupStarts[Math.max(0, groupStarts.length - keep)]!;
+}
+
+/**
  * Compacts a message list so it fits the context budget. Pure & deterministic:
  * the input array and its messages are never mutated.
  */
 export function compactContext(messages: LlmMessage[], options: CompactOptions): CompactResult {
-  const minRecentTurns = Math.max(0, options.minRecentTurns ?? AGENT_MIN_RECENT_TURNS);
+  // At least one turn always stays verbatim: `minRecentTurns: 0` would make the
+  // boundary `undefined` and silently protect the whole transcript.
+  const minRecentTurns = Math.max(1, options.minRecentTurns ?? AGENT_MIN_RECENT_TURNS);
   const outputReserveTokens = Math.max(0, options.outputReserveTokens ?? AGENT_OUTPUT_RESERVE_TOKENS);
   const budget = Math.max(0, options.budgetTokens - outputReserveTokens);
   const tools = options.tools;
@@ -281,13 +337,9 @@ export function compactContext(messages: LlmMessage[], options: CompactOptions):
   const beforeTokens = countMessagesTokens(messages, tools);
   let work = messages.map((message) => cloneMessage(message));
 
-  // Recent turns are protected: everything from the `minRecentTurns`-th newest
-  // user message onwards is untouchable (system messages always are).
-  const userIndexes: number[] = [];
-  work.forEach((message, index) => {
-    if (message.role === 'user' && !isHistoryNote(message)) userIndexes.push(index);
-  });
-  const protectFrom = userIndexes.length > 0 ? userIndexes[Math.max(0, userIndexes.length - minRecentTurns)] : work.length;
+  // Recent turns are protected: everything from the boundary onwards is
+  // untouchable (system messages always are).
+  const protectFrom = protectBoundary(work, minRecentTurns);
   // Capture the protected window by identity *before* any mutation: step 2
   // rewrites `work`, so a later `slice(protectFrom)` would point at the wrong
   // messages (that is exactly the bug the hard-trim pass must not repeat).
@@ -351,8 +403,13 @@ export function compactContext(messages: LlmMessage[], options: CompactOptions):
   // Step 3 (D3) — hard trim: if steps 1–2 could not reach the budget (e.g. one
   // turn with several very large tool results), shrink the largest remaining
   // bodies **outside the protected recent window** so the request converges.
-  // Recent turns and the system prompt are never rewritten — contract rule 2 —
-  // so callers still get a truthful `overflowTokens` when even this cannot fit.
+  //
+  // `user` messages are excluded as firmly as `system` ones. The first user
+  // message is the run's goal, and the pipelines embed the whole pre-fetched
+  // dataset in it as JSON — halving it produced a payload the model reported as
+  // `Unterminated string in JSON` and then dutifully re-fetched via tools, i.e.
+  // the exact waste the budget was meant to prevent. A goal that cannot fit is a
+  // truthful `overflowTokens`, not a silently corrupted prompt.
   let hardTrimmedMessages = 0;
   if (budget > 0 && countMessagesTokens(repaired.messages, tools) > budget) {
     const trimmable = repaired.messages
@@ -360,6 +417,7 @@ export function compactContext(messages: LlmMessage[], options: CompactOptions):
         (message) =>
           !protectedMessages.has(message) &&
           message.role !== 'system' &&
+          message.role !== 'user' &&
           typeof message.content === 'string' &&
           message.content.length > HARD_TRIM_FLOOR_CHARS,
       )

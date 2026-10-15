@@ -16,7 +16,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { renderToString } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
-import type { InferenceMetrics, SeriesPoint } from '@aia/shared';
+import type { AssetSummary, InferenceMetrics, SeriesPoint } from '@aia/shared';
 import {
   DEFAULT_LLM,
   LLM_PROVIDER_CUSTOM_ID,
@@ -45,11 +45,14 @@ import {
   ToastProvider,
 } from '../src/components/ui';
 import { splitHighlightValue } from '../src/components/FinancialsPanel';
-import { markerTooltipBlock, markersOnDate, seriesTooltipFormatter } from '../src/components/charts/tradeMarkers';
+import { markerPointData, markerTooltipBlock, markersOnDate, seriesTooltipFormatter } from '../src/components/charts/tradeMarkers';
 import { markersFromTransactions } from '../src/components/InstrumentDetailSections';
+import { RunTimeline, runProgressView, runTimelineState } from '../src/components/RunTimeline';
+import type { AgentStreamApi } from '../src/api/hooks';
 import { FinancialsView, formatFinancialValue, parseHighlight, statementRows } from '../src/components/FinancialsPanel';
 import { buildComparison } from '../src/pages/FinancialCompare';
-import { Markdown } from '../src/components/markdown/Markdown';
+import { AiAdviceCell } from '../src/pages/Assets';
+import { Markdown, markdownSummary, markdownVerdict } from '../src/components/markdown/Markdown';
 import { extractMetrics, parseChartSpec, parseMarkdown } from '../src/components/markdown/parse';
 import { LlmProviderField } from '../src/pages/SettingsLlmProvider';
 import { ModelField } from '../src/pages/SettingsModelField';
@@ -1130,4 +1133,203 @@ test('我的资产：当前走势会自动补刷，不是一列空白', () => {
   assert.ok(/missingSpark/.test(page), '缺走势时应自动补刷价格序列');
   assert.ok(/ageMs > 5 \* 60_000/.test(page), '只在行情过期时才自动刷新');
   assert.ok(/待刷新/.test(page), '无走势时要有占位提示而不是空白');
+});
+
+/* ═══════════ 买卖点 pin 悬浮浮窗（回归：悬停标签没有任何浮窗） ═══════════ */
+
+test('买卖点悬浮面板：markPoint 必须显式 trigger=item，否则被全局 axis 触发器吞掉', () => {
+  const marker = {
+    kind: 'buy' as const,
+    date: '2026-10-14',
+    price: 22.18,
+    shares: 100,
+    amount: 2218,
+    fee: 5.5,
+    note: '建仓 <加仓>',
+  };
+  const item = markerPointData(marker, 'CNY');
+  assert.equal(item.coord[0], '2026-10-14', 'pin 必须落在成交日');
+  assert.equal(item.coord[1], 22.18, 'pin 必须落在成交价');
+  assert.equal(item.symbol, 'pin');
+  // 关键：全局 tooltip 是 trigger:'axis'，而 ECharts 命中 markPoint 元素时走
+  // TooltipView._showSeriesItemTooltip，它把 [数据项模型, markPoint 模型,
+  // 坐标系模型] 与全局 tooltip 级联后判断 `trigger !== 'item' → return`。
+  // 只写 formatter 时 trigger 会继承成 'axis'，pin 上永远弹不出浮窗。
+  assert.equal(item.tooltip.trigger, 'item', 'markPoint 必须显式声明 tooltip.trigger = item');
+  assert.equal(
+    typeof item.tooltip.formatter,
+    'function',
+    'formatter 必须是函数（字符串会被当作 {a} 模板再走一遍 formatTpl）',
+  );
+  const panel = (item.tooltip.formatter as () => string)();
+  for (const needle of ['买入', '100', '22.18', '费用', '备注']) {
+    assert.ok(panel.includes(needle), `成交明细面板缺少「${needle}」`);
+  }
+  assert.ok(!panel.includes('<加仓>'), '备注必须转义，不能原样注入 HTML');
+  assert.equal(markerPointData({ ...marker, kind: 'sell' }).tooltip.trigger, 'item', '卖出 pin 同样要 item');
+
+  // 两个图表必须共用这个数据项工厂，且不允许再手写 markPoint 的 tooltip。
+  for (const file of ['KLineChart.tsx', 'NavChart.tsx']) {
+    const source = readSource('components', 'charts', file);
+    assert.ok(/markerPointData\(marker, currency\)/.test(source), `${file} 未使用 markerPointData`);
+    assert.ok(
+      !/tooltip:\s*\{\s*formatter:/.test(source),
+      `${file} 仍手写 markPoint tooltip：会继承全局 trigger:'axis'，悬停 pin 时没有浮窗`,
+    );
+  }
+});
+
+test('买卖点悬浮面板：pin 只在 tradeMarkers 里构造（避免再抄一份丢掉 trigger）', () => {
+  const dir = path.join(SRC_DIR, 'components', 'charts');
+  const offenders: string[] = [];
+  for (const name of fs.readdirSync(dir)) {
+    const source = fs.readFileSync(path.join(dir, name), 'utf8');
+    if (name !== 'tradeMarkers.ts' && /symbol:\s*'pin'/.test(source)) offenders.push(name);
+  }
+  assert.deepEqual(offenders, [], `这些文件自己构造了买卖 pin（应走 markerPointData）：${offenders.join(', ')}`);
+});
+
+/* ═══════════ 我的资产：AI 建议列的视觉渲染 ═══════════ */
+
+test('我的资产「AI 建议」：判定胶囊 + 纯文本摘要 + 悬浮全文 Markdown', () => {
+  const page = readSource('pages', 'Assets.tsx');
+  assert.ok(/markdownVerdict/.test(page), '判定（买入/入选/观望/回避）必须提取成胶囊');
+  assert.ok(/markdownSummary/.test(page), '摘要必须先剥掉 Markdown 标记');
+  assert.ok(/<HoverTip/.test(page), '全文必须放进悬浮浮窗（列表装不下整篇分析）');
+  assert.ok(/content=\{<Markdown text=\{asset\.aiSummary\}/.test(page), '浮窗里的分析必须按 Markdown 渲染');
+  assert.ok(/hovertip-clamp/.test(page), '列表里只留两行摘要');
+  assert.ok(/md-verdict tone-/.test(page), '判定胶囊要用报告渲染器同一套 class');
+  assert.ok(!/title=\{asset\.aiSummary/.test(page), '不应再把原始 Markdown 塞进 title 属性（等于没渲染）');
+  assert.ok(!/asset\.aiSummary \|\| '—'/.test(page), '空分析要走独立的空状态，而不是直接输出原文');
+
+  // 摘要：Markdown 标记必须全部消失
+  const summary = markdownSummary('## 一、组合简报\n\n**结论**：入选。质量分 74，估值处于合理区间。', 80);
+  assert.ok(!/[*#|]/.test(summary), `摘要里不能残留 Markdown 标记：${summary}`);
+  assert.ok(summary.includes('入选') && summary.includes('质量分 74'), '摘要丢了正文内容');
+  const truncated = markdownSummary('这是一段很长的结论文字，需要被截断成一行摘要以适配表格列宽', 10);
+  assert.equal(truncated.length, 11, '超长摘要要按字数截断');
+  assert.ok(truncated.endsWith('…'), '截断要有省略号');
+  assert.equal(markdownSummary('   '), '', '空白分析返回空串');
+
+  // 判定：结论标签拆开后匹配动词，风险段落不产生判定
+  assert.deepEqual(markdownVerdict('**结论**：入选。质量分 74，估值处于合理区间。'), { text: '入选', tone: 'buy' });
+  assert.deepEqual(markdownVerdict('**结论**：回避。估值过高。'), { text: '回避', tone: 'sell' });
+  assert.deepEqual(markdownVerdict('**结论**：观望。等待回调。'), { text: '观望', tone: 'neutral' });
+  assert.deepEqual(markdownVerdict('- 操作建议：增持，回调分批。'), { text: '增持', tone: 'buy' });
+  assert.equal(markdownVerdict('**主要风险**：行业景气度下滑。'), null);
+  assert.equal(markdownVerdict(''), null);
+
+  // 渲染层：与报告渲染器一致（同一套 verdict class）
+  const html = renderToString(<Markdown text={'**结论**：入选。'} variant="compact" />);
+  assert.ok(/md-verdict tone-buy/.test(html), '判定胶囊 class 与报告渲染器不一致');
+
+  // 单元格本身：判定胶囊 + 摘要 + 触发区；空分析走占位而不是「—」原文。
+  const asset = {
+    id: 'asset-1',
+    name: '贵州茅台',
+    code: '600519',
+    market: 'CN',
+    type: 'stock',
+    source: 'manual',
+    currency: 'CNY',
+    price: 22.18,
+    priceAt: null,
+    marketValue: 2218,
+    unrealizedPnl: 0,
+    unrealizedPnlPct: 0,
+    dayChange: 0,
+    dayChangePct: 0,
+    firstBuyAt: null,
+    lastBuyAt: null,
+    lastSellAt: null,
+    note: '',
+    aiSummary: '## 一、结论\n\n**结论**：入选。质量分 74，估值处于合理区间。',
+    aiSummaryAt: '2026-10-15T02:00:00.000Z',
+    spark: [],
+    createdAt: '2026-10-15T02:00:00.000Z',
+    closed: false,
+  } as AssetSummary;
+  const cell = renderToString(<AiAdviceCell asset={asset} />);
+  assert.ok(/class="hovertip-trigger/.test(cell), 'AI 建议单元格缺少悬浮触发区');
+  assert.ok(/md-verdict tone-buy/.test(cell), '单元格没有渲染判定胶囊');
+  assert.ok(cell.includes('入选') && cell.includes('质量分 74'), '摘要丢了正文内容');
+  assert.ok(!cell.includes('**'), '摘要里仍残留 Markdown 标记（回到「素的 Markdown」）');
+  assert.ok(cell.includes('悬浮 / 点击查看全文'), '缺少「悬浮查看全文」提示');
+  assert.ok(/aria-label="查看完整 AI 分析：贵州茅台"/.test(cell), '触发区缺少无障碍名称');
+  const emptyCell = renderToString(<AiAdviceCell asset={{ ...asset, aiSummary: '' }} />);
+  assert.ok(emptyCell.includes('—') && !emptyCell.includes('hovertip'), '没有 AI 分析时应走占位，而不是渲染空浮窗');
+});
+
+/* ═══════════ 推理进度：结束后必须收尾 ═══════════ */
+
+function streamState(over: Partial<AgentStreamApi>): AgentStreamApi {
+  return {
+    running: false,
+    runId: null,
+    kind: null,
+    title: '',
+    steps: [],
+    text: '',
+    progress: null,
+    entities: [],
+    toolEvents: [],
+    budget: null,
+    metrics: null,
+    metricsEvents: [],
+    error: null,
+    finished: null,
+    start: async () => streamState({}),
+    cancel: () => undefined,
+    reset: () => undefined,
+    ...over,
+  };
+}
+
+test('推理进度：完成后不再显示「第 4/20 轮推理」，进度条满格转成功色', () => {
+  const progress = { done: 4, total: 20, label: '第 4/20 轮推理' };
+
+  const running = streamState({ running: true, progress });
+  assert.equal(runTimelineState(running), 'running');
+  assert.deepEqual(runProgressView(running), { label: '第 4/20 轮推理', meta: '4/20', value: 4, tone: 'default' });
+  const runningHtml = renderToString(<RunTimeline stream={running} />);
+  assert.ok(runningHtml.includes('第 4/20 轮推理'), '运行中要展示服务端的轮次标签');
+
+  // 收敛式结束（第 4 轮得出结论）：最后一条 progress 就是 4/20，不能照搬成「还在跑」。
+  const done = streamState({ progress, finished: { status: 'done', summary: '共 4 轮完成' } });
+  assert.equal(runTimelineState(done), 'done');
+  assert.deepEqual(runProgressView(done), { label: '分析完成', meta: '共 4 轮推理', value: 20, tone: 'ok' });
+  const doneHtml = renderToString(<RunTimeline stream={done} />);
+  assert.ok(doneHtml.includes('分析完成'), '完成后进度区必须给出终态文案');
+  assert.ok(!doneHtml.includes('第 4/20 轮推理'), '完成后不能再显示「第 4/20 轮推理」');
+  assert.ok(/progress progress-ok/.test(doneHtml), '完成后进度条应转成成功色');
+  assert.ok(/width:100%/.test(doneHtml), '完成后进度条应满格');
+
+  // 失败 / 中断同样要有终态，不能停在半路。
+  const failed = streamState({ progress, error: '上游 502', finished: { status: 'error', summary: '上游 502' } });
+  assert.equal(runTimelineState(failed), 'error');
+  assert.deepEqual(runProgressView(failed), { label: '已失败', meta: '第 4/20 轮中断', value: 4, tone: 'error' });
+  assert.ok(/progress progress-error/.test(renderToString(<RunTimeline stream={failed} />)), '失败要用红色进度条');
+
+  const stopped = streamState({ progress });
+  assert.equal(runTimelineState(stopped), 'stopped');
+  assert.deepEqual(runProgressView(stopped), { label: '已中断', meta: '第 4/20 轮', value: 4, tone: 'muted' });
+  assert.ok(/progress progress-muted/.test(renderToString(<RunTimeline stream={stopped} />)), '中断要用灰色进度条');
+
+  // 没有进度事件时不能凭空造一条。
+  assert.equal(runProgressView(streamState({ running: true })), null);
+
+  // 右下角面板的元信息同理：结束后是「共 N 轮推理」；状态徽标也必须复用同一套终态。
+  const dock = readSource('components', 'AgentActivityDock.tsx');
+  assert.ok(
+    /running \? `第 \$\{latest\.turn\} 轮推理` : `共 \$\{latest\.turn\} 轮推理`/.test(dock),
+    '面板元信息在结束后必须改成总轮次',
+  );
+  assert.ok(/runTimelineState\(stream\)/.test(dock), '状态徽标必须复用 runTimelineState（中断不能算已完成）');
+  assert.ok(/stopped: '已中断'/.test(dock), '缺少「已中断」状态文案');
+
+  // 终态配色必须有对应 CSS，否则 tone 只是空 class。
+  const css = readSource('styles.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  for (const tone of ['ok', 'error', 'muted']) {
+    assert.ok(css.includes(`.progress-${tone} .progress-bar`), `缺少终态进度条配色：progress-${tone}`);
+  }
 });

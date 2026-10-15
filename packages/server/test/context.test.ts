@@ -313,6 +313,106 @@ test('compactContext: 首轮（system+user）也能安全工作', () => {
   assert.equal(result.afterTokens, result.beforeTokens);
 });
 
+/* ─────────────── 生产事故回归：流水线形状只有一条 user 消息 ─────────────── */
+
+/**
+ * 资产/标的/建议三条流水线都只 push 一条 `user` 消息（目标），后面全是
+ * assistant+tool 组。旧的 `protectFrom`（「第 N 条最新 user 消息」）在这种形状下
+ * 退化成「目标之后的全部消息都受保护」，于是压缩三步全部不可达：
+ * 191 轮里 0 次 `上下文压缩`，却记了 8 次 `上下文超预算`，单次请求达 65k tokens
+ * （预算 48k）。这个形状以前没有任何测试覆盖（`conversation()` 每轮都插 user）。
+ */
+function pipelineConversation(system: string, groups: number, toolChars: number): LlmMessage[] {
+  const messages: LlmMessage[] = [
+    { role: 'system', content: system },
+    { role: 'user', content: `请分析以下持仓。${'数据'.repeat(200)}` },
+  ];
+  for (let index = 0; index < groups; index += 1) {
+    const id = `call_${index + 1}`;
+    messages.push({
+      role: 'assistant',
+      content: `第 ${index + 1} 轮`,
+      tool_calls: [{ id, type: 'function', function: { name: 'get_quote', arguments: `{"code":"6009${index}"}` } }],
+    });
+    messages.push({
+      role: 'tool',
+      tool_call_id: id,
+      name: 'get_quote',
+      content: JSON.stringify({ ok: true, turn: index + 1, payload: '数据'.repeat(toolChars / 2) }),
+    });
+  }
+  return messages;
+}
+
+test('回归：单条 user 目标 + 多组工具调用的流水线形状也能压缩到预算内', () => {
+  const messages = pipelineConversation(SYSTEM, 13, 9000);
+  const before = countMessagesTokens(messages);
+  const budget = 48_000;
+  const result = compactContext(messages, { budgetTokens: budget, minRecentTurns: 4 });
+
+  assert.ok(before > budget, `前置条件：${before} 必须超过预算 ${budget}`);
+  assert.equal(result.compacted, true, '流水线形状必须真的压缩（旧的 protectFrom 让它变成空操作）');
+  assert.ok(result.afterTokens <= budget, `afterTokens=${result.afterTokens} 必须落回预算内`);
+  assert.equal(result.overflowTokens, 0);
+  assert.ok(result.shrunkenToolResults > 0, '历史工具结果必须被压缩');
+
+  // 最近的若干组仍原样保留（按组而不是按 user 消息保护）。
+  assert.deepEqual(result.messages.slice(-8), messages.slice(-8));
+  assert.equal(result.messages[0]?.content, SYSTEM);
+  assertNoOrphanTools(result.messages);
+});
+
+test('回归：user 目标消息永不被改写（目标里是整段预取 JSON，裁剪会毁掉请求）', () => {
+  const goal = `请分析。以下是已抓取好的市场数据 JSON：${JSON.stringify({
+    holdings: Array.from({ length: 40 }, (_, index) => ({ 代码: `6009${index}`, 数据: '财务数据'.repeat(120) })),
+  })}`;
+  const messages: LlmMessage[] = [
+    { role: 'system', content: SYSTEM },
+    { role: 'user', content: goal },
+    {
+      role: 'assistant',
+      content: '开始',
+      tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_quote', arguments: '{}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_1', name: 'get_quote', content: JSON.stringify({ ok: true, payload: '数据'.repeat(3000) }) },
+  ];
+
+  // 预算极小：硬裁剪本可以「凑数」，但绝不能碰 user 目标。
+  const result = compactContext(messages, { budgetTokens: 300, outputReserveTokens: 0, minRecentTurns: 1 });
+
+  const goalOut = result.messages.find((message) => message.role === 'user' && String(message.content).startsWith('请分析。'));
+  assert.equal(goalOut?.content, goal, '目标消息必须逐字保持不变（否则模型收到半截 JSON）');
+  // 目标放不进预算时如实报告溢出，而不是悄悄裁剪它。
+  assert.ok(result.overflowTokens > 0, '装不下就要如实报告 overflowTokens');
+  // 仍然可以被解析成合法 JSON（即没被截断）。
+  assert.doesNotThrow(() => JSON.parse(String(goalOut?.content).slice(String(goalOut?.content).indexOf('{'))));
+});
+
+test('回归：reasoning_content 计入 token 估算，且压缩时保留', () => {
+  const trace = '思考轨迹'.repeat(500);
+  const plain: LlmMessage[] = [
+    { role: 'system', content: SYSTEM },
+    { role: 'user', content: '分析' },
+    { role: 'assistant', content: '答案', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_quote', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c1', name: 'get_quote', content: '{}' },
+  ];
+  const withTrace: LlmMessage[] = plain.map((message, index) =>
+    index === 2 ? { ...message, reasoning_content: trace } : message,
+  );
+
+  // 估算器必须看见思考轨迹（旧逻辑完全不计，导致预算检查低估 14–22%）。
+  assert.equal(
+    countMessagesTokens(withTrace) - countMessagesTokens(plain),
+    estimateTokens(trace),
+    'reasoning_content 必须计入 token 预算',
+  );
+
+  // 压缩不得丢掉它：DeepSeek 要求带 tool_calls 的 assistant 消息回传思考轨迹。
+  const result = compactContext(withTrace, { budgetTokens: 48_000 });
+  const assistant = result.messages.find((message) => message.role === 'assistant');
+  assert.equal(assistant?.reasoning_content, trace, 'cloneMessage 必须保留 reasoning_content');
+});
+
 test('D3: 保护窗口本身超预算时如实报告 overflowTokens，且不裁剪最近轮次', () => {
   // The protected recent turns alone cannot fit a tiny budget, so compaction
   // cannot converge — the contract is then to *say so* (overflowTokens > 0)
