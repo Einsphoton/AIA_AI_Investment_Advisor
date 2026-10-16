@@ -11,6 +11,7 @@ import { z } from 'zod';
 
 import {
   DATA_SOURCE_SLOTS,
+  MAX_SCHEDULES,
   SOURCE_CATALOGUE,
   type DataSourceCatalogueEntry,
   type LlmConfig,
@@ -87,24 +88,46 @@ const settingsInputSchema = z.object({
   budget: z
     .object({ CN: z.number().min(0).optional(), HK: z.number().min(0).optional(), US: z.number().min(0).optional() })
     .optional(),
-  schedule: z
-    .object({
-      mode: z.enum(['off', 'interval', 'daily']).optional(),
-      intervalMinutes: z.number().int().min(1).max(100_000).optional(),
-      dailyTime: z
-        .string()
-        .regex(/^\d{2}:\d{2}$/, '需为 HH:mm')
-        .refine((value) => {
-          // Range check: the regex alone accepts "25:99", which the scheduler
-          // would silently clamp — the UI would then show a time that never runs.
-          const [hour, minute] = value.split(':').map(Number);
-          return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
-        }, '需为合法的 24 小时时间（00:00–23:59）')
-        .optional(),
-      runAssetAnalysis: z.boolean().optional(),
-      runWatchlistAnalysis: z.boolean().optional(),
-      runAdvice: z.boolean().optional(),
-    })
+  // 定时任务：**整体替换**（与 mcpServers 同语义，空数组 = 不排程）。每个任务自带
+  // 触发方式与要跑的步骤；模式里没有 off —— 停用是任务自己的 enabled。
+  schedules: z
+    .array(
+      z
+        .object({
+          id: z
+            .string()
+            .min(1)
+            .max(40)
+            .regex(/^[A-Za-z0-9_-]+$/, '只能包含字母、数字、下划线与连字符'),
+          name: z.string().min(1).max(60),
+          enabled: z.boolean().optional().default(true),
+          mode: z.enum(['interval', 'daily']),
+          intervalMinutes: z.number().int().min(1).max(100_000).optional().default(1440),
+          dailyTime: z
+            .string()
+            .regex(/^\d{2}:\d{2}$/, '需为 HH:mm')
+            .refine((value) => {
+              // Range check: the regex alone accepts "25:99", which the scheduler
+              // would silently clamp — the UI would then show a time that never runs.
+              const [hour, minute] = value.split(':').map(Number);
+              return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+            }, '需为合法的 24 小时时间（00:00–23:59）')
+            .optional()
+            .default('08:30'),
+          runAssetAnalysis: z.boolean().optional().default(true),
+          runWatchlistAnalysis: z.boolean().optional().default(true),
+          runAdvice: z.boolean().optional().default(true),
+        })
+        .refine(
+          (task) => task.runAssetAnalysis || task.runWatchlistAnalysis || task.runAdvice,
+          '至少要选择一个要跑的步骤（资产分析 / 标的分析 / 投资建议）',
+        ),
+    )
+    .max(MAX_SCHEDULES, `最多 ${MAX_SCHEDULES} 个定时任务`)
+    .refine(
+      (tasks) => new Set(tasks.map((task) => task.id)).size === tasks.length,
+      '任务 id 不能重复',
+    )
     .optional(),
   enforceBudget: z.boolean().optional(),
   watchlistCandidateLimit: z.number().int().min(0).max(100).optional(),
@@ -166,7 +189,7 @@ export function toSettingsDto(stored: StoredSettings): Settings {
     apiKeyMasked: maskApiKey(apiKey),
     dataSources: maskDataSourceConfig(stored.dataSources),
     budget: stored.budget,
-    schedule: stored.schedule,
+    schedules: stored.schedules,
     enforceBudget: stored.enforceBudget,
     watchlistCandidateLimit: stored.watchlistCandidateLimit,
     watchlistRetireDeleteRuns: stored.watchlistRetireDeleteRuns,
@@ -402,7 +425,8 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     if (body.watchlistCandidateLimit !== undefined) patch.watchlistCandidateLimit = body.watchlistCandidateLimit;
     if (body.watchlistRetireDeleteRuns !== undefined) patch.watchlistRetireDeleteRuns = body.watchlistRetireDeleteRuns;
     if (body.budget !== undefined) patch.budget = { ...stripUndefined(body.budget) } as StoredSettings['budget'];
-    if (body.schedule !== undefined) patch.schedule = { ...stripUndefined(body.schedule) } as StoredSettings['schedule'];
+    // 定时任务整体替换（空数组 = 删光所有任务）。
+    if (body.schedules !== undefined) patch.schedules = body.schedules as StoredSettings['schedules'];
     if (body.dataSources !== undefined) {
       patch.dataSources = sanitiseDataSourcePatch(body.dataSources) as unknown as StoredSettings['dataSources'];
     }
@@ -430,10 +454,11 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     const saved = repo.saveSettings(settingsPatch(patch));
     // Data-source pins / keys may have changed: drop the datasource HTTP cache.
     if (body.dataSources !== undefined) await resetDatasourceCache();
-    // Schedule changes must take effect without a restart; `nextRunAt()` reads
-    // the live timer, so a stale scheduler would silently never run. The module
-    // singleton covers the boot race before `index.ts` calls `setScheduler()`.
-    if (body.schedule !== undefined) (getScheduler() ?? getActiveScheduler())?.reload();
+    // Schedule changes must take effect without a restart; the live timer is the
+    // only thing that knows the plan, so a stale scheduler would silently keep a
+    // deleted task or miss a new one. The module singleton covers the boot race
+    // before `index.ts` calls `setScheduler()`.
+    if (body.schedules !== undefined) (getScheduler() ?? getActiveScheduler())?.reload();
     return toSettingsDto(saved);
   });
 

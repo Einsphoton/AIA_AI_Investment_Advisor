@@ -483,12 +483,13 @@ try {
   const resetAll = await call('POST', '/api/backup/clear', { keepSettings: false });
   const afterReset = await call('GET', '/api/settings');
   check(
-    'keepSettings:false 恢复出厂设置（清空 Key、定时任务关闭）',
+    'keepSettings:false 恢复出厂设置（清空 Key、定时任务清空）',
     resetAll.status === 200 &&
       resetAll.json?.settingsReset === true &&
       afterReset.json?.hasApiKey === false &&
-      afterReset.json?.schedule?.mode === 'off',
-    `status=${resetAll.status} hasApiKey=${afterReset.json?.hasApiKey} mode=${afterReset.json?.schedule?.mode}`,
+      Array.isArray(afterReset.json?.schedules) &&
+      afterReset.json.schedules.length === 0,
+    `status=${resetAll.status} hasApiKey=${afterReset.json?.hasApiKey} schedules=${JSON.stringify(afterReset.json?.schedules)}`,
   );
 } catch (error) {
   record('未预期异常', 'FAIL', error.stack ?? String(error));

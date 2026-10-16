@@ -13,6 +13,7 @@ import path from 'node:path';
 
 import {
   APP_VERSION,
+  DEFAULT_SCHEDULE_TASK,
   type AssetSummary,
   type BackupPayload,
   type ImportMode,
@@ -91,7 +92,7 @@ export function settingsForBackup(stored: StoredSettings): NonNullable<BackupPay
     // Secret-free: each slot exposes only provider/enabled + hasApiKey/apiKeyMasked.
     dataSources: maskDataSourceConfig(stored.dataSources),
     budget: stored.budget,
-    schedule: stored.schedule,
+    schedules: stored.schedules,
     enforceBudget: stored.enforceBudget,
     watchlistCandidateLimit: stored.watchlistCandidateLimit,
     watchlistRetireDeleteRuns: stored.watchlistRetireDeleteRuns,
@@ -312,7 +313,13 @@ function applyImportedSettings(repo: Repo, payload: BackupPayload): void {
       patch.dataSources = sanitiseImportedDataSources(imported.dataSources);
     }
     if (imported.budget !== undefined) patch.budget = imported.budget as StoredSettings['budget'];
-    if (imported.schedule !== undefined) patch.schedule = imported.schedule as StoredSettings['schedule'];
+    if (imported.schedules !== undefined) {
+      // 整体替换；坏条目由 repo 的归一化丢弃。
+      patch.schedules = Array.isArray(imported.schedules) ? (imported.schedules as StoredSettings['schedules']) : [];
+    } else if (isRecord((imported as Record<string, unknown>).schedule)) {
+      // 兼容 2026-10 之前的备份：单个 schedule 对象 → 一个任务。
+      patch.schedules = legacyScheduleToTasks((imported as Record<string, unknown>).schedule as Record<string, unknown>);
+    }
     if (typeof imported.enforceBudget === 'boolean') patch.enforceBudget = imported.enforceBudget;
     if (typeof imported.watchlistCandidateLimit === 'number') {
       patch.watchlistCandidateLimit = imported.watchlistCandidateLimit;
@@ -353,6 +360,36 @@ function applyImportedSettings(repo: Repo, payload: BackupPayload): void {
   } catch {
     /* a settings restore failure must not fail the data import */
   }
+}
+
+/**
+ * 兼容 2026-10 之前的备份格式：`settings.schedule`（单个任务对象）→ 一个定时任务。
+ * `mode='off'` → 空数组（与新版「没有任务」等价）。
+ */
+function legacyScheduleToTasks(raw: Record<string, unknown>): StoredSettings['schedules'] {
+  const mode = raw.mode;
+  if (mode !== 'interval' && mode !== 'daily') return [];
+  const dailyTime =
+    typeof raw.dailyTime === 'string' && /^\d{2}:\d{2}$/.test(raw.dailyTime)
+      ? raw.dailyTime
+      : DEFAULT_SCHEDULE_TASK.dailyTime;
+  const intervalMinutes =
+    typeof raw.intervalMinutes === 'number' && Number.isFinite(raw.intervalMinutes) && raw.intervalMinutes >= 1
+      ? Math.floor(raw.intervalMinutes)
+      : DEFAULT_SCHEDULE_TASK.intervalMinutes;
+  return [
+    {
+      id: 'sched_imported',
+      name: '导入的定时任务',
+      enabled: true,
+      mode,
+      intervalMinutes,
+      dailyTime,
+      runAssetAnalysis: raw.runAssetAnalysis !== false,
+      runWatchlistAnalysis: raw.runWatchlistAnalysis !== false,
+      runAdvice: raw.runAdvice !== false,
+    },
+  ];
 }
 
 /**

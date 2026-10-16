@@ -291,8 +291,7 @@ ul { margin: 0; padding-left: 18px; }
 }
 .version-badge-warn .version-badge-dot { background-color: #e06a54; }
 
-.version-detail { display: flex; flex-direction: column; gap: 5px; min-width: 224px; }
-.version-detail-row { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.version-detail { display: flex; flex-direction: column; gap: 5px; min-width: 224px; }.version-detail-row { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
 .version-detail-key {
   font-size: 9px;
   letter-spacing: 0.18em;
@@ -1617,7 +1616,43 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .fin-highlight-value.neg { color: var(--neg); }
 .fin-highlight-hint { margin-top: 2px; font-size: 10.5px; color: var(--text-mute); overflow-wrap: anywhere; }
 
-/* ── 21. responsive + reduced motion ─────────────────────────────────────── */
+/* ── 22. 定时任务（紧凑列表：一行一个任务，编辑就地展开）─────────────────────
+   设计目标：任务多起来也不能把设置页撑长。所以每条任务默认只占一行，
+   名称/触发方式/步骤/下次运行全部挤在一行里，表单只在「编辑」时展开一条。 */
+.sched-list { display: flex; flex-direction: column; gap: 5px; }
+.sched-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 5px 10px;
+  min-height: 34px;
+  border: 1px solid var(--border-quiet);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  transition: border-color 0.16s ease;
+}
+.sched-row:hover { border-color: var(--border-strong); }
+.sched-row.is-open { border-color: var(--border-strong); background: var(--bg-elevated); }
+.sched-row.is-off { opacity: 0.5; }
+.sched-name { font-size: 12.5px; font-weight: 600; max-width: 30%; }
+.sched-meta { font-size: 11px; color: var(--text-mute); white-space: nowrap; }
+.sched-steps { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.sched-steps-warn { color: var(--gold-300); }
+.sched-spacer { flex: 1 1 auto; min-width: 8px; }
+.sched-next { font-size: 11px; color: var(--text-mute); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sched-row .row-actions { gap: 2px; }
+/* 展开的编辑区：3 列自适应 + 12px 字号输入框，尽量少占高度。 */
+.sched-editor {
+  margin: 5px 0 3px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border-quiet);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+}
+.sched-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.sched-form .field { gap: 4px; }
+.sched-form .field-label { font-size: 9.5px; letter-spacing: 0.16em; }
+.sched-form .input { padding: 5px 9px; font-size: 12px; }
+
+/* ── 23. responsive + reduced motion ─────────────────────────────────────── */
 
 /* 超宽屏（≥1700px）：内容铺满后适当放大内边距与关键数字，
    让被拉宽的卡片保持视觉密度，而不是显得空荡。 */
@@ -1691,6 +1726,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   .card-header { padding: 11px 13px; }
   .card-body { padding: 13px; }
   .card-title { font-size: 13px; }
+
+  /* 窄屏：定时任务行仍保持一行 —— 让出「步骤」这一列（编辑展开后仍可改）。 */
+  .sched-row { gap: 8px; }
+  .sched-name { max-width: 42%; }
+  .sched-steps { display: none; }
 
   .stat-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 148px), 1fr)); gap: 10px; }
   .stat-card { padding: 12px 13px; }

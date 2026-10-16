@@ -64,10 +64,43 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 | GET | `/api/settings/data-sources` | 返回 `{ slots: {slot, market, kind, label, options: DataSourceCatalogueEntry[]}[], providers: DataSourceCatalogueEntry[] }` |
 | POST | `/api/settings/data-sources/probe` | 对当前启用的数据源做一次可用性探测，返回 `{ provider, ok, latencyMs, message }[]` |
 
+### 定时任务（`Settings.schedules`，数组）
+
+2026-10 起定时任务是**数组**（旧版的单个 `Settings.schedule` + 全局 `mode='off'` 已移除）：
+
+```jsonc
+"schedules": [
+  { "id": "sched_morning", "name": "工作日盘前", "enabled": true, "mode": "daily",
+    "dailyTime": "08:45", "intervalMinutes": 1440,
+    "runAssetAnalysis": true, "runWatchlistAnalysis": false, "runAdvice": true },
+  { "id": "sched_weekend", "name": "周末挖标的", "enabled": false, "mode": "interval",
+    "intervalMinutes": 360, "dailyTime": "08:30",
+    "runAssetAnalysis": false, "runWatchlistAnalysis": true, "runAdvice": false }
+]
+```
+
+| 规则 | 说明 |
+| --- | --- |
+| 替换语义 | `PUT /api/settings` 里 `schedules` **整体替换**（与 `mcpServers` 相同）；省略该字段 = 保持不变；`[]` = 删光所有任务并停止排程 |
+| 每条任务 | `id`（稳定标识，`[A-Za-z0-9_-]{1,40}`，同一数组内不可重复）、`name`、`enabled`（停用后配置保留但不排程）、`mode`（`interval` \| `daily`，**没有** `off`）、`intervalMinutes`（≥1，从上次跑完起算）、`dailyTime`（`HH:mm` 本地时间）、三个步骤开关 |
+| 校验 | `dailyTime` 必须是合法的 24 小时时间（`25:99` → 400）；三个步骤**至少选一个**（全关的任务没有任何意义 → 400）；`id` 重复 → 400；最多 20 个任务 |
+| 生效 | 保存后调度器立即 `reload()`，无需重启；同一时刻到期的多个任务**合并成一次运行**（步骤取并集），跑完各自重排 |
+| 旧库 / 旧备份 | 旧库的 `schedule_*` 单任务列在读取时迁移成「一个任务」（`mode='off'` → 空数组）；旧备份里的 `settings.schedule` 对象同样兼容；写回时旧列会同步第一个启用任务，方便回滚到旧版本 |
+| 观察 | `GET /api/dashboard` 的 `signals.scheduleEnabled`（是否至少有一个启用任务）、`signals.nextRunAt`（最近一次）与 `signals.nextRuns[]`（`{id,name,nextRunAt}`，按时间升序）来自**实时调度器**；设置页据此逐个任务显示下次运行时间 |
+
 ## 3. 仪表盘（/api/dashboard）
 
 - `GET /api/dashboard` → `DashboardPayload`
   - `portfolio`：**第一板块**（总市值/总成本/浮动盈亏/已实现盈亏，统一折算为 CNY，`fxRates` 为折算率）
+  - `portfolio.performance`（`PortfolioPerformance`）：**当年年化收益**，Dashboard 第一行的「年化收益率 / 已实现年化收益率」直接读它
+    - `annualizedPct` = **XIRR（资金加权，实际天数/365）**：期初（上一年最后一天）持仓市值按各自 ≤ 该日的**最后收盘价**估值，
+      叠加当年每笔买卖的真实现金流（买入含费 / 卖出扣费），期末取当前总市值。**不是**「收益率 ÷ 天数 × 365」的外推
+    - `realizedAnnualizedPct` = 只算**当年卖出**部分：账面成本（移动加权平均，含分摊买入费用）锚定在这些份额的**加权平均买入日**
+    - `sinceInceptionPct` = 全周期年化（首次买入 → 今天，同口径，仅需账本 + 期末市值）
+    - 期初估值失败（缺历史收盘价 / 取数超时）时 `openingValue`、`annualizedPct` 一律为 `null`，`notes` 写明原因 —— **绝不用 0 或估算值冒充**；
+      当年没有卖出时 `realizedAnnualizedPct` 同样为 `null`（不适用，而不是 0）
+    - 期初收盘价按「标的 × 年度」缓存在 `kv`（`perf.openClose.<基准日>.<assetId>`），每年每个标的只取一次上游
+    - 支持可选 `?asOf=YYYY-MM-DD`（未来日期夹到今天）把口径固定在某个估值日，便于复核：`GET /api/dashboard?asOf=2026-06-30`
   - `counts` + `signals`：**第二板块**（持仓数量、资产数量、标的变化、新建议）
   - `topHoldings`：**第三板块**（按市值 Top5，`AssetSummary[]`，含 `spark` 缩略走势）
   - `briefing`：**第四板块**（AI 针对持仓的分析简报，`null` 表示尚未生成）
@@ -303,7 +336,7 @@ advice_outcomes / agent_runs / agent_steps / agent_run_messages / chat_sessions 
 audit_log / pending_writes / kv`，返回逐表删除行数（`ClearDataResult`，另含总行数 `deleted`）。
 
 - `keepSettings` 省略或 `true`：设置行完全不动 —— LLM / 数据源 API Key、投资性格、预算与定时任务都保留，清完可立即继续使用；
-- `keepSettings: false`：设置恢复为**出厂默认**（等价于全新数据库：清空全部 Key、投资性格与预算回默认、定时任务回到 `off`），并刷新数据源缓存与调度器；
+- `keepSettings: false`：设置恢复为**出厂默认**（等价于全新数据库：清空全部 Key、投资性格与预算回默认、定时任务清空为 `[]`），并刷新数据源缓存与调度器；
 - 两种情况下 `last_run_at` 都会被清空（它指向的 run 已不存在）；
 - AI 流水线正在运行时拒绝执行（**409**），否则 run 结束后会把数据重新写回来；
 - 磁盘上的备份快照（`data/backups`）**不删除**，这是不可撤销操作的恢复后路。

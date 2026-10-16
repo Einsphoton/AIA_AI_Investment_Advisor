@@ -65,7 +65,8 @@ export interface SettingsPatch {
   llm?: Partial<StoredSettings['llm']>;
   dataSources?: { [K in keyof StoredSettings['dataSources']]?: Partial<StoredSettings['dataSources'][K]> };
   budget?: Partial<StoredSettings['budget']>;
-  schedule?: Partial<StoredSettings['schedule']>;
+  /** 定时任务：整体替换（数组；空数组 = 不排程）。 */
+  schedules?: StoredSettings['schedules'];
   enforceBudget?: boolean;
   watchlistCandidateLimit?: number;
   /** P3 淘汰机制：连续确认退役多少次后才真正删除（0 = 只标记不删除）。 */

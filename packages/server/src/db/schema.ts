@@ -35,6 +35,7 @@ export const SCHEMA_STATEMENTS: string[] = [
      schedule_run_asset INTEGER NOT NULL DEFAULT 1,
      schedule_run_watchlist INTEGER NOT NULL DEFAULT 1,
      schedule_run_advice INTEGER NOT NULL DEFAULT 1,
+     schedules TEXT NOT NULL DEFAULT '[]',
      last_run_at TEXT,
      updated_at TEXT NOT NULL DEFAULT ''
    )`,
@@ -307,6 +308,8 @@ export function migrateSchema(db: DatabaseSync): void {
   // 思考模型（DeepSeek reasoning）要求把 assistant 的思考轨迹回传；老库补列，
   // 否则续跑一个工具循环会在第一轮就 400。
   ensureColumn(db, 'agent_run_messages', 'reasoning_content', 'TEXT');
+  // 定时任务数组（2026-10）：旧库只有单任务的 schedule_* 列，读取时迁移到这一列。
+  ensureColumn(db, 'settings', 'schedules', "TEXT NOT NULL DEFAULT '[]'");
 
   for (const statement of INDEX_STATEMENTS) db.exec(statement);
 }

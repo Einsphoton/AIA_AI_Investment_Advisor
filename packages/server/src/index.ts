@@ -53,7 +53,7 @@ async function main(): Promise<void> {
   // report the *real* next run time (never a re-computed guess).
   setScheduler(scheduler);
   app.log.info(
-    { schedule: repo.getSettings().schedule.mode, next: scheduler.nextRunAt() },
+    { schedules: repo.getSettings().schedules.length, next: scheduler.nextRunAt() },
     'scheduler initialised',
   );
 

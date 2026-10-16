@@ -13,7 +13,6 @@ import type {
   LlmConfig,
   Market,
   Quote,
-  ScheduleConfig,
 } from '@aia/shared';
 import { z, type ZodType } from 'zod';
 
@@ -355,7 +354,8 @@ export type SettingsPatch = {
   llm?: Partial<LlmConfig>;
   dataSources?: { [K in keyof DataSourceConfig]?: Partial<DataSourceConfig[K]> };
   budget?: Partial<BudgetConfig>;
-  schedule?: Partial<ScheduleConfig>;
+  /** 定时任务：整体替换（数组）。 */
+  schedules?: StoredSettings['schedules'];
   enforceBudget?: boolean;
   watchlistCandidateLimit?: number;
   lastRunAt?: string | null;

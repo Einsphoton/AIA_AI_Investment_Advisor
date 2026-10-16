@@ -82,6 +82,12 @@ export interface LoggerLike {
   debug: (msg: string, ...rest: unknown[]) => void;
 }
 
+/** 定时器注入点：默认用全局 `setTimeout/clearTimeout`，测试可换成假时钟。 */
+export interface SchedulerTimers {
+  setTimeout(fn: () => void, ms: number): { unref?: () => void };
+  clearTimeout(handle: { unref?: () => void }): void;
+}
+
 /** Background scheduler seam (implemented by `agent-engine`). */
 export interface SchedulerDeps {
   getRepo: () => import('./repo.js').Repo;
@@ -89,16 +95,32 @@ export interface SchedulerDeps {
   logger: LoggerLike;
   /** Invoked after every scheduled/manual pipeline run (for UI signalling). */
   onRunComplete?: (run: AgentRun) => void;
+  /**
+   * 定时器来源。测试传假实现即可精确控制触发时刻，**不需要**替换全局
+   * `setTimeout` —— 那样会干扰同一进程里并行跑的其它测试（真实教训）。
+   */
+  timers?: SchedulerTimers;
+  /** 当前时间（毫秒）。默认 `Date.now`，测试可注入假时钟。 */
+  now?: () => number;
+}
+
+/** 单个定时任务的下次运行时间（`Scheduler.plan()` 的元素）。 */
+export interface SchedulerPlanEntry {
+  id: string;
+  name: string;
+  nextRunAt: string;
 }
 
 export interface Scheduler {
-  /** Starts the in-process timer; safe to call when `mode === 'off'`. */
+  /** Starts the in-process timer; safe to call when no task is enabled. */
   start(): void;
   stop(): void;
-  /** Applies the current settings without restarting the process. */
+  /** Applies the current `settings.schedules` without restarting the process. */
   reload(): void;
-  /** ISO timestamp of the next planned run, or null when disabled. */
+  /** ISO timestamp of the next planned run (earliest task), or null when disabled. */
   nextRunAt(): string | null;
+  /** 每个启用任务各自的下次运行时间（升序）；界面按任务展示。 */
+  plan(): SchedulerPlanEntry[];
   /** Runs the full pipeline now (asset → watchlist → advice) and resolves it. */
   runPipeline(): Promise<AgentRun>;
 }

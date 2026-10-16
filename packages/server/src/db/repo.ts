@@ -24,7 +24,7 @@ import {
   DEFAULT_MCP_SERVERS,
   DEFAULT_PERSONA,
   DEFAULT_REPORT_STYLE,
-  DEFAULT_SCHEDULE,
+  DEFAULT_SCHEDULE_TASK,
   DEFAULT_TOOL_POLICY,
   DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
   DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
@@ -42,6 +42,7 @@ import {
   type McpServerConfig,
   type PendingWrite,
   type PendingWriteStatus,
+  type ScheduleTask,
   type ToolPolicy,
   type ToolRisk,
 } from '@aia/shared';
@@ -259,19 +260,109 @@ function rowToSettings(row: Row): StoredSettings {
       HK: toNumber(row.budget_hkd, DEFAULT_BUDGET.HK),
       US: toNumber(row.budget_usd, DEFAULT_BUDGET.US),
     },
-    schedule: {
-      mode: (str(row.schedule_mode, DEFAULT_SCHEDULE.mode) || DEFAULT_SCHEDULE.mode) as StoredSettings['schedule']['mode'],
-      intervalMinutes: int(row.schedule_interval_minutes, DEFAULT_SCHEDULE.intervalMinutes),
-      dailyTime: str(row.schedule_daily_time, DEFAULT_SCHEDULE.dailyTime),
-      runAssetAnalysis: bool(row.schedule_run_asset, DEFAULT_SCHEDULE.runAssetAnalysis),
-      runWatchlistAnalysis: bool(row.schedule_run_watchlist, DEFAULT_SCHEDULE.runWatchlistAnalysis),
-      runAdvice: bool(row.schedule_run_advice, DEFAULT_SCHEDULE.runAdvice),
-    },
+    schedules: rowToSchedules(row),
     enforceBudget: bool(row.enforce_budget, DEFAULT_ENFORCE_BUDGET),
     watchlistCandidateLimit: int(row.watchlist_candidate_limit, DEFAULT_WATCHLIST_CANDIDATE_LIMIT),
     watchlistRetireDeleteRuns: int(row.watchlist_retire_delete_runs, DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS),
     lastRunAt: nullableStr(row.last_run_at),
     updatedAt: str(row.updated_at, nowIso()),
+  };
+}
+
+/* ── 定时任务（数组）：读取时兼容旧库的单任务列 ─────────────────────────── */
+
+/** 一条任务的防御性归一化；返回 null 表示这条数据不可用（直接丢弃）。 */
+function normalizeScheduleTask(input: unknown): ScheduleTask | null {
+  if (!input || typeof input !== 'object') return null;
+  const raw = input as Record<string, unknown>;
+  const id = typeof raw.id === 'string' ? raw.id.trim() : '';
+  const mode = raw.mode === 'interval' || raw.mode === 'daily' ? raw.mode : null;
+  if (id === '' || mode === null) return null;
+  const dailyTime = typeof raw.dailyTime === 'string' && /^\d{2}:\d{2}$/.test(raw.dailyTime) ? raw.dailyTime : DEFAULT_SCHEDULE_TASK.dailyTime;
+  const intervalMinutes = Math.min(100_000, Math.max(1, Math.floor(toNumber(raw.intervalMinutes, DEFAULT_SCHEDULE_TASK.intervalMinutes))));
+  return {
+    id,
+    name: typeof raw.name === 'string' && raw.name.trim() !== '' ? raw.name.trim() : id,
+    enabled: raw.enabled === undefined ? true : raw.enabled === true,
+    mode,
+    intervalMinutes,
+    dailyTime,
+    runAssetAnalysis: raw.runAssetAnalysis === undefined ? true : raw.runAssetAnalysis === true,
+    runWatchlistAnalysis: raw.runWatchlistAnalysis === undefined ? true : raw.runWatchlistAnalysis === true,
+    runAdvice: raw.runAdvice === undefined ? true : raw.runAdvice === true,
+  };
+}
+
+/** 数组归一化：丢弃坏条目、去重（同 id 只保留第一条）。 */
+export function normalizeSchedules(input: unknown): ScheduleTask[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const out: ScheduleTask[] = [];
+  for (const item of input) {
+    const task = normalizeScheduleTask(item);
+    if (!task || seen.has(task.id)) continue;
+    seen.add(task.id);
+    out.push(task);
+  }
+  return out;
+}
+
+/**
+ * `settings.schedules` 的读取：新列优先；新列为空时兼容旧库的单任务列
+ * （`mode='off'` → 空数组）。旧列在每次保存时由 {@link schedulesToLegacy} 同步，
+ * 因此「用户删光任务」不会被误判成「旧库还没迁移」。
+ */
+function rowToSchedules(row: Row): ScheduleTask[] {
+  const parsed = normalizeSchedules(parseJson<unknown>(row.schedules));
+  if (parsed.length > 0) return parsed;
+
+  const legacyMode = str(row.schedule_mode, 'off');
+  if (legacyMode !== 'interval' && legacyMode !== 'daily') return [];
+  return [
+    {
+      id: 'sched_legacy',
+      name: '默认定时任务',
+      enabled: true,
+      mode: legacyMode,
+      intervalMinutes: int(row.schedule_interval_minutes, DEFAULT_SCHEDULE_TASK.intervalMinutes),
+      dailyTime: str(row.schedule_daily_time, DEFAULT_SCHEDULE_TASK.dailyTime),
+      runAssetAnalysis: bool(row.schedule_run_asset, DEFAULT_SCHEDULE_TASK.runAssetAnalysis),
+      runWatchlistAnalysis: bool(row.schedule_run_watchlist, DEFAULT_SCHEDULE_TASK.runWatchlistAnalysis),
+      runAdvice: bool(row.schedule_run_advice, DEFAULT_SCHEDULE_TASK.runAdvice),
+    },
+  ];
+}
+
+/**
+ * 旧列同步（可回滚）：把第一个启用任务写进 `schedule_*` 列，没有启用任务就写 `off`。
+ * 这样用旧版本代码打开同一个库时，排程行为仍然合理（而不是静默全部失效）。
+ */
+function schedulesToLegacy(tasks: ScheduleTask[]): {
+  mode: string;
+  intervalMinutes: number;
+  dailyTime: string;
+  runAsset: boolean;
+  runWatchlist: boolean;
+  runAdvice: boolean;
+} {
+  const task = tasks.find((item) => item.enabled);
+  if (!task) {
+    return {
+      mode: 'off',
+      intervalMinutes: DEFAULT_SCHEDULE_TASK.intervalMinutes,
+      dailyTime: DEFAULT_SCHEDULE_TASK.dailyTime,
+      runAsset: DEFAULT_SCHEDULE_TASK.runAssetAnalysis,
+      runWatchlist: DEFAULT_SCHEDULE_TASK.runWatchlistAnalysis,
+      runAdvice: DEFAULT_SCHEDULE_TASK.runAdvice,
+    };
+  }
+  return {
+    mode: task.mode,
+    intervalMinutes: task.intervalMinutes,
+    dailyTime: task.dailyTime,
+    runAsset: task.runAssetAnalysis,
+    runWatchlist: task.runWatchlistAnalysis,
+    runAdvice: task.runAdvice,
   };
 }
 
@@ -532,8 +623,8 @@ class SqliteRepo implements Repo {
          llm_fast_model, llm_timeout_ms, llm_context_tokens, data_sources, tool_policy, mcp_servers, budget_cny,
          budget_hkd, budget_usd, enforce_budget,
          watchlist_candidate_limit, watchlist_retire_delete_runs, schedule_mode, schedule_interval_minutes, schedule_daily_time,
-         schedule_run_asset, schedule_run_watchlist, schedule_run_advice, last_run_at, updated_at
-       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         schedule_run_asset, schedule_run_watchlist, schedule_run_advice, schedules, last_run_at, updated_at
+       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
        ON CONFLICT(id) DO NOTHING`,
       DEFAULT_PERSONA,
       DEFAULT_REPORT_STYLE,
@@ -554,12 +645,13 @@ class SqliteRepo implements Repo {
       DEFAULT_ENFORCE_BUDGET ? 1 : 0,
       DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
       DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
-      DEFAULT_SCHEDULE.mode,
-      DEFAULT_SCHEDULE.intervalMinutes,
-      DEFAULT_SCHEDULE.dailyTime,
-      DEFAULT_SCHEDULE.runAssetAnalysis ? 1 : 0,
-      DEFAULT_SCHEDULE.runWatchlistAnalysis ? 1 : 0,
-      DEFAULT_SCHEDULE.runAdvice ? 1 : 0,
+      'off',
+      DEFAULT_SCHEDULE_TASK.intervalMinutes,
+      DEFAULT_SCHEDULE_TASK.dailyTime,
+      DEFAULT_SCHEDULE_TASK.runAssetAnalysis ? 1 : 0,
+      DEFAULT_SCHEDULE_TASK.runWatchlistAnalysis ? 1 : 0,
+      DEFAULT_SCHEDULE_TASK.runAdvice ? 1 : 0,
+      stringifyJson([]),
       nowIso(),
     );
   }
@@ -578,7 +670,7 @@ class SqliteRepo implements Repo {
       llm: { ...current.llm, ...withoutUndefined(patch.llm) },
       dataSources: mergeDataSources(current.dataSources, patch.dataSources),
       budget: { ...current.budget, ...withoutUndefined(patch.budget) },
-      schedule: { ...current.schedule, ...withoutUndefined(patch.schedule) },
+      schedules: patch.schedules !== undefined ? normalizeSchedules(patch.schedules) : current.schedules,
       enforceBudget: patch.enforceBudget ?? current.enforceBudget,
       watchlistCandidateLimit: patch.watchlistCandidateLimit ?? current.watchlistCandidateLimit,
       watchlistRetireDeleteRuns: patch.watchlistRetireDeleteRuns ?? current.watchlistRetireDeleteRuns,
@@ -587,6 +679,7 @@ class SqliteRepo implements Repo {
       lastRunAt: patch.lastRunAt !== undefined ? patch.lastRunAt : current.lastRunAt,
       updatedAt: nowIso(),
     };
+    const legacy = schedulesToLegacy(merged.schedules);
 
     this.run(
       `UPDATE settings SET
@@ -596,7 +689,7 @@ class SqliteRepo implements Repo {
          budget_hkd = ?, budget_usd = ?, enforce_budget = ?, watchlist_candidate_limit = ?,
          watchlist_retire_delete_runs = ?, schedule_mode = ?,
          schedule_interval_minutes = ?, schedule_daily_time = ?, schedule_run_asset = ?, schedule_run_watchlist = ?,
-         schedule_run_advice = ?, last_run_at = ?, updated_at = ?
+         schedule_run_advice = ?, schedules = ?, last_run_at = ?, updated_at = ?
        WHERE id = 1`,
       merged.persona,
       merged.reportStyle,
@@ -617,12 +710,14 @@ class SqliteRepo implements Repo {
       merged.enforceBudget ? 1 : 0,
       merged.watchlistCandidateLimit,
       merged.watchlistRetireDeleteRuns,
-      merged.schedule.mode,
-      merged.schedule.intervalMinutes,
-      merged.schedule.dailyTime,
-      merged.schedule.runAssetAnalysis ? 1 : 0,
-      merged.schedule.runWatchlistAnalysis ? 1 : 0,
-      merged.schedule.runAdvice ? 1 : 0,
+      // 旧列同步：第一个启用任务（没有就写 off），保证用旧版本代码打开同一库时排程仍然合理。
+      legacy.mode,
+      legacy.intervalMinutes,
+      legacy.dailyTime,
+      legacy.runAsset ? 1 : 0,
+      legacy.runWatchlist ? 1 : 0,
+      legacy.runAdvice ? 1 : 0,
+      stringifyJson(merged.schedules),
       merged.lastRunAt,
       merged.updatedAt,
     );

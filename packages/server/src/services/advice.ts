@@ -99,19 +99,10 @@ export async function runFullPipeline(context: PipelineContext, options: FullPip
   return last;
 }
 
-/** Step flags derived from `settings.schedule` (scheduler entry point). */
-export function scheduleFlags(repo: Repo): FullPipelineOptions {
-  try {
-    const schedule = repo.getSettings().schedule;
-    return {
-      skipAsset: !schedule.runAssetAnalysis,
-      skipWatchlist: !schedule.runWatchlistAnalysis,
-      skipAdvice: !schedule.runAdvice,
-    };
-  } catch {
-    return { skipAsset: false, skipWatchlist: false, skipAdvice: false };
-  }
-}
+/**
+ * 流水线步骤开关由调用方给出：定时入口（`services/scheduler.ts`）按**到期任务的并集**
+ * 计算（`mergeTaskFlags`），手工入口不传 = 三步全跑。
+ */
 
 /** Latest run summary of a kind, for `GET /api/.../last` endpoints. */
 export function latestRunSummary(repo: Repo, kind?: AgentRunKind): AgentRunSummary | null {

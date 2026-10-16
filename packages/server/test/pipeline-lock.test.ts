@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { AgentRun } from '@aia/shared';
+import type { AgentRun, ScheduleTask } from '@aia/shared';
 
 import { createRepo } from '../src/db/repo.js';
 import { createScheduler } from '../src/services/scheduler.js';
@@ -83,20 +83,21 @@ test('runExclusiveOrThrow：占用时抛出 PipelineBusyError', async () => {
 });
 
 test('D7 + D3：tick 与手动流水线共享锁；运行期间 nextRunAt() 绝不是过去时刻', async () => {
-  const realSetTimeout = globalThis.setTimeout;
-  const realClearTimeout = globalThis.clearTimeout;
   let seq = 0;
   const live = new Set<number>();
   const pending = new Map<number, () => void>();
-  // Instrument the timer API so a tick can be fired deterministically.
-  (globalThis as { setTimeout: unknown }).setTimeout = (fn: () => void) => {
-    const id = ++seq;
-    live.add(id);
-    pending.set(id, fn);
-    return { id, unref() {} };
-  };
-  (globalThis as { clearTimeout: unknown }).clearTimeout = (handle: { id?: number } | undefined) => {
-    if (handle?.id !== undefined) live.delete(handle.id);
+  /** 假定时器：注入 scheduler（不替换全局 setTimeout —— 那会干扰并行跑的其它测试）。 */
+  const timers = {
+    setTimeout: (fn: () => void): { unref: () => void } => {
+      const id = ++seq;
+      live.add(id);
+      pending.set(id, fn);
+      return { unref() {} };
+    },
+    clearTimeout: (handle: { unref?: () => void } | undefined): void => {
+      const id = (handle as { id?: number } | undefined)?.id;
+      if (id !== undefined) live.delete(id);
+    },
   };
   const fireLatest = (): boolean => {
     const id = [...live].pop();
@@ -110,7 +111,15 @@ test('D7 + D3：tick 与手动流水线共享锁；运行期间 nextRunAt() 绝�
   const repo = createRepo(path.join(dir, 'advisor.db'));
   repo.migrate();
   const base = { intervalMinutes: 1, dailyTime: '08:30', runAssetAnalysis: true, runWatchlistAnalysis: true, runAdvice: true };
-  repo.saveSettings({ schedule: { ...base, mode: 'off' } });
+  const task = (over: Partial<ScheduleTask> = {}): ScheduleTask => ({
+    id: 'sched_1',
+    name: '测试任务',
+    enabled: true,
+    mode: 'interval',
+    ...base,
+    ...over,
+  });
+  repo.saveSettings({ schedules: [] });
 
   let gateOpen = false;
   // Holder object: a plain `let` would be flow-narrowed to `null` by TS.
@@ -147,13 +156,13 @@ test('D7 + D3：tick 与手动流水线共享锁；运行期间 nextRunAt() 绝�
     },
   };
   const logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
-  const scheduler = createScheduler({ getRepo: () => repo, agent, logger });
+  const scheduler = createScheduler({ getRepo: () => repo, agent, logger, timers });
 
   try {
     scheduler.start();
-    assert.equal(scheduler.nextRunAt(), null, 'mode=off 时不排程');
+    assert.equal(scheduler.nextRunAt(), null, '没有启用任务时不排程');
 
-    repo.saveSettings({ schedule: { ...base, mode: 'interval' } });
+    repo.saveSettings({ schedules: [task()] });
     scheduler.reload();
     const planned = scheduler.nextRunAt();
     assert.ok(planned !== null && Date.parse(planned) > Date.now(), '武装后必须是未来时间');
@@ -192,8 +201,6 @@ test('D7 + D3：tick 与手动流水线共享锁；运行期间 nextRunAt() 绝�
     scheduler.stop();
     repo.close();
     fs.rmSync(dir, { recursive: true, force: true });
-    (globalThis as { setTimeout: unknown }).setTimeout = realSetTimeout;
-    (globalThis as { clearTimeout: unknown }).clearTimeout = realClearTimeout;
   }
 });
 

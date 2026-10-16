@@ -14,7 +14,7 @@ import type {
   Persona,
   RangeKey,
   ReportStyle,
-  ScheduleConfig,
+  ScheduleTask,
   ToolPolicy,
 } from './types.js';
 
@@ -911,14 +911,26 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig = {
 
 export const DEFAULT_BUDGET: BudgetConfig = { CN: 5000, HK: 5000, US: 1000 };
 
-export const DEFAULT_SCHEDULE: ScheduleConfig = {
-  mode: 'off',
+/**
+ * 新建定时任务时的默认模板（`id` 由前端生成）。
+ * 默认**不预置任何任务**：`DEFAULT_SCHEDULES = []`，与「不排程」等价。
+ */
+export const DEFAULT_SCHEDULE_TASK: Omit<ScheduleTask, 'id'> = {
+  name: '每日盘前分析',
+  enabled: true,
+  mode: 'daily',
   intervalMinutes: 1440,
   dailyTime: '08:30',
   runAssetAnalysis: true,
   runWatchlistAnalysis: true,
   runAdvice: true,
 };
+
+/** 出厂不预置定时任务（旧版的 `mode='off'` 等价于空数组）。 */
+export const DEFAULT_SCHEDULES: ScheduleTask[] = [];
+
+/** 单个实例最多可配置的定时任务数（与 MCP 服务器保持同一量级）。 */
+export const MAX_SCHEDULES = 20;
 
 export const DEFAULT_PERSONA: Persona = 'balanced';
 export const DEFAULT_REPORT_STYLE: ReportStyle = 'professional';

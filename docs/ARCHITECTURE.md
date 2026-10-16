@@ -78,6 +78,8 @@ settings(id INTEGER PRIMARY KEY CHECK (id = 1), persona TEXT, report_style TEXT,
          enforce_budget INTEGER, watchlist_candidate_limit INTEGER,
          schedule_mode TEXT, schedule_interval_minutes INTEGER, schedule_daily_time TEXT,
          schedule_run_asset INTEGER, schedule_run_watchlist INTEGER, schedule_run_advice INTEGER,
+         schedules TEXT /*JSON：ScheduleTask[]，2026-10 起定时任务为数组；上面 schedule_* 列仅为
+                          旧库迁移与回滚保留，写回时同步第一个启用任务*/,
          last_run_at TEXT, updated_at TEXT)
 
 assets(id TEXT PRIMARY KEY, name TEXT, code TEXT, market TEXT, type TEXT, source TEXT,
@@ -237,7 +239,7 @@ run(session, systemPrompt, userGoal)
 - **可中断（P0-2 起为真取消）**：客户端断开或用户主动中断 → `AbortController` 贯穿到 `fetch`，**立刻停止**后续推理与工具调用（省 token）；已产生的部分结论写入 `run.summary`（`status='error'`、`error='已取消'`），**已提交的写入不回滚**；被中断或被轮次上限截断的 run 可用 `POST /api/agent/runs/:id/resume` 从持久化轨迹续跑。
 - **不落敏感数据（对外）**：`llm.apiKey` 与 `dataSources.*.apiKey` 只存本地 SQLite；HTTP 层永远只返回 `hasApiKey` + `apiKeyMasked`，导出的备份/快照同样剔除 Key。
 - **账本一致性**：持仓完全由交易流水推导；删除交易前重放校验，禁止出现"没有对应买入的卖出"（409 拒绝）。
-- **定时任务可信**：`PUT /api/settings` 命中 `schedule` 时立即 `scheduler.reload()`；`/api/dashboard` 的 `nextRunAt` 读调度器真实计划，而不是自行推算。
+- **定时任务可信（数组：可并存多个）**：`Settings.schedules: ScheduleTask[]`，每个任务自带触发方式（`interval` / `daily`）与要跑的步骤，停用用任务自己的 `enabled`；`PUT /api/settings` 命中 `schedules`（整体替换）时立即 `scheduler.reload()`；调度器只维护一个定时器，指向所有启用任务里最近的一次触发，同一时刻到期的多个任务**合并成一次运行**（步骤取并集）后各自重排；`/api/dashboard` 的 `nextRunAt` / `nextRuns[]` 读调度器真实计划，而不是自行推算。
 - **AI 长文本 = Markdown（提示词与渲染器同源）**：`ai_summary` / 简报 / `reason` / `thesis` 一律按 Markdown 书写，前端用 `components/markdown/*` 渲染。渲染**不 1:1 对应 Markdown 语义**，而是按最佳阅读形态重排：`## 一、标题` → 编号徽标 + 图标；`**结论**：…` / `**主要风险**：…` / `**目标价**：…` → 带导轨与判定胶囊的语义卡片；两列 `| 指标 | 数值 |` → 指标卡面板（该形状不再走表格）；≥三列表格 → 斑马纹数据表（数值列右对齐 + 内联柱）；`**+14.5%**` → 涨跌胶囊；```chart → 真实 ECharts。语法契约写在 `agent/prompts.ts` 的 `MARKDOWN_GUIDE`（分段 / 加粗 / 两列指标表 / 对比表 / 加粗标签起句 / `metrics`、`chart` 代码块）；**改语法必须同时改解析器**，`packages/server/test/prompt-markdown.test.ts` 会校验示例仍是合法可解析的。渲染器不产出 HTML 字符串，模型输出里的标签只会作为文本显示。
 - **建议必须可追溯来源**：`create_advice` 按 `code+market+type` 反查回填 `assetId`/`watchItemId`，`AdviceItem.origin` 由此推导为 持仓 / 我的标的 / 池外。买入建议优先来自持仓（加仓）或「我的标的」；池外建议是允许的（可能确实有更好的机会），但界面必须标出来 —— 它等于跳过了「AI 标的分析」的质量分门槛。
 - **候选池要跨市场、跨类型**：标的分析提示词带上当前池子的市场/类型分布并优先补齐缺口（预算覆盖 CN/HK/US）。场外基金的类型判定以东财 `Classify/JYS = 'OTCFUND'` 为准，误判成 `etf` 会命中同代码股票并写入错误价格。

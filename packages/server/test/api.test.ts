@@ -926,6 +926,24 @@ test('dashboard: 返回 DashboardPayload 全部字段并降级 indices', async (
   assert.equal(dash.portfolio.fxRates.CNY, 1);
   assert.equal(typeof dash.portfolio.fxRates.USD, 'number');
 
+  // 当年年化（Dashboard 第一行的两个计数）：字段齐备 + 口径说明必须写清 +
+  // 不可度量时如实为 null（绝不用 0 冒充）。
+  const perf = dash.portfolio.performance;
+  assert.ok(perf, 'portfolio.performance 必须存在');
+  assert.equal(perf.year, new Date().getFullYear());
+  assert.equal(perf.periodStart, `${new Date().getFullYear() - 1}-12-31`);
+  assert.match(perf.periodEnd, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(Number.isFinite(perf.days) && perf.days >= 0);
+  assert.ok(Array.isArray(perf.notes) && perf.notes.length > 0, '口径说明不能为空');
+  assert.ok(perf.notes[0].startsWith('口径：XIRR'), `第一条说明必须是口径：${perf.notes[0]}`);
+  assert.equal(perf.endingValue, dash.portfolio.marketValue, '期末市值必须与持仓汇总完全一致');
+  assert.ok(perf.openingValue === null || typeof perf.openingValue === 'number');
+  assert.ok(perf.annualizedPct === null || typeof perf.annualizedPct === 'number');
+  assert.ok(perf.realizedAnnualizedPct === null || typeof perf.realizedAnnualizedPct === 'number');
+  assert.ok(perf.sinceInceptionPct === null || typeof perf.sinceInceptionPct === 'number');
+  assert.ok(perf.sinceInceptionFrom === null || /^\d{4}-\d{2}-\d{2}$/.test(perf.sinceInceptionFrom));
+  assert.equal(typeof perf.netInvested, 'number');
+
   assert.ok(dash.counts.holdings >= 1);
   assert.ok(dash.counts.instruments >= 2);
   assert.ok(dash.counts.watchItems >= 1);
@@ -1424,14 +1442,14 @@ test('backup/clear: 一键清除所有数据（默认保留 AI 配置，可恢�
   const again = json(await app.inject({ method: 'POST', url: '/api/backup/clear', payload: {} }));
   assert.equal(again.deleted, 0);
 
-  // 可选：恢复出厂设置（清空 Key、定时任务回 off）。
+  // 可选：恢复出厂设置（清空 Key、定时任务清空）。
   const reset = json(await app.inject({ method: 'POST', url: '/api/backup/clear', payload: { keepSettings: false } }));
   assert.equal(reset.settingsReset, true);
   const fresh = json(await app.inject({ method: 'GET', url: '/api/settings' }));
   assert.equal(fresh.hasApiKey, false);
   assert.equal(fresh.apiKeyMasked, '');
   assert.equal(fresh.persona, 'balanced');
-  assert.equal(fresh.schedule.mode, 'off');
+  assert.deepEqual(fresh.schedules, [], '恢复出厂后不保留任何定时任务');
   assert.ok(!JSON.stringify(fresh).includes(RAW_API_KEY), '响应中不得出现明文 API Key');
 });
 
@@ -1500,4 +1518,183 @@ test('diagnostics: probe=0 跳过探测；日志接口不会因缓冲为空而�
     assert.equal(typeof record.at, 'string');
     assert.equal(typeof record.msg, 'string');
   }
+});
+
+/* ───────────── 当年年化收益率（XIRR）：端到端真账本重算 ───────────── */
+
+const ISO_DAY = 86_400_000;
+const isoOf = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
+
+test('dashboard: 年化收益率走 XIRR（当年真实现金流 + 期末市值），已实现年化只算当年卖出', async (t) => {
+  const todayMs = Date.parse(`${isoOf(Date.now())}T00:00:00Z`);
+  const year = new Date().getFullYear();
+  const yearStartMs = Date.parse(`${year}-01-01T00:00:00Z`);
+  const daysIntoYear = Math.round((todayMs - yearStartMs) / ISO_DAY);
+  // 年初那几周没有足够的当年区间，年化会被短期波动放大：跳过数值断言（口径本身仍被上面的用例覆盖）。
+  if (daysIntoYear < 45) {
+    t.skip(`当前是 ${year} 年第 ${daysIntoYear} 天，当年区间过短，跳过数值断言`);
+    return;
+  }
+
+  const buyDay = isoOf(yearStartMs + 5 * ISO_DAY); // 当年 1 月 6 日
+  const sellDay = isoOf(todayMs - 20 * ISO_DAY); // 20 天前（必然晚于买入日）
+  const today = isoOf(todayMs);
+
+  // 建仓：100 股 @10（当年买入 → 期初无持仓，当年年化从这笔现金流起算）。
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/assets',
+    payload: { code: '000778', market: 'CN', type: 'stock', name: '年化测试标的', shares: 100, price: 10, tradeDate: buyDay },
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  const asset = json(created);
+
+  // 卖出 20 股 @12（当年卖出 → 已实现年化可算）。
+  const sold = await app.inject({
+    method: 'POST',
+    url: `/api/assets/${asset.id}/transactions`,
+    payload: { kind: 'sell', shares: 20, price: 12, tradeDate: sellDay },
+  });
+  assert.equal(sold.statusCode, 200, sold.body);
+
+  const dash = json(await app.inject({ method: 'GET', url: `/api/dashboard?asOf=${today}` }));
+  const perf = dash.portfolio.performance;
+
+  assert.equal(perf.periodEnd, today, 'asOf 必须可复核（口径固定在指定估值日）');
+  assert.equal(perf.year, year);
+  assert.equal(perf.openingValue, 0, '当年才建仓 → 期初无持仓，不需要历史行情');
+  assert.equal(perf.endingValue, dash.portfolio.marketValue);
+  assert.equal(perf.endingValue, 80 * 10, '期末 80 股 × 现价 10');
+  assert.equal(perf.netInvested, 100 * 10 - 20 * 12, '净投入 = 买入 1000 − 卖出 240');
+  assert.equal(perf.realizedPnl, (12 - 10) * 20, '账本口径已实现盈亏');
+
+  // 当年年化：投入 1000，回收 240 + 期末 800（共 1040）→ 必须为正。
+  assert.ok(perf.annualizedPct !== null, `当年年化应可度量：${perf.notes.join(' | ')}`);
+  assert.ok(perf.annualizedPct! > 0, `净赚 40 时年化必须为正，实际 ${perf.annualizedPct}`);
+
+  // 已实现年化：-200（20 股成本，锚定买入日）+240（卖出净收入）→ 20% / 持有天数 的几何年化。
+  const holdingDays = Math.round((Date.parse(`${sellDay}T00:00:00Z`) - Date.parse(`${buyDay}T00:00:00Z`)) / ISO_DAY);
+  const expectedRealized = ((240 / 200) ** (365 / holdingDays) - 1) * 100;
+  assert.ok(perf.realizedAnnualizedPct !== null, `已实现年化应可度量：${perf.notes.join(' | ')}`);
+  assert.ok(
+    Math.abs(perf.realizedAnnualizedPct! - expectedRealized) < 1e-3,
+    `已实现年化应为 ${expectedRealized.toFixed(4)}%，实际 ${perf.realizedAnnualizedPct}`,
+  );
+
+  assert.equal(typeof perf.sinceInceptionPct, 'number', '全周期年化只用账本，必须可算');
+  assert.equal(perf.sinceInceptionFrom, buyDay);
+  assert.ok(perf.notes.some((note: string) => note.includes('期初') && note.includes('无持仓')));
+
+  // 未来日期一律夹到今天；非法日期忽略。
+  const clamped = json(await app.inject({ method: 'GET', url: '/api/dashboard?asOf=2999-01-01' }));
+  assert.equal(clamped.portfolio.performance.periodEnd, today, '未来估值日必须夹到今天');
+  const ignored = json(await app.inject({ method: 'GET', url: '/api/dashboard?asOf=not-a-date' }));
+  assert.equal(ignored.portfolio.performance.periodEnd, today, '非法估值日忽略，退回今天');
+});
+
+/* ───────────── 定时任务数组（设置页可添加多个） ───────────── */
+
+test('settings: 定时任务数组 —— 多任务并存、整体替换、非法值被拒', async () => {
+  const morning = {
+    id: 'sched_morning',
+    name: '工作日盘前',
+    enabled: true,
+    mode: 'daily',
+    dailyTime: '08:45',
+    runAssetAnalysis: true,
+    runWatchlistAnalysis: false,
+    runAdvice: true,
+  };
+  const weekend = {
+    id: 'sched_weekend',
+    name: '周末挖标的',
+    enabled: true,
+    mode: 'interval',
+    intervalMinutes: 360,
+    runAssetAnalysis: false,
+    runWatchlistAnalysis: true,
+    runAdvice: false,
+  };
+
+  const saved = await app.inject({ method: 'PUT', url: '/api/settings', payload: { schedules: [morning, weekend] } });
+  assert.equal(saved.statusCode, 200, saved.body);
+  const body = json(saved);
+  assert.deepEqual(body.schedules.map((task: any) => task.id), ['sched_morning', 'sched_weekend']);
+  assert.equal(body.schedules[0].dailyTime, '08:45');
+  assert.equal(body.schedules[0].intervalMinutes, 1440, '未传的字段由服务端补默认值');
+  assert.equal(body.schedules[1].runAdvice, false);
+
+  const reread = json(await app.inject({ method: 'GET', url: '/api/settings' }));
+  assert.deepEqual(reread.schedules, body.schedules, '定时任务必须原样读回');
+
+  // Dashboard 逐个任务给出计划（设置页与首页徽标都读它）。
+  const dash = json(await app.inject({ method: 'GET', url: '/api/dashboard' }));
+  assert.equal(dash.signals.scheduleEnabled, true);
+  assert.equal(dash.signals.nextRuns.length, 2);
+  assert.ok(
+    dash.signals.nextRuns.every((entry: any) => entry.id && entry.name && !Number.isNaN(Date.parse(entry.nextRunAt))),
+  );
+  assert.equal(dash.signals.nextRunAt, dash.signals.nextRuns[0].nextRunAt, '最近一次 = 计划里最早的一条');
+  const sorted = [...dash.signals.nextRuns].sort((a: any, b: any) => a.nextRunAt.localeCompare(b.nextRunAt));
+  assert.deepEqual(dash.signals.nextRuns, sorted, '计划必须按时间升序');
+
+  // 整体替换：只发一个任务 → 另一个消失（不是合并）。
+  const replaced = json(await app.inject({ method: 'PUT', url: '/api/settings', payload: { schedules: [weekend] } }));
+  assert.deepEqual(replaced.schedules.map((task: any) => task.id), ['sched_weekend']);
+
+  // 空数组 = 删光所有任务。
+  const cleared = json(await app.inject({ method: 'PUT', url: '/api/settings', payload: { schedules: [] } }));
+  assert.deepEqual(cleared.schedules, []);
+  const clearedDash = json(await app.inject({ method: 'GET', url: '/api/dashboard' }));
+  assert.equal(clearedDash.signals.scheduleEnabled, false);
+  assert.deepEqual(clearedDash.signals.nextRuns, []);
+
+  // 校验：非法时间 / 一个步骤都不选 / id 重复 / 旧的 off 模式，一律 400。
+  const badTime = await app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    payload: { schedules: [{ id: 'x', name: 'x', mode: 'daily', dailyTime: '25:99' }] },
+  });
+  assert.equal(badTime.statusCode, 400, '非法 HH:mm 必须被拒（否则界面显示的时间永远不会跑）');
+
+  const noSteps = await app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    payload: {
+      schedules: [
+        { id: 'x', name: 'x', mode: 'daily', runAssetAnalysis: false, runWatchlistAnalysis: false, runAdvice: false },
+      ],
+    },
+  });
+  assert.equal(noSteps.statusCode, 400);
+  assert.ok(
+    json(noSteps).error.details.some((issue: { message: string }) => /至少/.test(issue.message)),
+    '必须提示至少选一个步骤',
+  );
+
+  const duplicate = await app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    payload: {
+      schedules: [
+        { id: 'dup', name: 'a', mode: 'daily' },
+        { id: 'dup', name: 'b', mode: 'daily' },
+      ],
+    },
+  });
+  assert.equal(duplicate.statusCode, 400);
+
+  const legacyMode = await app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    payload: { schedules: [{ id: 'x', name: 'x', mode: 'off' }] },
+  });
+  assert.equal(legacyMode.statusCode, 400, '整体 off 模式已被任务自己的 enabled 取代');
+
+  // 省略该字段 = 保持不变（不会因为保存别的设置而清空任务）。
+  const keep = json(await app.inject({ method: 'PUT', url: '/api/settings', payload: { schedules: [morning] } }));
+  assert.equal(keep.schedules.length, 1);
+  const untouched = json(await app.inject({ method: 'PUT', url: '/api/settings', payload: { enforceBudget: true } }));
+  assert.equal(untouched.schedules.length, 1, '省略 schedules 时不得改动已保存的任务');
+  await app.inject({ method: 'PUT', url: '/api/settings', payload: { schedules: [] } });
 });

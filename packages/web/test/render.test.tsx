@@ -57,6 +57,14 @@ import { extractMetrics, parseChartSpec, parseMarkdown } from '../src/components
 import { LlmProviderField } from '../src/pages/SettingsLlmProvider';
 import { ModelField } from '../src/pages/SettingsModelField';
 import { DangerZoneCard } from '../src/pages/SettingsDangerZone';
+import { SchedulesCard } from '../src/pages/SettingsSchedules';
+import {
+  buildInput,
+  newScheduleDraft,
+  toDraft,
+  toSchedulePayload,
+  type Draft,
+} from '../src/pages/settingsDraft';
 import { selectResumableRuns } from '../src/components/InterruptedRunsAlert';
 
 const ROUTES: { path: string; expect: string[] }[] = [
@@ -168,6 +176,51 @@ test('Dashboard 工具栏提供「AI一键分析」，并走完整流水线（�
     /path: '\/agent\/run-now'/.test(source),
     '「AI一键分析」必须调用 /agent/run-now，才能跑完资产分析 → 标的分析 → AI 投资建议',
   );
+});
+
+/* ─────────── 第一行：年化收益率 / 已实现年化收益率（XIRR） ─────────── */
+
+test('Dashboard 第一行显示「年化收益率」「已实现年化收益率」，且在持仓统计卡片内', () => {
+  const page = readSource('pages', 'Dashboard.tsx');
+  assert.ok(page.includes('label="年化收益率"'), '缺少「年化收益率」计数');
+  assert.ok(page.includes('label="已实现年化收益率"'), '缺少「已实现年化收益率」计数');
+
+  // 位置：必须在第一行（title="持仓统计" 的卡片里），且在「计数与信号」之前。
+  const firstRow = page.indexOf('title="持仓统计"');
+  const secondCard = page.indexOf('title="计数与信号"');
+  const annualized = page.indexOf('label="年化收益率"');
+  const realized = page.indexOf('label="已实现年化收益率"');
+  assert.ok(firstRow > 0 && secondCard > firstRow, '未找到持仓统计/计数与信号卡片');
+  assert.ok(annualized > firstRow && annualized < secondCard, '「年化收益率」必须在第一行');
+  assert.ok(realized > firstRow && realized < secondCard, '「已实现年化收益率」必须在第一行');
+});
+
+test('年化计数：绑定 XIRR 结果、写明口径、不可度量时显示 — 而不是 0', () => {
+  const page = readSource('pages', 'Dashboard.tsx');
+  assert.ok(/portfolio\.performance|perf = portfolio\?\.performance/.test(page), '数据必须来自 portfolio.performance');
+  assert.ok(/perf\.annualizedPct/.test(page), '年化收益率必须绑定 annualizedPct');
+  assert.ok(/perf\.realizedAnnualizedPct/.test(page), '已实现年化收益率必须绑定 realizedAnnualizedPct');
+  assert.ok(/XIRR/.test(page), '副标题必须写明 XIRR 口径');
+  assert.ok(/performanceHint/.test(page), '必须提供口径说明（期初/期末市值、降级原因）悬浮可查');
+  assert.ok(/periodStart/.test(page) && /openingValue/.test(page), '口径说明必须包含起点与期初市值');
+  // null（不可度量）必须如实显示 —，绝不用 0 顶替；fmtPct(null) 已经是 —。
+  assert.ok(!/annualizedPct \?\? 0/.test(page), '不可度量不得用 0 顶替');
+  assert.ok(!/realizedAnnualizedPct \?\? 0/.test(page), '不可度量不得用 0 顶替');
+});
+
+test('契约与接线：PortfolioPerformance 由服务端计算，dashboard 路由产出', () => {
+  const types = fs.readFileSync(path.resolve(SRC_DIR, '..', '..', 'shared', 'src', 'types.ts'), 'utf8');
+  assert.ok(/export interface PortfolioPerformance/.test(types), '缺少 PortfolioPerformance 契约');
+  assert.ok(/performance: PortfolioPerformance/.test(types), 'DashboardPortfolio 未挂载 performance');
+  for (const field of ['annualizedPct', 'realizedAnnualizedPct', 'sinceInceptionPct', 'openingValue', 'endingValue', 'netInvested', 'realizedPnl', 'notes']) {
+    assert.ok(new RegExp(`\\b${field}\\b`).test(types), `契约缺少 ${field}`);
+  }
+
+  const route = fs.readFileSync(path.resolve(SRC_DIR, '..', '..', 'server', 'src', 'routes', 'dashboard.ts'), 'utf8');
+  assert.ok(/buildPortfolioPerformance/.test(route), 'dashboard 路由未接入年化计算');
+  const service = fs.readFileSync(path.resolve(SRC_DIR, '..', '..', 'server', 'src', 'services', 'performance.ts'), 'utf8');
+  assert.ok(/export function solveXirr/.test(service), '年化必须由 XIRR 求解器算出');
+  assert.ok(!/\/ 天数 \* 365|365 \/ days \* 100/.test(service), '禁止用「收益率 ÷ 天数 × 365」的线性外推冒充年化');
 });
 
 /* ─────────── 推理过程：右下角全局面板（切换页面不消失） ─────────── */
@@ -1425,4 +1478,173 @@ test('Dashboard 顶部挂载「未完成运行」提示条，并指向续跑接�
     '提示条必须调用 P1-3 的续跑接口 /api/agent/runs/:id/resume',
   );
   assert.ok(/api\.agent\.runs\(20\)/.test(alert), '提示条应复用现有的运行列表接口，不新增服务端接口');
+});
+
+/* ═════════════ 定时任务（数组：可添加多个） ═════════════ */
+
+/** 建一个用于草稿测试的 Settings 桩（只填定时任务相关的字段）。 */
+function settingsStub(schedules: Draft['schedules']): Parameters<typeof toDraft>[0] {
+  return {
+    persona: 'balanced',
+    reportStyle: 'professional',
+    llm: {
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKey: '',
+      model: 'deepseek-chat',
+      temperature: 0,
+      maxTokens: 0,
+      fastModel: '',
+      timeoutMs: 180_000,
+      contextTokens: 48_000,
+    },
+    hasApiKey: false,
+    apiKeyMasked: '',
+    dataSources: {},
+    budget: { CN: 5000, HK: 5000, US: 1000 },
+    schedules: schedules.map((task) => ({
+      id: task.id,
+      name: task.name,
+      enabled: task.enabled,
+      mode: task.mode,
+      intervalMinutes: Number(task.intervalMinutes) || 1440,
+      dailyTime: task.dailyTime,
+      runAssetAnalysis: task.runAssetAnalysis,
+      runWatchlistAnalysis: task.runWatchlistAnalysis,
+      runAdvice: task.runAdvice,
+    })) as Parameters<typeof toDraft>[0]['schedules'],
+    enforceBudget: true,
+    watchlistCandidateLimit: 5,
+    watchlistRetireDeleteRuns: 3,
+    toolPolicy: { deny: [], requireWriteApproval: false },
+    mcpServers: [],
+    updatedAt: '2026-10-16T09:00:00.000+08:00',
+  } as Parameters<typeof toDraft>[0];
+}
+
+test('设置页定时任务：展开后是紧凑三列表单（名称 / 触发方式 / 时间或间隔 + 步骤）', () => {
+  const html = renderToString(
+    <ToastProvider>
+      <SchedulesCard
+        value={[newScheduleDraft({ id: 'sched_a', name: '工作日盘前', dailyTime: '08:45' })]}
+        onChange={() => undefined}
+        defaultExpandedId="sched_a"
+      />
+    </ToastProvider>,
+  );
+  assert.ok(html.includes('sched-editor'), '展开后必须渲染编辑区');
+  assert.ok(html.includes('sched-form'), '编辑区必须用紧凑栅格（不是整屏 form-grid）');
+  for (const label of ['任务名称', '触发方式', '每天时间']) {
+    assert.ok(html.includes(label), `展开后缺少「${label}」`);
+  }
+  assert.ok(html.includes('aria-haspopup="listbox"'), '触发方式用紧凑下拉，而不是占宽的分段控件');
+  assert.ok(html.includes('资产分析') && html.includes('标的分析') && html.includes('投资建议'), '步骤勾选缺失');
+  assert.ok(html.includes('收起'), '展开后按钮应变成「收起」');
+});
+
+test('定时任务草稿：新增/删除/改时间都能生成 schedules 补丁（整体替换）', () => {
+  const base = toDraft(settingsStub([newScheduleDraft({ id: 'sched_a', name: '盘前' })]));
+  assert.equal(base.schedules.length, 1, '服务端已有任务要进草稿');
+  assert.equal(base.schedules[0]!.id, 'sched_a');
+
+  // 没改动 → 不下发 schedules（避免覆盖服务端并发更新）。
+  assert.equal(buildInput(base, base).schedules, undefined);
+
+  // 新增一个任务 → 数组整体下发。
+  const added: Draft = { ...base, schedules: [...base.schedules, newScheduleDraft({ id: 'sched_b', name: '周末' })] };
+  const addedInput = buildInput(added, base);
+  assert.equal(addedInput.schedules?.length, 2);
+  assert.deepEqual(addedInput.schedules?.map((task) => task.id), ['sched_a', 'sched_b']);
+
+  // 删除任务 → 空数组也要下发（否则服务端会保留旧任务）。
+  const removed = buildInput({ ...base, schedules: [] }, base);
+  assert.deepEqual(removed.schedules, []);
+
+  // 改时间 / 改步骤 → 下发解析后的值。
+  const edited: Draft = {
+    ...base,
+    schedules: [{ ...base.schedules[0]!, mode: 'interval', intervalMinutes: '90', runAdvice: false }],
+  };
+  const editedInput = buildInput(edited, base);
+  assert.equal(editedInput.schedules?.[0]!.mode, 'interval');
+  assert.equal(editedInput.schedules?.[0]!.intervalMinutes, 90);
+  assert.equal(editedInput.schedules?.[0]!.runAdvice, false);
+});
+
+test('定时任务草稿：非法值在提交前就被拦下（时间 / 间隔 / 空步骤 / 空名称）', () => {
+  const draft = newScheduleDraft({ name: '测试' });
+  assert.throws(() => toSchedulePayload({ ...draft, dailyTime: '25:99' }), /HH:mm/);
+  assert.throws(() => toSchedulePayload({ ...draft, mode: 'interval', intervalMinutes: '' }), /必须是有效数字/);
+  assert.throws(() => toSchedulePayload({ ...draft, mode: 'interval', intervalMinutes: 'abc' }), /必须是有效数字/);
+  assert.throws(
+    () => toSchedulePayload({ ...draft, runAssetAnalysis: false, runWatchlistAnalysis: false, runAdvice: false }),
+    /至少要选择一个/,
+  );
+  assert.throws(() => toSchedulePayload({ ...draft, name: '   ' }), /名称/);
+
+  // 合法值：切换触发方式不会把另一个模式的配置改成默认值。
+  const payload = toSchedulePayload({ ...draft, mode: 'daily', dailyTime: '08:45', intervalMinutes: '45' });
+  assert.equal(payload.mode, 'daily');
+  assert.equal(payload.dailyTime, '08:45');
+  assert.equal(payload.intervalMinutes, 45, 'daily 模式下也要保留用户填过的间隔');
+});
+
+test('设置页定时任务：紧凑列表（一行一个任务）默认收起，编辑才展开', () => {
+  const html = renderToString(
+    <ToastProvider>
+      <SchedulesCard
+        value={[newScheduleDraft({ id: 'sched_a', name: '工作日盘前', dailyTime: '08:45' })]}
+        onChange={() => undefined}
+        nextRuns={[{ id: 'sched_a', name: '工作日盘前', nextRunAt: '2026-10-17T00:45:00.000Z' }]}
+      />
+    </ToastProvider>,
+  );
+  assert.ok(html.includes('AI 定时任务'), '缺少定时任务卡片标题');
+  assert.ok(html.includes('添加任务'), '必须能添加多个任务');
+  // 一行内看全：名称 / 触发方式 / 步骤 / 下次运行。
+  assert.ok(html.includes('工作日盘前'), '任务名未渲染');
+  assert.ok(html.includes('每天 08:45'), '触发方式摘要未渲染');
+  assert.ok(html.includes('资产·标的·建议'), '步骤摘要未渲染');
+  assert.ok(html.includes('sched-row'), '必须用紧凑行渲染（不是每条任务一整块表单）');
+  assert.ok(html.includes('下次'), '必须显示服务端返回的下次运行时间');
+  // 默认收起：编辑表单（任务名称 / 触发方式 / 间隔输入）不进首屏 DOM。
+  assert.ok(!html.includes('sched-editor'), '默认不应展开编辑表单（否则又变成占地方的整块表单）');
+  assert.ok(!html.includes('任务名称'), '默认不应展开编辑表单');
+});
+
+test('设置页定时任务：停用的任务压暗并标注「已停用」', () => {
+  const html = renderToString(
+    <ToastProvider>
+      <SchedulesCard
+        value={[
+          newScheduleDraft({ id: 'sched_off', name: '周末挖标的', enabled: false, mode: 'interval', intervalMinutes: '360' }),
+        ]}
+        onChange={() => undefined}
+        nextRuns={[]}
+      />
+    </ToastProvider>,
+  );
+  assert.ok(html.includes('is-off'), '停用任务必须有 is-off（压暗）样式');
+  assert.ok(html.includes('每 360 分钟'), '按间隔的摘要未渲染');
+  assert.ok(html.includes('已停用'), '停用状态必须写明');
+  assert.ok(!html.includes('下次'), '停用任务不该显示下次运行时间');
+});
+
+test('设置页接线：定时任务走草稿 + 整体提交，Dashboard 徽标显示任务数量', () => {
+  const page = readSource('pages', 'Settings.tsx');
+  assert.ok(/<SchedulesCard/.test(page), '设置页未挂载定时任务卡片');
+  assert.ok(/schedules: next/.test(page), '卡片改动必须写回草稿的 schedules');
+  assert.ok(/signals\.nextRuns/.test(page), '每个任务的下次运行时间应来自 /api/dashboard 的 signs.nextRuns');
+  assert.ok(!/scheduleMode/.test(page), '旧的单任务字段不应再出现在设置页');
+
+  const card = readSource('pages', 'SettingsSchedules.tsx');
+  assert.ok(/MAX_SCHEDULES/.test(card), '添加上限必须与共享常量一致');
+  assert.ok(/props\.onChange\(\[\.\.\.tasks/.test(card), '添加任务 = 往数组里追加（数组形态的核心）');
+  assert.ok(/tasks\.filter\(\(entry\) => entry\.id !== task\.id\)/.test(card), '删除任务必须按 id 从数组移除');
+
+  const draft = readSource('pages', 'settingsDraft.ts');
+  assert.ok(/schedules: ScheduleTaskDraft\[\]/.test(draft), '草稿必须用数组保存多个任务');
+  assert.ok(/input\.schedules = draft\.schedules\.map\(toSchedulePayload\)/.test(draft), '保存时必须整体提交 schedules 数组');
+
+  const dashboard = readSource('pages', 'Dashboard.tsx');
+  assert.ok(/signals\.nextRuns/.test(dashboard), 'Dashboard 徽标应显示任务数量');
 });

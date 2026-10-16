@@ -17,7 +17,7 @@ import type {
   Market,
   Persona,
   ReportStyle,
-  ScheduleConfig,
+  ScheduleTask,
   StepStatus,
   ToolPolicy,
   ToolRisk,
@@ -35,7 +35,8 @@ export interface StoredSettings {
   llm: LlmConfig;
   dataSources: DataSourceConfig;
   budget: { CN: number; HK: number; US: number };
-  schedule: ScheduleConfig;
+  /** 定时任务列表（旧库的 `schedule_*` 单任务列会在读取时迁移到这个数组）。 */
+  schedules: ScheduleTask[];
   enforceBudget: boolean;
   watchlistCandidateLimit: number;
   /** P3 淘汰机制：连续 N 次分析仍被标记退役才真正删除；0 = 永不删除。 */

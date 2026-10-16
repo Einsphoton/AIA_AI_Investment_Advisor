@@ -116,15 +116,34 @@ export interface BudgetConfig {
   US: number;
 }
 
-export type ScheduleMode = 'off' | 'interval' | 'daily';
+/**
+ * 定时任务的触发方式。
+ *
+ * 这里**没有** `off`：整体开关已经取消，改为每个任务自己的 `enabled`
+ * （停用后配置保留但不排程），因为用户可以并存多个任务。
+ */
+export type ScheduleMode = 'interval' | 'daily';
 
-export interface ScheduleConfig {
+/**
+ * 一个定时任务（`Settings.schedules[i]`）。
+ *
+ * 2026-10 之前这里是一个整体配置 `Settings.schedule`；现在改成数组，可以并存多个：
+ * 例如「工作日 09:10 跑资产分析 + 投资建议」和「周日 20:00 只挖标的」互不干扰 ——
+ * 每个任务自带触发方式与要跑的步骤，跑完只重排自己那一条。
+ */
+export interface ScheduleTask {
+  /** 稳定 id（`sched_…`）：前端增删改与排程重载都靠它定位。 */
+  id: string;
+  /** 展示名，例如「工作日盘前」。 */
+  name: string;
+  /** 停用后配置保留、不再排程（等价于旧的 mode='off'，但按任务生效）。 */
+  enabled: boolean;
   mode: ScheduleMode;
-  /** Minutes between runs when mode === 'interval'. */
+  /** mode='interval'：两次运行之间的分钟数（≥1，从上次跑完算起）。 */
   intervalMinutes: number;
-  /** 'HH:mm' local time when mode === 'daily'. */
+  /** mode='daily'：本地时间 `HH:mm`。 */
   dailyTime: string;
-  /** Run the full pipeline (asset analysis → watchlist analysis → advice). */
+  /** 该任务连带执行的流水线步骤；三项全关的任务会被服务端拒绝。 */
   runAssetAnalysis: boolean;
   runWatchlistAnalysis: boolean;
   runAdvice: boolean;
@@ -186,7 +205,8 @@ export interface Settings {
   apiKeyMasked: string;
   dataSources: DataSourceConfig;
   budget: BudgetConfig;
-  schedule: ScheduleConfig;
+  /** 定时任务列表：每个任务独立触发、独立选择要跑的步骤。空数组 = 不排程。 */
+  schedules: ScheduleTask[];
   /** Whether budget enforcement blocks new buy advice. */
   enforceBudget: boolean;
   /** Max number of watchlist candidates the agent may create per run. */
@@ -210,7 +230,8 @@ export interface SettingsInput {
   llm?: Partial<LlmConfig>;
   dataSources?: Partial<DataSourceConfig>;
   budget?: Partial<BudgetConfig>;
-  schedule?: Partial<ScheduleConfig>;
+  /** 定时任务：**整体替换**（发送完整数组；省略该字段 = 保持不变）。 */
+  schedules?: ScheduleTask[];
   enforceBudget?: boolean;
   watchlistCandidateLimit?: number;
   watchlistRetireDeleteRuns?: number;
@@ -638,6 +659,44 @@ export interface BudgetStatus {
 
 /* ─────────────────────────────── dashboard ────────────────────────────────── */
 
+/**
+ * 当年收益统计（年化）。
+ *
+ * 全部由「真实账本 + 真实收盘价」确定性重算，口径写在 `notes` 里，可复算、可核对：
+ *   · 年化 = XIRR（资金加权内部收益率，actual/365），不是「收益率 ÷ 天数 × 365」的
+ *     外推——后者对不规则现金流是错的；
+ *   · 期初持仓按**上一年最后一天收盘价**估值（缺价时如实置 null，不给假数字）；
+ *   · 所有现金流含交易费用（真实现金流出/流入）。
+ */
+export interface PortfolioPerformance {
+  /** 统计年度（自然年，本地时区）。 */
+  year: number;
+  /** 估值起点：上一自然年最后一天（各标的取各自 ≤ 该日的最后收盘价）。 */
+  periodStart: string;
+  /** 估值终点（本地日期）。 */
+  periodEnd: string;
+  /** 期初持仓市值（折算为组合币种）；null = 缺少历史收盘价，无法估值。 */
+  openingValue: number | null;
+  /** 期末持仓总市值（折算后，等于 `marketValue`）。 */
+  endingValue: number;
+  /** 当年净投入 = 买入含费用 − 卖出净额（正 = 当年净追加资金）。 */
+  netInvested: number;
+  /** 当年已实现盈亏（与账本口径一致：不含交易费用）。 */
+  realizedPnl: number;
+  /** 当年组合年化收益率（XIRR，含费用），百分数；null = 不可度量。 */
+  annualizedPct: number | null;
+  /** 当年已实现年化收益率（仅当年卖出部分，含费用），百分数；null = 当年无卖出或不可度量。 */
+  realizedAnnualizedPct: number | null;
+  /** 全周期年化收益率（首次买入至今，XIRR，含费用）；null = 不可度量。 */
+  sinceInceptionPct: number | null;
+  /** 全周期起点（首次交易日）；null = 还没有任何买入。 */
+  sinceInceptionFrom: string | null;
+  /** 统计区间自然日数。 */
+  days: number;
+  /** 口径说明与降级原因（界面悬浮展示）。 */
+  notes: string[];
+}
+
 export interface DashboardPortfolio {
   marketValue: number;
   cost: number;
@@ -650,6 +709,8 @@ export interface DashboardPortfolio {
   dayChangePct: number;
   /** Rates used for conversion into `currency`, keyed by source currency. */
   fxRates: Record<string, number>;
+  /** 当年年化收益（XIRR）：Dashboard 第一行的「年化收益率 / 已实现年化收益率」。 */
+  performance: PortfolioPerformance;
 }
 
 export interface DashboardCounts {
@@ -677,8 +738,19 @@ export interface DashboardSignals {
   watchlistChanged: boolean;
   adviceChanged: boolean;
   priceStale: boolean;
+  /** 是否至少有一个启用的定时任务（等价于旧的 `mode !== 'off'`）。 */
   scheduleEnabled: boolean;
+  /** 所有启用任务中最近的一次运行时间。 */
   nextRunAt: string | null;
+  /** 每个启用任务各自的下次运行时间（按时间升序），供设置页逐个显示。 */
+  nextRuns: ScheduleNextRun[];
+}
+
+/** 一个启用任务的下次运行时间（`DashboardSignals.nextRuns` 的元素）。 */
+export interface ScheduleNextRun {
+  id: string;
+  name: string;
+  nextRunAt: string;
 }
 
 export interface DashboardPayload {

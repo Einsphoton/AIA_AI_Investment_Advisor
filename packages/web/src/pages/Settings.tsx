@@ -14,7 +14,6 @@ import {
 import type { DataSourceConfig, LlmProviderPreset, McpServerConfig, SettingsInput, ToolPolicy } from '@aia/shared';
 import { api } from '../api/client';
 import { toApiError, useAsync } from '../api/hooks';
-import { fmtDateTime } from '../format';
 import {
   Alert,
   Badge,
@@ -25,7 +24,6 @@ import {
   Field,
   Input,
   Loading,
-  Segmented,
   useToast,
 } from '../components/ui';
 import { DataSourcesCard } from './SettingsDataSources';
@@ -35,6 +33,7 @@ import { BackupCard } from './SettingsBackup';
 import { DangerZoneCard } from './SettingsDangerZone';
 import { ToolPolicyCard } from './SettingsToolPolicy';
 import { McpServersCard } from './SettingsMcpServers';
+import { SchedulesCard } from './SettingsSchedules';
 import { buildInput, isDirty, toDraft, type Draft } from './settingsDraft';
 
 /**
@@ -125,7 +124,6 @@ export function SettingsPage() {
   const toolPolicyDirty = toolPolicy && toolPolicyBase ? JSON.stringify(toolPolicy) !== JSON.stringify(toolPolicyBase) : false;
   const mcpServersDirty = mcpServers && mcpServersBase ? JSON.stringify(mcpServers) !== JSON.stringify(mcpServersBase) : false;
   const dirty = (draft && base ? isDirty(draft, base) : false) || toolPolicyDirty || mcpServersDirty;
-  const nextRunAt = dashboard.data?.signals.nextRunAt ?? null;
 
   function patch(changes: Partial<Draft>) {
     setDraft((previous) => (previous ? { ...previous, ...changes } : previous));
@@ -488,74 +486,12 @@ export function SettingsPage() {
         </div>
       </Card>
 
-      <Card
-        title="AI 定时任务"
-        actions={
-          <span className="tiny mute">
-            {draft.scheduleMode === 'off'
-              ? '定时任务已关闭'
-              : nextRunAt
-                ? `下次运行：${fmtDateTime(nextRunAt)}`
-                : '下次运行时间未知（服务端未返回）'}
-          </span>
-        }
-      >
-        <div className="toolbar mb-3">
-          <Segmented
-            value={draft.scheduleMode}
-            onChange={(mode) => patch({ scheduleMode: mode })}
-            options={[
-              { value: 'off', label: '关闭' },
-              { value: 'interval', label: '按间隔' },
-              { value: 'daily', label: '每天固定时间' },
-            ]}
-          />
-        </div>
-
-        {draft.scheduleMode === 'interval' && (
-          <div className="form-grid mb-3">
-            <Field label="运行间隔（分钟）">
-              <Input
-                inputMode="decimal"
-                value={draft.intervalMinutes}
-                onChange={(event) => patch({ intervalMinutes: event.target.value })}
-              />
-            </Field>
-          </div>
-        )}
-
-        {draft.scheduleMode === 'daily' && (
-          <div className="form-grid mb-3">
-            <Field label="每天运行时间（HH:mm）">
-              <Input type="time" value={draft.dailyTime} onChange={(event) => patch({ dailyTime: event.target.value })} />
-            </Field>
-          </div>
-        )}
-
-        {draft.scheduleMode !== 'off' && (
-          <>
-            <div className="tiny mute mb-2">每次定时运行连带执行的流水线：</div>
-            <div className="flex wrap gap-3">
-              <Checkbox
-                checked={draft.runAssetAnalysis}
-                onChange={(checked) => patch({ runAssetAnalysis: checked })}
-                label="资产分析"
-              />
-              <Checkbox
-                checked={draft.runWatchlistAnalysis}
-                onChange={(checked) => patch({ runWatchlistAnalysis: checked })}
-                label="标的分析"
-              />
-              <Checkbox checked={draft.runAdvice} onChange={(checked) => patch({ runAdvice: checked })} label="投资建议" />
-            </div>
-          </>
-        )}
-
-        <div className="divider" />
-        <div className="tiny mute">
-          定时任务在服务端按本地时区执行；修改后需点击「保存设置」。可前往「AI Chat」让 Agent 立即跑一次完整流水线。
-        </div>
-      </Card>
+      {/* AI 定时任务：数组形态，可并存多个任务（触发方式与步骤各自独立）。 */}
+      <SchedulesCard
+        value={draft.schedules}
+        onChange={(next) => patch({ schedules: next })}
+        nextRuns={dashboard.data?.signals.nextRuns ?? []}
+      />
 
       <BackupCard />
 

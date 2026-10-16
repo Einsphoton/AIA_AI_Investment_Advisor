@@ -15,7 +15,7 @@
  * 推理过程由全局右下角面板（AgentActivityDock）展示，不再占用页面空间。
  */
 import { Link } from 'react-router-dom';
-import type { DashboardPayload, Quote } from '@aia/shared';
+import type { DashboardPayload, PortfolioPerformance, Quote } from '@aia/shared';
 import { MARKET_LABELS, REPORT_STYLE_MAP, PERSONA_MAP } from '@aia/shared';
 import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
@@ -25,6 +25,37 @@ import { Alert, Badge, Button, Card, Empty, ErrorAlert, Loading, MarketTag, Prog
 import { InterruptedRunsAlert } from '../components/InterruptedRunsAlert';
 import { Sparkline } from '../components/charts/Sparkline';
 import { Markdown } from '../components/markdown/Markdown';
+
+/* ───────────────────────── 年化收益（第一行） ───────────────────────── */
+
+/** 年化收益率不显示正负号时也要着色；null（不可度量）保持中性。 */
+function returnTone(value: number | null | undefined): 'default' | 'pos' | 'neg' {
+  if (value === null || value === undefined || !Number.isFinite(value) || value === 0) return 'default';
+  return value > 0 ? 'pos' : 'neg';
+}
+
+/** 年化口径说明：数值怎么来的、期初期末是多少、为什么不可度量 —— 悬浮可查。 */
+function performanceHint(perf: PortfolioPerformance, kind: 'portfolio' | 'realized', currency: string): string {
+  const lines: string[] = [];
+  if (kind === 'portfolio') {
+    lines.push(`区间：${perf.periodStart} → ${perf.periodEnd}（${perf.days} 天）。`);
+    lines.push(`期初持仓市值：${perf.openingValue === null ? '不可得' : fmtMoney(perf.openingValue, currency)}（按 ${perf.periodStart} 收盘价折算）。`);
+    lines.push(`期末持仓市值：${fmtMoney(perf.endingValue, currency)}；当年净投入：${fmtSignedMoney(perf.netInvested, currency)}。`);
+    lines.push(
+      `全周期年化（${perf.sinceInceptionFrom ?? '尚无买入'} 起）：${
+        perf.sinceInceptionPct === null ? '不可度量' : fmtPct(perf.sinceInceptionPct)
+      }。`,
+    );
+  } else {
+    lines.push(`口径：只统计 ${perf.year} 年卖出掉的那部分份额。`);
+    lines.push('账面法（移动加权平均）没有批次，成本因此锚定在这些份额的加权平均买入日。');
+    lines.push(
+      `当年已实现盈亏（账本口径，不含费用）：${fmtSignedMoney(perf.realizedPnl, currency)}；年化结果含交易费用。`,
+    );
+  }
+  lines.push(...perf.notes);
+  return lines.join('\n');
+}
 
 export function DashboardPage() {
   const state = useAsync<DashboardPayload>(() => api.dashboard(), []);
@@ -40,6 +71,9 @@ export function DashboardPage() {
   const portfolio = payload?.portfolio;
   const counts = payload?.counts;
   const signals = payload?.signals;
+  // 旧服务端可能没有 performance 字段（滚动升级 / 缓存旧包）：缺了就不渲染这两个计数，
+  // 而不是让整页崩掉。左上角版本徽标会把「前后端版本不一致」直接标出来。
+  const perf = portfolio?.performance;
   const indices = liveIndices.data && liveIndices.data.length > 0 ? liveIndices.data : payload?.indices ?? [];
   const fxLines = portfolio
     ? Object.entries(portfolio.fxRates ?? {})
@@ -54,7 +88,10 @@ export function DashboardPage() {
           <span>数据更新于 {fmtDateTime(payload?.updatedAt)}</span>
           {signals?.priceStale && <Badge tone="warn">行情可能过期，建议刷新</Badge>}
           {signals?.scheduleEnabled && (
-            <Badge tone="ok">定时任务已开启{signals.nextRunAt ? ` · 下次 ${fmtDateTime(signals.nextRunAt)}` : ''}</Badge>
+            <Badge tone="ok">
+              定时任务已开启（{signals.nextRuns?.length ?? 0} 个）
+              {signals.nextRunAt ? ` · 下次 ${fmtDateTime(signals.nextRunAt)}` : ''}
+            </Badge>
           )}
           {payload?.briefing && (
             <Badge tone="ai">
@@ -129,6 +166,30 @@ export function DashboardPage() {
                 tone={portfolio.realizedPnl > 0 ? 'pos' : portfolio.realizedPnl < 0 ? 'neg' : 'default'}
                 sub="卖出部分累计落袋"
               />
+              {/* 年化收益率 / 已实现年化收益率：XIRR（资金加权，含费用），
+                  口径与降级原因在悬浮说明里逐条写明 —— 不可度量时显示 — 而不是 0。 */}
+              {perf && (
+                <>
+                  <StatCard
+                    label="年化收益率"
+                    value={fmtPct(perf.annualizedPct)}
+                    tone={returnTone(perf.annualizedPct)}
+                    sub={`${perf.year} 年至今 · ${perf.days} 天 · XIRR`}
+                    hint={performanceHint(perf, 'portfolio', portfolio.currency)}
+                  />
+                  <StatCard
+                    label="已实现年化收益率"
+                    value={fmtPct(perf.realizedAnnualizedPct)}
+                    tone={returnTone(perf.realizedAnnualizedPct)}
+                    sub={
+                      perf.realizedAnnualizedPct === null
+                        ? '当年没有卖出记录'
+                        : `当年卖出落袋 ${fmtSignedMoney(perf.realizedPnl, portfolio.currency)}`
+                    }
+                    hint={performanceHint(perf, 'realized', portfolio.currency)}
+                  />
+                </>
+              )}
             </div>
           </Card>
 

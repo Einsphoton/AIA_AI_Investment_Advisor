@@ -9,8 +9,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
-import { DEFAULT_DATA_SOURCES, DEFAULT_LLM, DEFAULT_PERSONA } from '@aia/shared';
+import { DEFAULT_DATA_SOURCES, DEFAULT_LLM, DEFAULT_PERSONA, type ScheduleTask } from '@aia/shared';
 
 import { createRepo } from '../src/db/repo.js';
 import { settingsPatch } from '../src/db/util.js';
@@ -36,6 +37,21 @@ function tempRepo(): { repo: Repo; dir: string } {
 
 let counter = 0;
 const uid = (): string => `${(counter += 1).toString().padStart(4, '0')}-${crypto.randomUUID()}`;
+
+/** 定时任务夹具（数组化之后的设置项）。 */
+function task(over: Partial<ScheduleTask> = {}): ScheduleTask {
+  return {
+    id: over.id ?? `sched_${uid()}`,
+    name: over.name ?? '测试任务',
+    enabled: over.enabled ?? true,
+    mode: over.mode ?? 'daily',
+    intervalMinutes: over.intervalMinutes ?? 1440,
+    dailyTime: over.dailyTime ?? '08:30',
+    runAssetAnalysis: over.runAssetAnalysis ?? true,
+    runWatchlistAnalysis: over.runWatchlistAnalysis ?? true,
+    runAdvice: over.runAdvice ?? true,
+  };
+}
 
 function newAsset(over: Partial<NewAsset> = {}): NewAsset {
   const id = over.id ?? uid();
@@ -132,7 +148,7 @@ test('repo: migrate 幂等且 settings 单行 seed 来自 @aia/shared 默认值'
     assert.equal(settings.budget.US, 1000);
     assert.equal(settings.enforceBudget, true);
     assert.equal(settings.watchlistCandidateLimit, 5);
-    assert.equal(settings.schedule.mode, 'off');
+    assert.equal(settings.schedules.length, 0, '出厂不预置定时任务');
     assert.equal(settings.dataSources.stockUS.provider, DEFAULT_DATA_SOURCES.stockUS.provider);
 
     // Reopening the same file (existing DB) keeps working.
@@ -154,7 +170,7 @@ test('repo: settings 深合并 + JSON 列 data_sources 往返', () => {
         llm: { model: 'deepseek-reasoner', apiKey: 'sk-secret-0001' },
         dataSources: { stockUS: { provider: 'tencent', enabled: false } },
         budget: { US: 2000 },
-        schedule: { mode: 'daily', dailyTime: '07:15' },
+        schedules: [task({ id: 'sched_a', name: '盘前', mode: 'daily', dailyTime: '07:15' })],
       }),
     );
 
@@ -167,18 +183,90 @@ test('repo: settings 深合并 + JSON 列 data_sources 往返', () => {
     assert.equal(saved.dataSources.stockCN.provider, 'auto', '其他槽位不受影响');
     assert.equal(saved.budget.US, 2000);
     assert.equal(saved.budget.CN, 5000);
-    assert.equal(saved.schedule.mode, 'daily');
-    assert.equal(saved.schedule.dailyTime, '07:15');
+    assert.equal(saved.schedules.length, 1);
+    assert.equal(saved.schedules[0]!.mode, 'daily');
+    assert.equal(saved.schedules[0]!.dailyTime, '07:15');
 
     const reloaded = repo.getSettings();
     assert.deepEqual(reloaded.dataSources, saved.dataSources);
     assert.equal(reloaded.llm.apiKey, 'sk-secret-0001');
-    assert.equal(reloaded.schedule.dailyTime, '07:15');
+    assert.deepEqual(reloaded.schedules, saved.schedules, '定时任务数组必须原样往返');
 
     // Clearing the key.
     assert.equal(repo.saveSettings(settingsPatch({ llm: { apiKey: '' } })).llm.apiKey, '');
   } finally {
     repo.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('repo: 定时任务数组整体替换、去重、旧列同步（可回滚）', () => {
+  const { repo, dir } = tempRepo();
+  try {
+    const first = task({ id: 'sched_a', name: '盘前', mode: 'interval', intervalMinutes: 90 });
+    const second = task({ id: 'sched_b', name: '周末', mode: 'daily', dailyTime: '20:00', enabled: false });
+    repo.saveSettings({ schedules: [first, second] });
+    assert.deepEqual(repo.getSettings().schedules, [first, second]);
+
+    // 整体替换语义：只发一个任务 = 另一个被删掉（不是合并）。
+    repo.saveSettings({ schedules: [second] });
+    assert.deepEqual(repo.getSettings().schedules.map((item) => item.id), ['sched_b']);
+
+    // 坏数据防御：重复 id / 结构不对的条目被丢弃，而不是让整个设置读不出来。
+    const sanitized = repo.saveSettings({
+      schedules: [
+        first,
+        { ...first } as unknown as ScheduleTask,
+        { id: 'broken' } as unknown as ScheduleTask,
+      ],
+    });
+    assert.deepEqual(sanitized.schedules.map((item) => item.id), ['sched_a']);
+
+    // 旧列同步：第一个**启用**任务写进 schedule_* 列（旧版本代码也能排程）。
+    repo.saveSettings({ schedules: [task({ id: 'sched_c', mode: 'interval', intervalMinutes: 45 })] });
+    repo.close();
+    const raw = new DatabaseSync(path.join(dir, 'advisor.db'));
+    const row = raw.prepare('SELECT schedule_mode, schedule_interval_minutes FROM settings WHERE id = 1').get() as {
+      schedule_mode: string;
+      schedule_interval_minutes: number;
+    };
+    assert.equal(row.schedule_mode, 'interval');
+    assert.equal(row.schedule_interval_minutes, 45);
+    raw.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('repo: 老库的单任务列（mode=daily）读取时迁移成 schedules 数组，且不会被重复迁移', () => {
+  const { repo, dir } = tempRepo();
+  repo.saveSettings({ schedules: [] });
+  repo.close();
+
+  // 模拟 2026-10 之前的库：schedules 列是空的，排程信息只在 schedule_* 列里。
+  const raw = new DatabaseSync(path.join(dir, 'advisor.db'));
+  raw
+    .prepare(
+      'UPDATE settings SET schedule_mode = ?, schedule_daily_time = ?, schedule_run_watchlist = ?, schedule_run_advice = ? WHERE id = 1',
+    )
+    .run('daily', '07:15', 0, 1);
+  raw.close();
+
+  const reopened = createRepo(path.join(dir, 'advisor.db'));
+  reopened.migrate();
+  try {
+    const migrated = reopened.getSettings();
+    assert.equal(migrated.schedules.length, 1, '旧库必须迁移出一个任务');
+    assert.equal(migrated.schedules[0]!.enabled, true);
+    assert.equal(migrated.schedules[0]!.mode, 'daily');
+    assert.equal(migrated.schedules[0]!.dailyTime, '07:15');
+    assert.equal(migrated.schedules[0]!.runWatchlistAnalysis, false, '步骤开关也要迁移');
+
+    // 用户删光任务后：不得因为旧列还留着历史值而「复活」一个幽灵任务。
+    reopened.saveSettings({ schedules: [] });
+    assert.deepEqual(reopened.getSettings().schedules, []);
+  } finally {
+    reopened.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -695,7 +783,7 @@ test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重�
     assert.equal(fresh.llm.apiKey, '');
     assert.equal(fresh.dataSources.stockUS.apiKey, undefined, '出厂默认的数据源槽位不含 Key');
     assert.equal(fresh.persona, DEFAULT_PERSONA);
-    assert.equal(fresh.schedule.mode, 'off');
+    assert.deepEqual(fresh.schedules, [], '恢复出厂后不保留任何定时任务');
   } finally {
     repo.close();
     fs.rmSync(dir, { recursive: true, force: true });

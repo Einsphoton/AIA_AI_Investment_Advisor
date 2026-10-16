@@ -298,12 +298,15 @@ export function fxRateInto(currency: string, fxRates: Record<string, number>): n
 /**
  * Aggregates every position into CNY. Closed positions keep contributing their
  * realised P&L but no market value / cost.
+ *
+ * `performance`（当年年化）由 `services/performance.ts` 计算后由调用方合并：
+ * 它需要历史收盘价（异步 + 可能降级），不能塞进这个纯同步函数。
  */
 export function summarizePortfolio(
   summaries: AssetSummary[],
   fxRates: Record<string, number>,
   currency = 'CNY',
-): DashboardPortfolio {
+): Omit<DashboardPortfolio, 'performance'> {
   let marketValue = 0;
   let cost = 0;
   let unrealizedPnl = 0;

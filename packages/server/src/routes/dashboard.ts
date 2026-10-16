@@ -13,8 +13,10 @@ import type {
   DashboardBriefing,
   DashboardCounts,
   DashboardPayload,
+  DashboardPortfolio,
   DashboardSignals,
   Quote,
+  ScheduleNextRun,
 } from '@aia/shared';
 
 import { getRepo, getScheduler } from '../registry.js';
@@ -22,8 +24,13 @@ import type { StoredSettings, TxRow } from '../types/models.js';
 import type { Scheduler } from '../types/agent.js';
 import { loadMarketBridge, localMonth, nowIso, parseJson, toNumber } from '../db/util.js';
 import { computeBudgetStatus, computePosition, summarizePortfolio, toAssetSummary } from '../services/portfolio.js';
+import { buildPortfolioPerformance, localDay } from '../services/performance.js';
+import { enabledTasks, nextFireAt } from '../services/schedule.js';
 import { getFxRatesResult } from '../services/fx.js';
 import { getActiveScheduler } from '../services/scheduler.js';
+
+/** 期初估值（历史收盘价）的整体超时：宁可当年年化显示「不可度量」，也不拖慢 Dashboard。 */
+const PERFORMANCE_DEADLINE_MS = 6000;
 
 export const BRIEFING_KV_KEY = 'dashboard.briefing';
 export const SEEN_WATCHLIST_KV_KEY = 'seen.watchlistAt';
@@ -59,24 +66,26 @@ function liveScheduler(): Scheduler | null {
 
 /**
  * Fallback only: when no scheduler instance exists (e.g. unit tests that build
- * the app without `index.ts`) we approximate the plan from the stored schedule.
+ * the app without `index.ts`) we approximate the plan from the stored tasks.
  * The live scheduler is authoritative — see `signals` below.
+ *
+ * 与实时排程同一套口径（`services/schedule.ts`）：interval 从上次运行时间起算，
+ * daily 取当天 `HH:mm`（已过则顺延）。返回每个启用任务各自的计划（升序）。
  */
-function computeNextRunAt(settings: StoredSettings, lastRunAt: string | null): string | null {
-  const schedule = settings.schedule;
-  if (schedule.mode === 'off') return null;
-  const now = new Date();
-  if (schedule.mode === 'interval') {
-    const base = timestamp(lastRunAt) || now.getTime();
-    const interval = Math.max(1, toNumber(schedule.intervalMinutes, 1440)) * 60_000;
-    const next = new Date(base + interval);
-    return (next.getTime() > now.getTime() ? next : now).toISOString();
-  }
-  const [hour, minute] = (schedule.dailyTime || '00:00').split(':').map((part) => toNumber(part));
-  const next = new Date(now);
-  next.setHours(Math.min(23, Math.max(0, hour)), Math.min(59, Math.max(0, minute)), 0, 0);
-  if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1);
-  return next.toISOString();
+function computePlan(settings: StoredSettings, lastRunAt: string | null): ScheduleNextRun[] {
+  const tasks = enabledTasks(settings.schedules);
+  if (tasks.length === 0) return [];
+  const now = Date.now();
+  const base = timestamp(lastRunAt) || now;
+  return tasks
+    .map((task) => {
+      const at =
+        task.mode === 'interval'
+          ? Math.max(now, base + Math.max(1, toNumber(task.intervalMinutes, 1440)) * 60_000)
+          : nextFireAt({ ...task, enabled: true }, now) ?? now;
+      return { id: task.id, name: task.name, nextRunAt: new Date(at).toISOString() };
+    })
+    .sort((a, b) => a.nextRunAt.localeCompare(b.nextRunAt));
 }
 
 function readBriefing(settings: StoredSettings): DashboardBriefing | null {
@@ -92,14 +101,29 @@ function readBriefing(settings: StoredSettings): DashboardBriefing | null {
   };
 }
 
+/**
+ * 可选 `?asOf=YYYY-MM-DD`（未来日期夹到今天）：把年化口径固定在某个估值日，
+ * 便于复核「当年年化到底怎么算出来的」（`GET /api/dashboard?asOf=2026-06-30`）。
+ * 不传就是今天 —— 与页面默认看到的一致。
+ */
+function resolveAsOf(query: unknown): string | undefined {
+  const raw = (query as { asOf?: unknown } | undefined)?.asOf;
+  if (typeof raw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return undefined;
+  if (!Number.isFinite(Date.parse(`${raw}T00:00:00Z`))) return undefined;
+  const today = localDay();
+  return raw > today ? today : raw;
+}
+
 export async function registerDashboardRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/dashboard', async (request): Promise<DashboardPayload> => {
     const repo = getRepo();
     const settings = repo.getSettings();
     const now = Date.now();
+    const asOf = resolveAsOf(request.query);
 
     const grouped = new Map<string, TxRow[]>();
-    for (const tx of repo.listTransactions()) {
+    const transactions = repo.listTransactions();
+    for (const tx of transactions) {
       const list = grouped.get(tx.assetId);
       if (list) list.push(tx);
       else grouped.set(tx.assetId, [tx]);
@@ -108,10 +132,25 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     const rows = repo.listAssets();
     const summaries: AssetSummary[] = rows.map((row) => toAssetSummary(row, grouped.get(row.id) ?? []));
 
-    /* ── block 1: portfolio (CNY) ── */
+    /* ── block 1: portfolio (CNY) + 当年年化（XIRR，真实账本 + 真实收盘价） ── */
     const fx = await getFxRatesResult(repo);
     if (fx.warning) request.log.warn({ warning: fx.warning }, 'fx rates fell back to built-in table');
-    const portfolio = summarizePortfolio(summaries, fx.rates);
+    const totals = summarizePortfolio(summaries, fx.rates);
+    const performance = await buildPortfolioPerformance({
+      cache: { get: (key) => repo.getKv(key) ?? null, set: (key, value) => repo.setKv(key, value) },
+      assets: rows,
+      transactions,
+      summaries,
+      fxRates: fx.rates,
+      currency: totals.currency,
+      asOf,
+      year: asOf ? Number(asOf.slice(0, 4)) : undefined,
+      deadlineMs: PERFORMANCE_DEADLINE_MS,
+    });
+    if (performance.annualizedPct === null) {
+      request.log.info({ notes: performance.notes }, 'portfolio annualized return not measurable');
+    }
+    const portfolio: DashboardPortfolio = { ...totals, performance };
 
     /* ── block 2: counts + signals ── */
     // 退役标的不计入「我的标的」，但数量单独展示；信号与「最近变化」仍看全部记录。
@@ -141,12 +180,15 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     const seenWatchAt = timestamp(repo.getKv(SEEN_WATCHLIST_KV_KEY));
     const seenAdviceAt = timestamp(repo.getKv(SEEN_ADVICE_KV_KEY));
 
-    // The scheduler is the source of truth: `scheduleEnabled` must mean "a run
-    // is really planned", not merely "mode !== off" (M1 regression).
+    // The scheduler is the source of truth — but only when it really has a plan.
+    // 现在排程的是一组任务：实时计划优先；实时计划为空时按设置推算，因为
+    // 「实例存在但读不到任务」（例如单例绑定的是另一个进程/已关闭的库）绝不能
+    // 把用户配置好的任务显示成「未开启」。
     const scheduler = liveScheduler();
-    const schedulerNext = scheduler?.nextRunAt() ?? null;
-    const scheduleEnabled = scheduler ? schedulerNext !== null : settings.schedule.mode !== 'off';
-    const nextRunAt = scheduler ? schedulerNext : computeNextRunAt(settings, counts.lastRunAt);
+    const livePlan = scheduler?.plan() ?? [];
+    const nextRuns = livePlan.length > 0 ? livePlan : computePlan(settings, counts.lastRunAt);
+    const scheduleEnabled = nextRuns.length > 0;
+    const nextRunAt = nextRuns[0]?.nextRunAt ?? null;
 
     const signals: DashboardSignals = {
       watchlistChanged: watchlist.length > 0 && (seenWatchAt === 0 || latestWatchAt > seenWatchAt),
@@ -159,6 +201,7 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
         }),
       scheduleEnabled,
       nextRunAt,
+      nextRuns,
     };
 
     // Mark the current version as seen so the badge clears until something new lands.
@@ -175,7 +218,7 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     const briefing = readBriefing(settings);
 
     /* ── extra: budget + indices ── */
-    const budget: BudgetStatus = computeBudgetStatus(rows, repo.listTransactions(), settings.budget, localMonth());
+    const budget: BudgetStatus = computeBudgetStatus(rows, transactions, settings.budget, localMonth());
 
     let indices: Quote[] = [];
     const bridge = await loadMarketBridge();
