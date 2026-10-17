@@ -370,6 +370,88 @@ try {
   const traceMissing = await call('GET', '/api/agent/runs/does-not-exist/trace');
   check('未知 run 的 trace 返回 404', traceMissing.status === 404, `status=${traceMissing.status}`);
 
+  /* ── 新股打新（docs/API.md §12） ──────────────────────────────────────── */
+  const ipoList = await call('GET', '/api/ipo');
+  check(
+    'GET /api/ipo 形状（items/counts/lastRefreshAt）',
+    ipoList.status === 200 &&
+      Array.isArray(ipoList.json?.items) &&
+      typeof ipoList.json?.counts?.total === 'number' &&
+      'lastRefreshAt' in (ipoList.json ?? {}) &&
+      Array.isArray(ipoList.json?.warnings),
+    `status=${ipoList.status} body=${ipoList.text.slice(0, 120)}`,
+  );
+
+  // 抓取失败必须降级成 warnings（200），绝不让上游故障变成 5xx。
+  const ipoRefresh = await call('POST', '/api/ipo/refresh', { markets: ['CN'], limitPerMarket: 5 });
+  check(
+    'POST /api/ipo/refresh 抓不到也不 5xx（降级为 warnings）',
+    ipoRefresh.status === 200 &&
+      typeof ipoRefresh.json?.inserted === 'number' &&
+      Array.isArray(ipoRefresh.json?.warnings) &&
+      (ipoRefresh.json.inserted > 0 || ipoRefresh.json.warnings.length > 0),
+    `status=${ipoRefresh.status} inserted=${ipoRefresh.json?.inserted} warnings=${JSON.stringify(ipoRefresh.json?.warnings ?? []).slice(0, 120)}`,
+  );
+
+  const ipoCreated = await call('POST', '/api/ipo', {
+    market: 'HK',
+    code: '09999',
+    name: '冒烟新股',
+    issuePrice: 8,
+    lotSize: 500,
+    maxShares: 5000,
+    subscribeEnd: '2000-01-01',
+    listingDate: '2999-01-01',
+  });
+  check('POST /api/ipo 手工录入', ipoCreated.status === 200 && Boolean(ipoCreated.json?.id), `status=${ipoCreated.status} body=${ipoCreated.text.slice(0, 120)}`);
+  // 建议信息完整性：胜率与预期收益是契约字段；未分析时必须是 0（未评估），不能拿别的数字冒充。
+  check(
+    'POST /api/ipo 带 winProbability / expectedReturn（未分析时为 0）',
+    ipoCreated.status === 200 && ipoCreated.json?.winProbability === 0 && ipoCreated.json?.expectedReturn === 0,
+    `winProbability=${ipoCreated.json?.winProbability} expectedReturn=${ipoCreated.json?.expectedReturn}`,
+  );
+  // 一句话理由：未分析时为空串（界面显示「—」），分析后由 save_ipo_analysis 写入。
+  check(
+    'POST /api/ipo 带 verdictReason（未分析时为空串）',
+    ipoCreated.status === 200 && ipoCreated.json?.verdictReason === '',
+    `verdictReason=${JSON.stringify(ipoCreated.json?.verdictReason)}`,
+  );
+  const ipoId = ipoCreated.json?.id;
+
+  const ipoSub = ipoId ? await call('POST', `/api/ipo/${ipoId}/subscribe`, { shares: 500 }) : { status: 0 };
+  check('POST /api/ipo/:id/subscribe 登记申购', ipoSub.status === 200 && ipoSub.json?.subscription?.status === 'applied', `status=${ipoSub.status} body=${ipoSub.text.slice(0, 120)}`);
+
+  const ipoAllot = ipoId ? await call('POST', `/api/ipo/${ipoId}/allot`, { shares: 500, price: 8, tradeDate: today }) : { status: 0 };
+  check(
+    'POST /api/ipo/:id/allot 中签自动入账（建资产 + ipo 流水）',
+    ipoAllot.status === 200 && ipoAllot.json?.assetCreated === true && ipoAllot.json?.offer?.subscription?.status === 'allotted',
+    `status=${ipoAllot.status} body=${ipoAllot.text.slice(0, 160)}`,
+  );
+  const ipoAssetId = ipoAllot.json?.asset?.id;
+  const ipoAsset = ipoAssetId ? await call('GET', `/api/assets/${ipoAssetId}`) : { status: 0 };
+  check(
+    '中签流水来源标为 ipo 且只写一笔',
+    ipoAsset.status === 200 && ipoAsset.json?.transactions?.length === 1 && ipoAsset.json.transactions[0].source === 'ipo',
+    `status=${ipoAsset.status} source=${ipoAsset.json?.transactions?.[0]?.source}`,
+  );
+
+  const ipoCorrection = ipoId ? await call('POST', `/api/ipo/${ipoId}/allot`, { shares: 200, price: 8, tradeDate: today }) : { status: 0 };
+  const ipoAssetFixed = ipoAssetId ? await call('GET', `/api/assets/${ipoAssetId}`) : { status: 0 };
+  check(
+    '重复回报中签 = 修正而不是累加',
+    ipoCorrection.status === 200 && ipoAssetFixed.json?.transactions?.length === 1 && ipoAssetFixed.json.transactions[0].shares === 200,
+    `status=${ipoCorrection.status} txs=${ipoAssetFixed.json?.transactions?.length} shares=${ipoAssetFixed.json?.transactions?.[0]?.shares}`,
+  );
+
+  const ipoMissing = await call('GET', '/api/ipo/does-not-exist');
+  check('未知新股返回 404', ipoMissing.status === 404, `status=${ipoMissing.status}`);
+
+  // 清理：删掉中签产生的资产与标的，避免影响后面的收尾断言。
+  if (ipoAssetId) await call('DELETE', `/api/assets/${ipoAssetId}`);
+  if (ipoId) await call('DELETE', `/api/ipo/${ipoId}`);
+  const ipoAfterCleanup = await call('GET', '/api/ipo?q=09999');
+  check('删除标的连带清掉列表记录', ipoAfterCleanup.status === 200 && ipoAfterCleanup.json?.items?.length === 0, `items=${ipoAfterCleanup.json?.items?.length}`);
+
 
   /* ── 行情（依赖网络，失败仅告警） ─────────────────────────────────────── */
   const quote = await call('GET', '/api/market/quote?market=CN&code=600519');

@@ -4,12 +4,25 @@
  */
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { MARKETS, MARKET_LABELS } from '@aia/shared';
-import type { AdviceItem, AdviceOutcome } from '@aia/shared';
+import { MARKETS, MARKET_LABELS, IPO_SOURCE_LABELS } from '@aia/shared';
+import type { AdviceItem, AdviceOutcome, IpoOffer } from '@aia/shared';
 import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { toApiError, useAsync } from '../api/hooks';
-import { fmtDateTime, fmtMoney, fmtPct, fmtPrice, fmtShares, pnlClass, safeNumber, todayIso } from '../format';
+import { fmtDate, fmtDateTime, fmtMoney, fmtNum, fmtPct, fmtPrice, fmtShares, pnlClass, safeNumber, todayIso } from '../format';
+import { IpoDetailDialog } from './IpoDetailDialog';
+import {
+  IPO_VERDICT_HINT,
+  IPO_VERDICT_TONE,
+  expectedReturnClass,
+  expectedReturnText,
+  priceText,
+  selectActionableIpoOffers,
+  truncateText,
+  verdictLabel,
+  verdictReasonText,
+  winRateText,
+} from './ipoView';
 import {
   Alert,
   Badge,
@@ -71,7 +84,12 @@ export function AdvicePage() {
   const settings = useAsync(() => api.settings.get(), []);
   const [trackNonce, setTrackNonce] = useState(0);
   const [tracking, setTracking] = useState(false);
+  /** 打新登记入口：从「打新建议」表格点按钮打开同一个详情/登记浮窗。 */
+  const [registerId, setRegisterId] = useState<string | null>(null);
   const outcomes = useAsync(() => api.advice.outcomes(), [nonce, trackNonce]);
+  // 打新结论也参与预算：中签缴款占用的现金必须从当月可用额度里扣掉，
+  // 所以建议页要能看到「正在招股 + AI 建议申购」的标的与建议股数。
+  const ipo = useAsync(() => api.ipo.list({ limit: 100 }), [nonce]);
   const llmMissing = settings.data !== null && !settings.data.hasApiKey;
   // 建议写作 / 资产写作 / 简报写作与运行结束都会刷新列表；
   // 推理过程与「新增 N 条建议」结论统一显示在右下角全局面板里。
@@ -79,6 +97,16 @@ export function AdvicePage() {
   useAgentRefresh(() => setNonce((value) => value + 1));
 
   const items = list.data?.items ?? [];
+  /** 正在招股 / 待申购的新股：这是会与买入建议抢当月现金的部分。 */
+  const ipoLive: IpoOffer[] = (ipo.data?.items ?? []).filter(
+    (offer) => offer.status === 'subscribing' || offer.status === 'upcoming',
+  );
+  /**
+   * 只把**值得下手**的放进这张表：AI 已明确「建议放弃」的不再占位
+   * （放弃的标的不会占用现金，列在这里只会稀释注意力），改成一句计数说明。
+   */
+  const { actionable: ipoActionable, avoided: ipoAvoided } = selectActionableIpoOffers(ipo.data?.items ?? []);
+  const ipoRegisterCount = ipoActionable.filter((offer) => offer.verdict === 'subscribe').length;
   // 运行中优先用 SSE 推送的实时预算（budget 事件）；运行结束后回落到列表返回的预算
   const budget = (running ? liveBudget : null) ?? list.data?.budget ?? null;
 
@@ -147,7 +175,8 @@ export function AdvicePage() {
         }
       >
         <div className="tiny mute mb-2">
-          点击「AI 投资建议」会先跑<strong>资产分析 → 标的分析</strong>，再汇总生成买入 / 卖出建议；买入建议受下方月度预算约束。
+          点击「AI 投资建议」会先跑<strong>资产分析 → 标的分析 → 打新分析</strong>，再汇总生成买入 / 卖出建议；买入建议受下方月度预算约束，
+          打新缴款同样占用当月资金。
           <br />
           每条建议都会 <strong>结合你的持仓与「我的标的」</strong>给出，并标注来源：<Badge tone="manual">持仓</Badge> 加仓 / 减仓、
           <Badge tone="ai">我的标的</Badge> 来自候选池、<Badge tone="warn">池外</Badge> 表示既非持仓也不在「我的标的」中
@@ -194,6 +223,145 @@ export function AdvicePage() {
           </div>
         )}
       </Card>
+
+      {/* 打新与买入建议共用同一份当月预算：正在招股且**还没被建议放弃**的标的必须在这里可见，
+          并且可以直接登记申购 / 中签（复用打新详情浮窗，不另造表单）。 */}
+      <Card
+        title={
+          <span className="center gap-2">
+            打新建议
+            {ipoActionable.length > 0 && <Badge>{ipoActionable.length} 只可打</Badge>}
+            {ipoRegisterCount > 0 && (
+              <Badge tone="ipo-subscribe" title={IPO_VERDICT_HINT.subscribe}>
+                {ipoRegisterCount} 只建议申购
+              </Badge>
+            )}
+          </span>
+        }
+        actions={
+          <div className="toolbar">
+            <Link to="/ipo" className="tiny">
+              全部新股 / 历史结论 →
+            </Link>
+            <Button
+              loading={running}
+              onClick={() => run({ path: '/ipo/analyze', title: 'AI 打新分析' })}
+            >
+              AI 打新分析
+            </Button>
+          </div>
+        }
+      >
+        {ipoLive.length === 0 ? (
+          <div className="tiny mute">
+            当前没有正在招股 / 待申购的新股（数据来自 {Object.values(IPO_SOURCE_LABELS).join(' · ')}）。
+            点击右上角「AI 打新分析」会先刷新新股信息再分析。
+          </div>
+        ) : ipoActionable.length === 0 ? (
+          <div className="tiny mute">
+            本批 {ipoAvoided.length} 只在招新股 AI 都建议放弃，因此这里不再列出（放弃的不会占用当月现金）。
+            如需查看理由，请前往「新股打新」页看 AI 结论全文。
+          </div>
+        ) : (
+          <>
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>新股</th>
+                    <th>市场</th>
+                    <th className="num">发行价</th>
+                    <th>申购截止</th>
+                    <th className="num">中签率 / 超购</th>
+                    <th className="num">胜率 / 预期收益</th>
+                    <th>AI 结论</th>
+                    <th>推荐理由</th>
+                    <th className="num">建议申购</th>
+                    <th>我的登记</th>
+                    <th className="right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ipoActionable.map((offer) => (
+                    <tr key={offer.id}>
+                      <td>
+                        <div className="strong">{offer.name || offer.code}</div>
+                        <div className="tiny mute mono">{offer.code}</div>
+                      </td>
+                      <td>
+                        <MarketTag market={offer.market} />
+                      </td>
+                      <td className="num mono tiny">{priceText(offer)}</td>
+                      <td className="tiny mono">{offer.subscribeEnd ? fmtDate(offer.subscribeEnd) : '未提供'}</td>
+                      <td className="num tiny">
+                        {offer.winningRate > 0 ? `${fmtNum(offer.winningRate, 2)}%` : '未提供'}
+                        {offer.oversubscribe > 0 ? ` / ${fmtNum(offer.oversubscribe, 1)}×` : ''}
+                      </td>
+                      <td className="num tiny">
+                        <div>{winRateText(offer)}</div>
+                        <div className={expectedReturnClass(offer)}>{expectedReturnText(offer)}</div>
+                      </td>
+                      <td>
+                        {offer.verdict ? (
+                          <Badge tone={IPO_VERDICT_TONE[offer.verdict]} title={IPO_VERDICT_HINT[offer.verdict]}>
+                            {verdictLabel(offer.verdict)}
+                          </Badge>
+                        ) : (
+                          <span className="tiny mute">待分析</span>
+                        )}
+                      </td>
+                      {/* 简明推荐理由：只说一句话（预算缺口 / 定价折价 / 破发风险），全文在详情里。 */}
+                      <td className="tiny" style={{ maxWidth: 260 }} title={verdictReasonText(offer) || undefined}>
+                        {verdictReasonText(offer) ? (
+                          truncateText(verdictReasonText(offer), 48)
+                        ) : (
+                          <span className="mute">—</span>
+                        )}
+                      </td>
+                      <td className="num mono tiny">{offer.suggestedShares > 0 ? `${fmtNum(offer.suggestedShares, 0)} 股` : '—'}</td>
+                      <td className="tiny">
+                        {offer.subscription
+                          ? `${fmtNum(offer.subscription.appliedShares, 0)} 股${
+                              offer.subscription.allottedShares > 0 ? ` · 中签 ${fmtNum(offer.subscription.allottedShares, 0)}` : ''
+                            }`
+                          : '未登记'}
+                      </td>
+                      <td>
+                        <div className="row-actions">
+                          <Button size="sm" onClick={() => setRegisterId(offer.id)}>
+                            {offer.subscription
+                              ? offer.subscription.status === 'allotted'
+                                ? '修改中签'
+                                : '登记中签'
+                              : offer.status === 'listed'
+                                ? '查看'
+                                : '登记申购'}
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="tiny mute mt-2">
+              中签率来自上游公告（「能不能买到」）；胜率与预期收益是 AI 推算（「买到之后赚不赚」）。
+              颜色为打新风险语义：绿=值得下手、红=建议放弃。
+              <br />
+              结论回答的是「<b>本期该不该打</b>」——已经把本月预算与一手入场费算进去，所以胜率高但预算不够时会显示
+              「中性观察」并在推荐理由里写明缺口；「胜率高」和「本期打不打得起」是两件事。
+              {ipoAvoided.length > 0 && `另有 ${ipoAvoided.length} 只已建议放弃，未列在此表。`}
+            </div>
+          </>
+        )}
+      </Card>
+
+      <IpoDetailDialog
+        id={registerId}
+        focusRegister
+        onClose={() => setRegisterId(null)}
+        onChanged={() => setNonce((value) => value + 1)}
+      />
 
       <Card
         title={`建议列表（${items.length}）`}

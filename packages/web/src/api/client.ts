@@ -30,6 +30,13 @@ import type {
   ImportMode,
   ImportResult,
   InstrumentSearchResult,
+  IpoAllotInput,
+  IpoAllotResult,
+  IpoListResponse,
+  IpoOffer,
+  IpoRefreshResult,
+  IpoSubscribeInput,
+  IpoUpsertInput,
   MacroSnapshot,
   NewsItem,
   PendingWrite,
@@ -214,6 +221,29 @@ export const api = {
     /** 建议结果追踪（确定性、不调用 LLM）：逐条实际表现 + 胜率统计。 */
     outcomes: () => request<AdviceOutcomesResponse>('/advice/outcomes'),
     trackOutcomes: () => request<AdviceOutcomesTrackResponse>('/advice/outcomes/track', json({})),
+  },
+
+  /* ── IPO 打新 ─────────────────────────────────────────────────────────── */
+  ipo: {
+    list: (query: { market?: string; status?: string; q?: string; limit?: number } = {}) =>
+      request<IpoListResponse>(`/ipo${qs(query)}`),
+    get: (id: string) => request<IpoOffer>(`/ipo/${encodeURIComponent(id)}`),
+    /** 抓取 A股/港股/美股三地新股（零 Key 公开源），按 uid 覆盖写入。 */
+    refresh: (input: { markets?: string[]; limitPerMarket?: number } = {}) =>
+      request<IpoRefreshResult>('/ipo/refresh', json(input)),
+    /** 手动录入一只新股（上游缺失或券商 App 信息更准时使用）。 */
+    create: (input: IpoUpsertInput) => request<IpoOffer>('/ipo', json(input)),
+    remove: (id: string) => request<{ ok: boolean }>(`/ipo/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    /** 登记「我申购了 N 股」（不写账本）。 */
+    subscribe: (id: string, input: IpoSubscribeInput) =>
+      request<IpoOffer>(`/ipo/${encodeURIComponent(id)}/subscribe`, json(input)),
+    unsubscribe: (id: string) =>
+      request<IpoOffer>(`/ipo/${encodeURIComponent(id)}/subscription`, { method: 'DELETE' }),
+    /** 登记中签：shares > 0 时自动建资产 + 买入流水；0 = 未中签。 */
+    allot: (id: string, input: IpoAllotInput) =>
+      request<IpoAllotResult>(`/ipo/${encodeURIComponent(id)}/allot`, json(input)),
+    /** 最近一次 AI 打新分析（SSE 走全局推理面板 `run({path:'/ipo/analyze'})`）。 */
+    lastAnalysis: () => request<AgentRunSummary | null>('/ipo/analyze/last'),
   },
 
   /* ── market ───────────────────────────────────────────────────────────── */

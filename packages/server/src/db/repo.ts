@@ -38,6 +38,7 @@ import {
   type ImportMode,
   type ImportResult,
   type InstrumentType,
+  type IpoMarketStatus,
   type Market,
   type McpServerConfig,
   type PendingWrite,
@@ -57,8 +58,13 @@ import type {
   AuditRow,
   ChatMessageRow,
   ChatSessionRow,
+  IpoOfferPatch,
+  IpoOfferRow,
+  IpoSubscriptionRow,
   NewAdvice,
   NewAsset,
+  NewIpoOffer,
+  NewIpoSubscription,
   NewStep,
   NewTx,
   NewWatch,
@@ -153,6 +159,77 @@ function rowToWatch(row: Row): WatchRow {
     retiredReason: str(row.retired_reason),
     retiredAt: nullableStr(row.retired_at),
     retireStreak: int(row.retire_streak, 0),
+    createdAt: str(row.created_at),
+    updatedAt: str(row.updated_at),
+  };
+}
+
+function rowToIpoOffer(row: Row): IpoOfferRow {
+  return {
+    id: str(row.id),
+    uid: str(row.uid),
+    market: str(row.market, 'CN') as IpoOfferRow['market'],
+    code: str(row.code),
+    subscribeCode: str(row.subscribe_code),
+    name: str(row.name),
+    source: str(row.source, 'manual'),
+    exchange: str(row.exchange),
+    board: str(row.board),
+    issuePrice: toNumber(row.issue_price),
+    priceLow: toNumber(row.price_low),
+    priceHigh: toNumber(row.price_high),
+    currency: str(row.currency, 'CNY'),
+    lotSize: toNumber(row.lot_size),
+    maxShares: toNumber(row.max_shares),
+    subscribeStart: nullableStr(row.subscribe_start),
+    subscribeEnd: nullableStr(row.subscribe_end),
+    allotmentDate: nullableStr(row.allotment_date),
+    listingDate: nullableStr(row.listing_date),
+    issueShares: toNumber(row.issue_shares),
+    raiseAmount: toNumber(row.raise_amount),
+    issuePe: toNumber(row.issue_pe),
+    industryPe: toNumber(row.industry_pe),
+    winningRate: toNumber(row.winning_rate),
+    oversubscribe: toNumber(row.oversubscribe),
+    sponsor: str(row.sponsor),
+    industry: str(row.industry),
+    prospectusUrl: str(row.prospectus_url),
+    status: str(row.status, 'unknown') as IpoOfferRow['status'],
+    advice: str(row.advice),
+    // 空串/缺失一律给 null：界面据此判断「还没分析」，不给假结论。
+    verdict: str(row.verdict) === '' ? null : (str(row.verdict) as IpoOfferRow['verdict']),
+    verdictReason: str(row.verdict_reason),
+    suggestedShares: toNumber(row.suggested_shares),
+    winProbability: toNumber(row.win_probability),
+    expectedReturn: toNumber(row.expected_return),
+    confidence: toNumber(row.confidence),
+    qualityScore: toNumber(row.quality_score),
+    adviceAt: nullableStr(row.advice_at),
+    adviceRunId: nullableStr(row.advice_run_id),
+    note: str(row.note),
+    createdAt: str(row.created_at),
+    updatedAt: str(row.updated_at),
+  };
+}
+
+function rowToIpoSubscription(row: Row): IpoSubscriptionRow {
+  return {
+    id: str(row.id),
+    offerUid: str(row.offer_uid),
+    market: str(row.market, 'CN') as IpoSubscriptionRow['market'],
+    code: str(row.code),
+    name: str(row.name),
+    status: str(row.status, 'applied') as IpoSubscriptionRow['status'],
+    appliedShares: toNumber(row.applied_shares),
+    allottedShares: toNumber(row.allotted_shares),
+    price: toNumber(row.price),
+    fee: toNumber(row.fee),
+    currency: str(row.currency, 'CNY'),
+    appliedAt: str(row.applied_at),
+    allottedAt: nullableStr(row.allotted_at),
+    assetId: nullableStr(row.asset_id),
+    transactionId: nullableStr(row.transaction_id),
+    note: str(row.note),
     createdAt: str(row.created_at),
     updatedAt: str(row.updated_at),
   };
@@ -289,6 +366,8 @@ function normalizeScheduleTask(input: unknown): ScheduleTask | null {
     dailyTime,
     runAssetAnalysis: raw.runAssetAnalysis === undefined ? true : raw.runAssetAnalysis === true,
     runWatchlistAnalysis: raw.runWatchlistAnalysis === undefined ? true : raw.runWatchlistAnalysis === true,
+    // 2026-10 新增的打新分析步骤：老任务没有该字段时按「开启」处理（与其它步骤一致）。
+    runIpoAnalysis: raw.runIpoAnalysis === undefined ? true : raw.runIpoAnalysis === true,
     runAdvice: raw.runAdvice === undefined ? true : raw.runAdvice === true,
   };
 }
@@ -328,6 +407,7 @@ function rowToSchedules(row: Row): ScheduleTask[] {
       dailyTime: str(row.schedule_daily_time, DEFAULT_SCHEDULE_TASK.dailyTime),
       runAssetAnalysis: bool(row.schedule_run_asset, DEFAULT_SCHEDULE_TASK.runAssetAnalysis),
       runWatchlistAnalysis: bool(row.schedule_run_watchlist, DEFAULT_SCHEDULE_TASK.runWatchlistAnalysis),
+      runIpoAnalysis: DEFAULT_SCHEDULE_TASK.runIpoAnalysis,
       runAdvice: bool(row.schedule_run_advice, DEFAULT_SCHEDULE_TASK.runAdvice),
     },
   ];
@@ -528,6 +608,8 @@ const CLEARED_TABLES = [
   'watchlist',
   'advice',
   'advice_outcomes',
+  'ipo_subscriptions',
+  'ipo_offers',
   'agent_steps',
   'agent_run_messages',
   'agent_runs',
@@ -980,6 +1062,247 @@ class SqliteRepo implements Repo {
     return this.run('DELETE FROM watchlist').changes;
   }
 
+  /* ── 新股打新 (IPO) ────────────────────────────────────────────────────── */
+
+  /**
+   * 打新标的列表。
+   *
+   * 排序刻意用「申购日倒序 + 上市日倒序」：最新的发行季在最上面，而还没确定申购日
+   * 的（`subscribe_start IS NULL`）退到后面 —— SQLite 里 `NULL` 排在最前，所以显式
+   * 用 `IS NULL` 作为第一排序键。
+   */
+  listIpoOffers(filter: { market?: Market; status?: IpoMarketStatus; limit?: number } = {}): IpoOfferRow[] {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filter.market) {
+      where.push('market = ?');
+      params.push(filter.market);
+    }
+    if (filter.status) {
+      where.push('status = ?');
+      params.push(filter.status);
+    }
+    const limit = Number.isFinite(filter.limit) && (filter.limit ?? 0) > 0 ? Math.trunc(filter.limit as number) : 500;
+    const sql =
+      `SELECT * FROM ipo_offers${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''}` +
+      ` ORDER BY subscribe_start IS NULL, subscribe_start DESC, listing_date IS NULL, listing_date DESC, name ASC LIMIT ?`;
+    return this.all(sql, ...params, limit).map(rowToIpoOffer);
+  }
+
+  getIpoOffer(id: string): IpoOfferRow | undefined {
+    const row = this.get('SELECT * FROM ipo_offers WHERE id = ?', id);
+    return row ? rowToIpoOffer(row) : undefined;
+  }
+
+  findIpoOfferByUid(uid: string): IpoOfferRow | undefined {
+    const row = this.get('SELECT * FROM ipo_offers WHERE uid = ?', uid);
+    return row ? rowToIpoOffer(row) : undefined;
+  }
+
+  createIpoOffer(input: NewIpoOffer): IpoOfferRow {
+    try {
+      this.run(
+        `INSERT INTO ipo_offers (
+           id, uid, market, code, subscribe_code, name, source, exchange, board, issue_price, price_low, price_high,
+           currency, lot_size, max_shares, subscribe_start, subscribe_end, allotment_date, listing_date, issue_shares,
+           raise_amount, issue_pe, industry_pe, winning_rate, oversubscribe, sponsor, industry, prospectus_url, status,
+           note, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        input.id,
+        input.uid,
+        input.market,
+        input.code ?? '',
+        input.subscribeCode ?? '',
+        input.name ?? '',
+        input.source ?? 'manual',
+        input.exchange ?? '',
+        input.board ?? '',
+        input.issuePrice ?? 0,
+        input.priceLow ?? 0,
+        input.priceHigh ?? 0,
+        input.currency ?? DEFAULT_CURRENCY(input.market),
+        input.lotSize ?? 0,
+        input.maxShares ?? 0,
+        input.subscribeStart ?? null,
+        input.subscribeEnd ?? null,
+        input.allotmentDate ?? null,
+        input.listingDate ?? null,
+        input.issueShares ?? 0,
+        input.raiseAmount ?? 0,
+        input.issuePe ?? 0,
+        input.industryPe ?? 0,
+        input.winningRate ?? 0,
+        input.oversubscribe ?? 0,
+        input.sponsor ?? '',
+        input.industry ?? '',
+        input.prospectusUrl ?? '',
+        input.status ?? 'unknown',
+        input.note ?? '',
+        input.createdAt ?? nowIso(),
+        nowIso(),
+      );
+    } catch (error) {
+      wrapDbError(error, `新股已存在：${input.uid}`, '新股写入失败：关联记录缺失');
+    }
+    const created = this.getIpoOffer(input.id);
+    if (!created) throw new Error(`createIpoOffer: row ${input.id} disappeared after insert`);
+    return created;
+  }
+
+  updateIpoOffer(id: string, patch: IpoOfferPatch): IpoOfferRow | undefined {
+    const map: Array<[keyof IpoOfferPatch, string]> = [
+      ['market', 'market'],
+      ['code', 'code'],
+      ['subscribeCode', 'subscribe_code'],
+      ['name', 'name'],
+      ['source', 'source'],
+      ['exchange', 'exchange'],
+      ['board', 'board'],
+      ['issuePrice', 'issue_price'],
+      ['priceLow', 'price_low'],
+      ['priceHigh', 'price_high'],
+      ['currency', 'currency'],
+      ['lotSize', 'lot_size'],
+      ['maxShares', 'max_shares'],
+      ['subscribeStart', 'subscribe_start'],
+      ['subscribeEnd', 'subscribe_end'],
+      ['allotmentDate', 'allotment_date'],
+      ['listingDate', 'listing_date'],
+      ['issueShares', 'issue_shares'],
+      ['raiseAmount', 'raise_amount'],
+      ['issuePe', 'issue_pe'],
+      ['industryPe', 'industry_pe'],
+      ['winningRate', 'winning_rate'],
+      ['oversubscribe', 'oversubscribe'],
+      ['sponsor', 'sponsor'],
+      ['industry', 'industry'],
+      ['prospectusUrl', 'prospectus_url'],
+      ['status', 'status'],
+      ['advice', 'advice'],
+      ['verdict', 'verdict'],
+      ['verdictReason', 'verdict_reason'],
+      ['suggestedShares', 'suggested_shares'],
+      ['winProbability', 'win_probability'],
+      ['expectedReturn', 'expected_return'],
+      ['confidence', 'confidence'],
+      ['qualityScore', 'quality_score'],
+      ['adviceAt', 'advice_at'],
+      ['adviceRunId', 'advice_run_id'],
+      ['note', 'note'],
+    ];
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    for (const [key, column] of map) {
+      const value = patch[key];
+      if (value === undefined) continue;
+      sets.push(`${column} = ?`);
+      values.push(value);
+    }
+    if (sets.length === 0) return this.getIpoOffer(id);
+    sets.push('updated_at = ?');
+    values.push(nowIso());
+    try {
+      const result = this.run(`UPDATE ipo_offers SET ${sets.join(', ')} WHERE id = ?`, ...values, id);
+      if (result.changes === 0) return undefined;
+    } catch (error) {
+      wrapDbError(error, '新股更新失败：已存在相同 uid 的记录', '新股更新失败：关联记录缺失');
+    }
+    return this.getIpoOffer(id);
+  }
+
+  deleteIpoOffer(id: string): boolean {
+    return this.transaction(() => {
+      const row = this.get('SELECT uid FROM ipo_offers WHERE id = ?', id);
+      if (!row) return false;
+      // 申购记录按 uid 关联（不是外键），必须显式删除，否则会留下悬挂记录。
+      this.run('DELETE FROM ipo_subscriptions WHERE offer_uid = ?', str(row.uid));
+      return this.run('DELETE FROM ipo_offers WHERE id = ?', id).changes > 0;
+    });
+  }
+
+  listIpoSubscriptions(): IpoSubscriptionRow[] {
+    return this.all('SELECT * FROM ipo_subscriptions ORDER BY applied_at DESC, name ASC').map(rowToIpoSubscription);
+  }
+
+  getIpoSubscription(offerUid: string): IpoSubscriptionRow | undefined {
+    const row = this.get('SELECT * FROM ipo_subscriptions WHERE offer_uid = ?', offerUid);
+    return row ? rowToIpoSubscription(row) : undefined;
+  }
+
+  /**
+   * 插入或更新申购记录（按 `offerUid` 唯一）。
+   *
+   * 刻意做成 upsert 而不是 create/update 两个方法：登记申购与录入中签都作用于同一条
+   * 记录，重复提交（网络重试、AI 工具重复调用）必须收敛成一条，而不是报冲突或产生第二行。
+   */
+  upsertIpoSubscription(input: NewIpoSubscription): IpoSubscriptionRow {
+    const existing = this.getIpoSubscription(input.offerUid);
+    const now = nowIso();
+    if (existing) {
+      const patch: Array<[unknown, string]> = [
+        [input.status, 'status'],
+        [input.appliedShares, 'applied_shares'],
+        [input.allottedShares, 'allotted_shares'],
+        [input.price, 'price'],
+        [input.fee, 'fee'],
+        [input.currency, 'currency'],
+        [input.appliedAt, 'applied_at'],
+        [input.allottedAt, 'allotted_at'],
+        [input.assetId, 'asset_id'],
+        [input.transactionId, 'transaction_id'],
+        [input.note, 'note'],
+        [input.code, 'code'],
+        [input.name, 'name'],
+      ];
+      const sets: string[] = [];
+      const values: unknown[] = [];
+      for (const [value, column] of patch) {
+        if (value === undefined) continue;
+        sets.push(`${column} = ?`);
+        values.push(value);
+      }
+      if (sets.length > 0) {
+        sets.push('updated_at = ?');
+        values.push(now);
+        this.run(`UPDATE ipo_subscriptions SET ${sets.join(', ')} WHERE id = ?`, ...values, existing.id);
+      }
+      const updated = this.getIpoSubscription(input.offerUid);
+      if (!updated) throw new Error(`upsertIpoSubscription: row ${existing.id} disappeared after update`);
+      return updated;
+    }
+    this.run(
+      `INSERT INTO ipo_subscriptions (
+         id, offer_uid, market, code, name, status, applied_shares, allotted_shares, price, fee, currency,
+         applied_at, allotted_at, asset_id, transaction_id, note, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      input.id,
+      input.offerUid,
+      input.market,
+      input.code ?? '',
+      input.name ?? '',
+      input.status ?? 'applied',
+      input.appliedShares ?? 0,
+      input.allottedShares ?? 0,
+      input.price ?? 0,
+      input.fee ?? 0,
+      input.currency ?? DEFAULT_CURRENCY(input.market),
+      input.appliedAt,
+      input.allottedAt ?? null,
+      input.assetId ?? null,
+      input.transactionId ?? null,
+      input.note ?? '',
+      input.createdAt ?? now,
+      now,
+    );
+    const created = this.getIpoSubscription(input.offerUid);
+    if (!created) throw new Error(`upsertIpoSubscription: row ${input.offerUid} disappeared after insert`);
+    return created;
+  }
+
+  deleteIpoSubscription(id: string): boolean {
+    return this.run('DELETE FROM ipo_subscriptions WHERE id = ?', id).changes > 0;
+  }
+
   /* ── advice ────────────────────────────────────────────────────────────── */
 
   listAdvice(filter: { status?: AdviceRow['status']; batchId?: string; limit?: number } = {}): AdviceRow[] {
@@ -1381,24 +1704,42 @@ class SqliteRepo implements Repo {
       transactions: this.listTransactions(),
       watchlist: this.listWatchlist('all'),
       advice: this.listAdvice(),
+      // 打新：标的按 uid 全量导出，申购记录一并带上（否则恢复后「我中签了多少股」全丢）。
+      ipoOffers: this.listIpoOffers({ limit: 100_000 }),
+      ipoSubscriptions: this.listIpoSubscriptions(),
     };
   }
 
   importAll(bundle: ExportBundle, mode: ImportMode): ImportResult {
     return this.transaction(() => {
-      const result: ImportResult = { assets: 0, transactions: 0, watchlist: 0, advice: 0, skipped: 0, mode };
+      const result: ImportResult = {
+        assets: 0,
+        transactions: 0,
+        watchlist: 0,
+        advice: 0,
+        ipoOffers: 0,
+        ipoSubscriptions: 0,
+        skipped: 0,
+        mode,
+      };
 
       if (mode === 'replace') {
         this.run('DELETE FROM transactions');
         this.run('DELETE FROM assets');
         this.run('DELETE FROM watchlist');
         this.run('DELETE FROM advice');
+        this.run('DELETE FROM ipo_subscriptions');
+        this.run('DELETE FROM ipo_offers');
       }
 
       const knownAssetIds = new Set(this.all('SELECT id FROM assets').map((row) => str(row.id)));
       const knownTxIds = new Set(this.all('SELECT id FROM transactions').map((row) => str(row.id)));
       const knownWatchIds = new Set(this.all('SELECT id FROM watchlist').map((row) => str(row.id)));
       const knownAdviceIds = new Set(this.all('SELECT id FROM advice').map((row) => str(row.id)));
+      const knownIpoIds = new Set(this.all('SELECT id FROM ipo_offers').map((row) => str(row.id)));
+      const knownIpoUids = new Set(this.all('SELECT uid FROM ipo_offers').map((row) => str(row.uid)));
+      const knownSubIds = new Set(this.all('SELECT id FROM ipo_subscriptions').map((row) => str(row.id)));
+      const knownSubUids = new Set(this.all('SELECT offer_uid FROM ipo_subscriptions').map((row) => str(row.offer_uid)));
 
       for (const asset of bundle.assets ?? []) {
         if (!isValidAssetRow(asset) || knownAssetIds.has(asset.id)) {
@@ -1456,6 +1797,43 @@ class SqliteRepo implements Repo {
         }
       }
 
+      // 打新标的：按 id 与 uid 双重去重，避免同一只新股以两条记录落在库里。
+      for (const item of bundle.ipoOffers ?? []) {
+        if (!isValidIpoOfferRow(item) || knownIpoIds.has(item.id) || knownIpoUids.has(item.uid)) {
+          result.skipped += 1;
+          continue;
+        }
+        try {
+          this.insertIpoOfferRow(item);
+          knownIpoIds.add(item.id);
+          knownIpoUids.add(item.uid);
+          result.ipoOffers += 1;
+        } catch {
+          result.skipped += 1;
+        }
+      }
+
+      // 申购记录必须指向已存在的新股（uid），否则会变成查不到的悬挂记录。
+      for (const item of bundle.ipoSubscriptions ?? []) {
+        if (
+          !isValidIpoSubscriptionRow(item) ||
+          knownSubIds.has(item.id) ||
+          knownSubUids.has(item.offerUid) ||
+          !knownIpoUids.has(item.offerUid)
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        try {
+          this.upsertIpoSubscription(item);
+          knownSubIds.add(item.id);
+          knownSubUids.add(item.offerUid);
+          result.ipoSubscriptions += 1;
+        } catch {
+          result.skipped += 1;
+        }
+      }
+
       return result;
     });
   }
@@ -1490,6 +1868,8 @@ class SqliteRepo implements Repo {
         watchlist: counts.watchlist,
         advice: counts.advice,
         adviceOutcomes: counts.advice_outcomes,
+        ipoOffers: counts.ipo_offers,
+        ipoSubscriptions: counts.ipo_subscriptions,
         runs: counts.agent_runs,
         steps: counts.agent_steps,
         runMessages: counts.agent_run_messages,
@@ -1563,6 +1943,41 @@ class SqliteRepo implements Repo {
         decidedAt: row.decidedAt,
       });
     }
+  }
+
+  /** 打新标的的整体插入（`createIpoOffer` + AI 结论字段），用于备份恢复。 */
+  private insertIpoOfferRow(row: IpoOfferRow): void {
+    this.createIpoOffer(row);
+    this.updateIpoOffer(row.id, {
+      exchange: row.exchange,
+      board: row.board,
+      priceLow: row.priceLow,
+      priceHigh: row.priceHigh,
+      subscribeStart: row.subscribeStart,
+      subscribeEnd: row.subscribeEnd,
+      allotmentDate: row.allotmentDate,
+      listingDate: row.listingDate,
+      issueShares: row.issueShares,
+      raiseAmount: row.raiseAmount,
+      industryPe: row.industryPe,
+      winningRate: row.winningRate,
+      oversubscribe: row.oversubscribe,
+      industry: row.industry,
+      prospectusUrl: row.prospectusUrl,
+      status: row.status,
+      advice: row.advice,
+      verdict: row.verdict,
+      verdictReason: row.verdictReason,
+      suggestedShares: row.suggestedShares,
+      winProbability: row.winProbability,
+      expectedReturn: row.expectedReturn,
+      confidence: row.confidence,
+      qualityScore: row.qualityScore,
+      adviceAt: row.adviceAt,
+      adviceRunId: row.adviceRunId,
+      note: row.note,
+    });
+    this.run('UPDATE ipo_offers SET updated_at = ? WHERE id = ?', row.updatedAt ?? nowIso(), row.id);
   }
 
   /* ── helpers ───────────────────────────────────────────────────────────── */
@@ -1770,7 +2185,10 @@ const MARKETS = new Set(['CN', 'HK', 'US']);
 const TYPES = new Set(['stock', 'etf', 'fund']);
 const CREATORS = new Set(['manual', 'ai']);
 const TX_KINDS = new Set(['buy', 'sell']);
-const TX_SOURCES = new Set(['manual', 'ai', 'advice']);
+const TX_SOURCES = new Set(['manual', 'ai', 'advice', 'ipo']);
+const IPO_STATUSES = new Set(['upcoming', 'subscribing', 'allotted', 'listed', 'unknown']);
+const IPO_VERDICTS = new Set(['subscribe', 'neutral', 'avoid']);
+const IPO_SUB_STATUSES = new Set(['applied', 'allotted', 'missed']);
 
 function isNonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
@@ -1818,5 +2236,29 @@ function isValidAdviceRow(row: AdviceRow): boolean {
     MARKETS.has(row.market) &&
     TYPES.has(row.type) &&
     (row.action === 'buy' || row.action === 'sell')
+  );
+}
+
+function isValidIpoOfferRow(row: IpoOfferRow): boolean {
+  return (
+    !!row &&
+    isNonEmpty(row.id) &&
+    isNonEmpty(row.uid) &&
+    isNonEmpty(row.name) &&
+    MARKETS.has(row.market) &&
+    (!row.status || IPO_STATUSES.has(row.status)) &&
+    (!row.verdict || IPO_VERDICTS.has(row.verdict))
+  );
+}
+
+function isValidIpoSubscriptionRow(row: IpoSubscriptionRow): boolean {
+  return (
+    !!row &&
+    isNonEmpty(row.id) &&
+    isNonEmpty(row.offerUid) &&
+    MARKETS.has(row.market) &&
+    Number.isFinite(row.appliedShares) &&
+    Number.isFinite(row.allottedShares) &&
+    (!row.status || IPO_SUB_STATUSES.has(row.status))
   );
 }

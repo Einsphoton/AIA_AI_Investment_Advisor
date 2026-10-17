@@ -30,7 +30,7 @@ AIInvestmentAdvisor/
 │   ├── dev.ps1 / dev.sh        # Windows / macOS 一键脚本
 │   ├── build.ps1 / build.sh    # typecheck + build + test
 │   ├── run-tests.mjs           # 同进程测试运行器（替代 node --test <dir>）
-│   ├── smoke-api.mjs           # 端到端 API 冒烟（47 项断言）
+│   ├── smoke-api.mjs           # 端到端 API 冒烟（90+ 项断言）
 │   ├── check-deploy.mjs        # compose/Dockerfile 校验 + 镜像 runtime 闭包复现
 │   └── probe-sources.mjs       # 数据源连通性自检
 ├── docs/{ARCHITECTURE,API,SOURCES,VERIFY,VERIFY-REPORT}.md
@@ -41,10 +41,10 @@ AIInvestmentAdvisor/
 │   │   ├── index.ts app.ts config.ts errors.ts registry.ts   # 启动 / 装配 / 进程配置 / 错误 / 服务定位
 │   │   ├── types/{models.ts,repo.ts,agent.ts}                # 冻结的仓储与 Agent 接口
 │   │   ├── db/{schema.ts,repo.ts,util.ts}
-│   │   ├── datasources/{types.ts,http.ts,registry.ts,eastmoney.ts,tencent.ts,fund.ts,macro.ts,news.ts,websearch.ts,keyed.ts}
+│   │   ├── datasources/{types.ts,http.ts,registry.ts,eastmoney.ts,tencent.ts,fund.ts,macro.ts,news.ts,websearch.ts,keyed.ts,ipo.ts}
 │   │   ├── agent/{loop.ts,llm.ts,tools.ts,prompts.ts,runtime.ts,budget.ts,positions.ts}
-│   │   ├── services/{portfolio.ts,analytics.ts,briefing.ts,advice.ts,scheduler.ts,backup.ts,fx.ts}
-│   │   └── routes/{index.ts,sse.ts,settings.ts,assets.ts,watchlist.ts,advice.ts,dashboard.ts,market.ts,chat.ts,agent.ts,backup.ts}
+│   │   ├── services/{portfolio.ts,analytics.ts,briefing.ts,advice.ts,ipo.ts,scheduler.ts,backup.ts,fx.ts}
+│   │   └── routes/{index.ts,sse.ts,settings.ts,assets.ts,watchlist.ts,ipo.ts,advice.ts,dashboard.ts,market.ts,chat.ts,agent.ts,backup.ts}
 │   └── test/*.test.ts          # node:test（由 scripts/run-tests.mjs 同进程执行）
 └── packages/web/
     ├── rollup.config.mjs index.html
@@ -53,7 +53,7 @@ AIInvestmentAdvisor/
         ├── main.tsx App.tsx styles.css format.ts
         ├── api/{client.ts,sse.ts,hooks.ts,agentActivity.tsx,agentMetrics.ts}
         ├── components/{Layout.tsx,ui.tsx,AgentActivityDock.tsx,RunTimeline.tsx,InstrumentDetailSections.tsx,charts/*,markdown/*}
-        └── pages/{Dashboard,Assets,Watchlist,Advice,Chat,Settings}.tsx + 各页面子组件
+        └── pages/{Dashboard,Assets,Watchlist,Advice,Ipo,Chat,Settings}.tsx + 各页面子组件
 ```
 
 ### 写入边界（并行开发互不重叠）
@@ -62,9 +62,9 @@ AIInvestmentAdvisor/
 | --- | --- |
 | Lead | 根配置、`packages/shared/**`、`packages/server/src/{index,app,config}.ts`、`packages/server/src/routes/index.ts`、`packages/web/src/{main.tsx,App.tsx,styles.css}`、`packages/web/src/{api,components}/**`、Docker/scripts/docs |
 | `server-core` | `packages/server/src/db/**`、`services/{portfolio,backup,fx}.ts`、`routes/{settings,assets,watchlist,advice,dashboard,backup}.ts`、`packages/server/test/**` |
-| `agent-engine` | `packages/server/src/agent/**`、`datasources/**`、`services/{analytics,briefing,advice,scheduler}.ts`、`routes/{agent,chat,market}.ts` |
+| `agent-engine` | `packages/server/src/agent/**`、`datasources/**`（含 `ipo.ts`）、`services/{analytics,briefing,advice,ipo,scheduler}.ts`、`routes/{agent,chat,market,ipo}.ts` |
 | `web-core-pages` | `packages/web/src/pages/{Dashboard,Assets}.tsx` |
-| `web-ai-pages` | `packages/web/src/pages/{Watchlist,Advice,Chat,Settings}.tsx` |
+| `web-ai-pages` | `packages/web/src/pages/{Watchlist,Advice,Ipo,IpoDetailDialog,IpoAddDialog,ipoView,Chat,Settings}.tsx`（`ipoView.ts` 是打新展示口径：建议配色与胜率/预期收益格式化，三个页面共用一份，避免各写各的） |
 
 > 任何跨边界修改必须先通知 Lead；共享类型只能由 Lead 修改。
 
@@ -116,8 +116,35 @@ chat_sessions(id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT)
 chat_messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, tool_calls TEXT,
               tool_call_id TEXT, run_id TEXT, created_at TEXT)
 
+ipo_offers(id TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE /*market:code[:subscribeCode]*/,
+           market TEXT, code TEXT, subscribe_code TEXT, name TEXT, source TEXT, exchange TEXT,
+           board TEXT, issue_price REAL, price_low REAL, price_high REAL, currency TEXT,
+           lot_size REAL, max_shares REAL, subscribe_start TEXT, subscribe_end TEXT,
+           allotment_date TEXT, listing_date TEXT, issue_shares REAL, raise_amount REAL,
+           issue_pe REAL, industry_pe REAL, winning_rate REAL, oversubscribe REAL,
+           sponsor TEXT, industry TEXT, prospectus_url TEXT,
+           status TEXT /*由日期推导，不手选：upcoming|subscribing|allotted|listed|unknown*/,
+           advice TEXT, verdict TEXT /*subscribe|neutral|avoid*/,
+           verdict_reason TEXT /*一句话理由：预算缺口或标的风险，界面「推荐理由」列*/,
+           suggested_shares REAL,
+           win_probability REAL /*AI 推算的胜率 0-1：上市后正收益概率*/,
+           expected_return REAL /*AI 推算的预期收益 %：相对发行价涨幅，可为负*/,
+           confidence REAL, quality_score REAL, advice_at TEXT, advice_run_id TEXT,
+           note TEXT, created_at TEXT, updated_at TEXT)
+
+ipo_subscriptions(id TEXT PRIMARY KEY, offer_uid TEXT NOT NULL UNIQUE, market TEXT, code TEXT,
+                  name TEXT, status TEXT /*applied|allotted|missed*/, applied_shares REAL,
+                  allotted_shares REAL, price REAL, fee REAL, currency TEXT, applied_at TEXT,
+                  allotted_at TEXT, asset_id TEXT, transaction_id TEXT /*指向打新写入的那笔流水*/,
+                  note TEXT, created_at TEXT, updated_at TEXT)
+
 kv(key TEXT PRIMARY KEY, value TEXT)          -- 运行时缓存（FX 汇率、最近简报指针等）
 ```
+
+> `ipo_subscriptions.offer_uid` 与 `ipo_offers.uid` 按值关联（不是外键），删除标的一并删登记
+> （`repo.deleteIpoOffer` 内显式清理，避免悬挂记录）；`asset_id/transaction_id` 指向账本，
+> 中签入账后由它们保证「重复回报 = 修正而不是累加」。索引：`market/status/listing_date`（标的）、
+> `status`（登记）。
 
 > `assets` 与 `watchlist` 用同一张表的思路：二者都是「标的」，但资产需要交易记录与持仓计算，
 > 标的需要 `initial_price`/`quality_score`/`target_price`。为避免歧义，这里采用两张表 + 共享
@@ -164,15 +191,21 @@ run(session, systemPrompt, userGoal)
 | `save_dashboard_briefing` | 写回 Dashboard 的 AI 简报 |
 | `get_budget` | 查询当月预算剩余 |
 | `get_settings_profile` | 读取投资性格/报告风格与淘汰阈值，用于调整分析口径 |
+| `list_ipo_offers` / `get_ipo_offer` / `get_ipo_prospectus` | **打新只读**：在招新股列表 / 单只详情 / 取招股书正文（外部内容，走不可信围栏 + 审计） |
+| `save_ipo_analysis` | **打新写入**（`requiresWrite='ipo'`）：写 `advice`/`verdict`/`verdictReason`/`suggestedShares`/`winProbability`/`expectedReturn`/`qualityScore`，校验建议股数是每手整数倍且不超过申购上限，并要求**胜率、预期收益、一句话理由必填且 `advice` 正文里能读到前两个数**；还校验**结论自洽**（`subscribe` 需 ≥1 手且胜率 ≥50%、预期收益 >0；`neutral`/`avoid` 股数必须为 0；胜率 ≥60% 且预期为正时不得判 `avoid`），否则驳回（见 `docs/API.md §12.1`） |
+| `record_ipo_subscription` / `record_ipo_allotment` | **打新写入**：登记「我申购了 N 股」/「我中了 N 股」；后者自动建资产 + 写 `source='ipo'` 的买入流水（修正语义由服务层保证） |
 | `delete_watch_item` | **系统工具（`systemOnly`，不发给模型）**：按淘汰规则真正删除已退役标的 |
 
-### 4.3 三条流水线（对应 UI 按钮）
+### 4.3 四条流水线（对应 UI 按钮）
 
 1. **AI 资产分析**（`POST /api/assets/analyze`）：逐个持仓 → 并行抓取行情/K线/基本面/**财报三表（4 期）**/基金详情/分红/新闻 → LLM 深度分析（必含财报跨期趋势）→ 写回 `ai_summary` → 汇总成组合简报（Dashboard 第四板块）。
 2. **AI 标的分析**（`POST /api/watchlist/analyze`）：按投资性格从信息源搜索候选 → 初筛（代码/流动性/匹配度）→ 深度分析 → `upsert_watch_item`（含优质评估、目标价、预期收益、逻辑）→ 同时刷新既有标的的估值与结论。
-3. **AI 投资建议**（`POST /api/advice/generate`）：先跑 1 与 2 → 结合持仓、预算、性格 → 生成买/卖建议（`create_advice`）→ 写入 `advice` 表，`status=pending`。
+3. **AI 打新分析**（`POST /api/ipo/analyze`，2026-10 新增）：先 `refreshIpoOffers` 抓三地新股 → 对每只在招标的（默认 8 只）组装「发行要素 + 中签率/超购 + 一手入场费推算 + 用户登记 + 当月预算 + 宏观快照」简报 → LLM 按六段框架（发行与估值 / 招股书要点 / 基本面与财务 / 宏观与微观 / 国际与政商环境 / 打新策略与预算联动）分析 → `save_ipo_analysis` 写回结论（**必须含胜率、预期收益与一句话理由**；`verdict` 表达「本期该不该打」，预算不足但标的不差时判 `neutral` 并写明缺口）。**结论不写 `advice` 表**：建议确认会直接写资产，而「建议申购」是尚未成交的标的，语义不同（见 `docs/API.md §6/§12`）。
+4. **AI 投资建议**（`POST /api/advice/generate`）：先跑 1、2、3 → 结合持仓、预算、性格与在招新股 → 生成买/卖建议（`create_advice`）→ 写入 `advice` 表，`status=pending`。
 
-三条流水线共用同一个 Loop 与工具集，仅系统提示词与目标不同；调度器（interval/daily）复用 `POST /api/agent/run-now`。
+四条流水线共用同一个 Loop 与工具集，仅系统提示词与目标不同（`DEFAULT_WRITES` 按 kind 限定可写域，
+如 `ipo-analysis` 只能写 `ipo`）；调度器（interval/daily）的每个任务可选开关四个步骤，复用
+`POST /api/agent/run-now` 的同一套流程。
 
 ### 4.3.2 自选标的淘汰（P3：软标记 → 计数 → 删除）
 
@@ -197,7 +230,7 @@ run(session, systemPrompt, userGoal)
 
 ### 4.3.1 前端推理面板（全局 · 不随路由卸载）
 
-四类 AI 入口（Dashboard「AI一键分析」、资产分析、标的分析、投资建议）与活动页「续跑」**不再**
+四类 AI 入口（Dashboard「AI一键分析」、资产分析、标的分析、投资建议）+ 打新分析（`/ipo`）与活动页「续跑」**不再**
 在页面内联渲染推理过程，而是共用 `api/agentActivity.tsx` 提供的全局 Provider：
 
 - Provider 位于 `<Routes>` **之外**（`App.tsx`），因此切换页面不会卸载 SSE 流，推理继续、面板不消失；
@@ -238,7 +271,7 @@ run(session, systemPrompt, userGoal)
 - **Agent 必须有据可依**：工具返回的数值才能进入结论；`save_asset_analysis` / `create_advice` 要求引用工具事实，提示词强制「无数据时说明数据缺失，不得编造」。
 - **可中断（P0-2 起为真取消）**：客户端断开或用户主动中断 → `AbortController` 贯穿到 `fetch`，**立刻停止**后续推理与工具调用（省 token）；已产生的部分结论写入 `run.summary`（`status='error'`、`error='已取消'`），**已提交的写入不回滚**；被中断或被轮次上限截断的 run 可用 `POST /api/agent/runs/:id/resume` 从持久化轨迹续跑。
 - **不落敏感数据（对外）**：`llm.apiKey` 与 `dataSources.*.apiKey` 只存本地 SQLite；HTTP 层永远只返回 `hasApiKey` + `apiKeyMasked`，导出的备份/快照同样剔除 Key。
-- **账本一致性**：持仓完全由交易流水推导；删除交易前重放校验，禁止出现"没有对应买入的卖出"（409 拒绝）。
+- **账本一致性**：持仓完全由交易流水推导；删除交易前重放校验，禁止出现"没有对应买入的卖出"（409 拒绝）。**打新中签入账走同一套校验**：重复回报中签股数是「删除上一次 `source='ipo'` 的流水再重写」的修正语义（期间有卖出则 409），`shares=0` 只记状态不动账本；中签缴款不拦预算（钱已实际支付），仅在超出当月预算时写 `warnings`。
 - **定时任务可信（数组：可并存多个）**：`Settings.schedules: ScheduleTask[]`，每个任务自带触发方式（`interval` / `daily`）与要跑的步骤，停用用任务自己的 `enabled`；`PUT /api/settings` 命中 `schedules`（整体替换）时立即 `scheduler.reload()`；调度器只维护一个定时器，指向所有启用任务里最近的一次触发，同一时刻到期的多个任务**合并成一次运行**（步骤取并集）后各自重排；`/api/dashboard` 的 `nextRunAt` / `nextRuns[]` 读调度器真实计划，而不是自行推算。
 - **AI 长文本 = Markdown（提示词与渲染器同源）**：`ai_summary` / 简报 / `reason` / `thesis` 一律按 Markdown 书写，前端用 `components/markdown/*` 渲染。渲染**不 1:1 对应 Markdown 语义**，而是按最佳阅读形态重排：`## 一、标题` → 编号徽标 + 图标；`**结论**：…` / `**主要风险**：…` / `**目标价**：…` → 带导轨与判定胶囊的语义卡片；两列 `| 指标 | 数值 |` → 指标卡面板（该形状不再走表格）；≥三列表格 → 斑马纹数据表（数值列右对齐 + 内联柱）；`**+14.5%**` → 涨跌胶囊；```chart → 真实 ECharts。语法契约写在 `agent/prompts.ts` 的 `MARKDOWN_GUIDE`（分段 / 加粗 / 两列指标表 / 对比表 / 加粗标签起句 / `metrics`、`chart` 代码块）；**改语法必须同时改解析器**，`packages/server/test/prompt-markdown.test.ts` 会校验示例仍是合法可解析的。渲染器不产出 HTML 字符串，模型输出里的标签只会作为文本显示。
 - **建议必须可追溯来源**：`create_advice` 按 `code+market+type` 反查回填 `assetId`/`watchItemId`，`AdviceItem.origin` 由此推导为 持仓 / 我的标的 / 池外。买入建议优先来自持仓（加仓）或「我的标的」；池外建议是允许的（可能确实有更好的机会），但界面必须标出来 —— 它等于跳过了「AI 标的分析」的质量分门槛。
@@ -251,7 +284,7 @@ run(session, systemPrompt, userGoal)
 - **详情弹窗用页签 + 折叠区分层**：AI 分析结论独立成页签（`Tabs`），体积大但不常看的财报放进默认收起的 `Disclosure`，避免弹窗被拉成一条长滚动。
 - **大字号统计卡必须能换行**：`StatCard` 是 25px 大字号，遇到「-1.6322亿CNY（2026中报）」这类长值会溢出边框；`.stat-value` / `.fin-highlight-value` 必须保留 `overflow-wrap: anywhere`（财报指标改用专用的 `fin-highlight` 卡片，把期间拆成单独一行）。
 - **响应式布局约定**：主内容区不设最大宽度（列表类直接铺满整行；区块类用 `repeat(auto-fit, minmax(min(100%, Npx), 1fr))` 随宽度增减列数）。改动 `styles.css` 时保留 ≥1700 / ≤1100 / ≤900 / ≤640 / ≤420 五档断点语义，并由 `render.test.tsx` 的布局契约用例守住「不再写死宽度」。
-- **AI 流水线互斥**：调度器 tick 与 4 条手动 SSE 入口共享同一把非阻塞锁（`services/pipeline-lock.ts`），同一时刻只跑一条流水线；锁被占用时手动入口立即 `error` + `run-finished(status="error")` + `done` 且不写库，tick 跳过本次。`/api/chat/*` 有意不在锁内（交互对话不应被长流水线阻塞），可能与该批次流水线并发写入 —— 单用户自托管场景可接受。
+- **AI 流水线互斥**：调度器 tick 与 5 条手动 SSE 入口（资产 / 标的 / 打新 / 建议 / run-now）共享同一把非阻塞锁（`services/pipeline-lock.ts`），同一时刻只跑一条流水线；锁被占用时手动入口立即 `error` + `run-finished(status="error")` + `done` 且不写库，tick 跳过本次。`/api/chat/*` 有意不在锁内（交互对话不应被长流水线阻塞），可能与该批次流水线并发写入 —— 单用户自托管场景可接受。
 
 ## 6. 验证方式（详见 docs/VERIFY.md 与 docs/VERIFY-REPORT.md）
 

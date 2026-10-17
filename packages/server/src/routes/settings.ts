@@ -116,11 +116,12 @@ const settingsInputSchema = z.object({
             .default('08:30'),
           runAssetAnalysis: z.boolean().optional().default(true),
           runWatchlistAnalysis: z.boolean().optional().default(true),
+          runIpoAnalysis: z.boolean().optional().default(true),
           runAdvice: z.boolean().optional().default(true),
         })
         .refine(
-          (task) => task.runAssetAnalysis || task.runWatchlistAnalysis || task.runAdvice,
-          '至少要选择一个要跑的步骤（资产分析 / 标的分析 / 投资建议）',
+          (task) => task.runAssetAnalysis || task.runWatchlistAnalysis || task.runIpoAnalysis || task.runAdvice,
+          '至少要选择一个要跑的步骤（资产分析 / 标的分析 / 打新分析 / 投资建议）',
         ),
     )
     .max(MAX_SCHEDULES, `最多 ${MAX_SCHEDULES} 个定时任务`)

@@ -51,7 +51,7 @@ export interface AgentRunRequest {
    * Hint for pipelines: entities the run is allowed to create/modify.
    * Enforced by the tool layer, not by the model.
    */
-  allowWrites?: Array<'asset' | 'watchlist' | 'advice' | 'briefing' | 'settings'>;
+  allowWrites?: Array<'asset' | 'watchlist' | 'advice' | 'briefing' | 'settings' | 'ipo'>;
 }
 
 export interface AgentRuntime {

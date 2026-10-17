@@ -55,9 +55,11 @@ import { randomUUID } from 'node:crypto';
 const DEFAULT_WRITES: Record<string, AllowWrite[]> = {
   'asset-analysis': ['asset', 'briefing'],
   'watchlist-analysis': ['watchlist'],
+  // 打新分析：写入新股记录（结论/建议股数）；申购与中签登记由用户在前端确认，默认不开放。
+  'ipo-analysis': ['ipo'],
   advice: ['advice', 'briefing'],
   chat: ['asset', 'watchlist', 'advice', 'briefing'],
-  scheduled: ['asset', 'watchlist', 'advice', 'briefing'],
+  scheduled: ['asset', 'watchlist', 'advice', 'briefing', 'ipo'],
   custom: [],
 };
 

@@ -1426,7 +1426,14 @@ test('backup/clear: 一键清除所有数据（默认保留 AI 配置，可恢�
   assert.equal(body.settingsReset, false);
   assert.ok(body.deleted >= body.assets + body.transactions + body.watchlist + body.runs);
 
-  assert.deepEqual(repo.exportAll(), { assets: [], transactions: [], watchlist: [], advice: [] });
+  assert.deepEqual(repo.exportAll(), {
+    assets: [],
+    transactions: [],
+    watchlist: [],
+    advice: [],
+    ipoOffers: [],
+    ipoSubscriptions: [],
+  });
   assert.equal(repo.listRuns().length, 0);
   assert.equal(repo.listSessions().length, 0);
   assert.equal(repo.listAudit().length, 0);
@@ -1537,7 +1544,9 @@ test('dashboard: 年化收益率走 XIRR（当年真实现金流 + 期末市值�
   }
 
   const buyDay = isoOf(yearStartMs + 5 * ISO_DAY); // 当年 1 月 6 日
-  const sellDay = isoOf(todayMs - 20 * ISO_DAY); // 20 天前（必然晚于买入日）
+  // 卖出日固定在 5 天前：这样「卖出份额的持有区间」= daysIntoYear − 10 ≥ 35 天，
+  // 够长到允许年化（< 30 天时服务端会拒绝给年化，改给累计收益率）。
+  const sellDay = isoOf(todayMs - 5 * ISO_DAY);
   const today = isoOf(todayMs);
 
   // 建仓：100 股 @10（当年买入 → 期初无持仓，当年年化从这笔现金流起算）。
@@ -1584,12 +1593,21 @@ test('dashboard: 年化收益率走 XIRR（当年真实现金流 + 期末市值�
   assert.equal(typeof perf.sinceInceptionPct, 'number', '全周期年化只用账本，必须可算');
   assert.equal(perf.sinceInceptionFrom, buyDay);
   assert.ok(perf.notes.some((note: string) => note.includes('期初') && note.includes('无持仓')));
+  // 累计收益率始终给出（年化不可信时的替代展示）。
+  assert.ok(typeof perf.cumulativePct === 'number', '区间累计收益率必须可算');
+  assert.equal(perf.annualizedReliable, true, '区间 ≥30 天才允许年化');
+  assert.ok(perf.cashFlowDays >= 30, `实际有资金天数应 ≥30，实际 ${perf.cashFlowDays}`);
 
   // 未来日期一律夹到今天；非法日期忽略。
   const clamped = json(await app.inject({ method: 'GET', url: '/api/dashboard?asOf=2999-01-01' }));
   assert.equal(clamped.portfolio.performance.periodEnd, today, '未来估值日必须夹到今天');
   const ignored = json(await app.inject({ method: 'GET', url: '/api/dashboard?asOf=not-a-date' }));
   assert.equal(ignored.portfolio.performance.periodEnd, today, '非法估值日忽略，退回今天');
+
+  // 估值日设在买入日当天：区间不足 1 天，年化必须为 null（改由累计收益率兜底展示）。
+  const sameDay = json(await app.inject({ method: 'GET', url: `/api/dashboard?asOf=${buyDay}` }));
+  assert.equal(sameDay.portfolio.performance.annualizedReliable, false);
+  assert.equal(sameDay.portfolio.performance.annualizedPct, null, '区间过短不得给年化数字');
 });
 
 /* ───────────── 定时任务数组（设置页可添加多个） ───────────── */
@@ -1662,7 +1680,7 @@ test('settings: 定时任务数组 —— 多任务并存、整体替换、非�
     url: '/api/settings',
     payload: {
       schedules: [
-        { id: 'x', name: 'x', mode: 'daily', runAssetAnalysis: false, runWatchlistAnalysis: false, runAdvice: false },
+        { id: 'x', name: 'x', mode: 'daily', runAssetAnalysis: false, runWatchlistAnalysis: false, runIpoAnalysis: false, runAdvice: false },
       ],
     },
   });
@@ -1697,4 +1715,212 @@ test('settings: 定时任务数组 —— 多任务并存、整体替换、非�
   const untouched = json(await app.inject({ method: 'PUT', url: '/api/settings', payload: { enforceBudget: true } }));
   assert.equal(untouched.schedules.length, 1, '省略 schedules 时不得改动已保存的任务');
   await app.inject({ method: 'PUT', url: '/api/settings', payload: { schedules: [] } });
+});
+
+/* ─────────────── 新股打新：/api/ipo*（列表 / 刷新 / 申购 / 中签入账） ─────────────── */
+
+test('打新：列表是空库友好的结构（counts 全 0、items 空数组），非法过滤值直接 400', async () => {
+  const listed = json(await app.inject({ method: 'GET', url: '/api/ipo' }));
+  assert.deepEqual(listed.items, []);
+  assert.deepEqual(listed.counts, { total: 0, CN: 0, HK: 0, US: 0, subscribing: 0, applied: 0, allotted: 0 });
+  assert.equal(listed.lastRefreshAt, null, '从没刷新过时必须是 null，界面据此提示「先刷新」');
+  assert.deepEqual(listed.warnings, []);
+
+  const badMarket = await app.inject({ method: 'GET', url: '/api/ipo?market=MOON' });
+  assert.equal(badMarket.statusCode, 400);
+  assert.equal(json(badMarket).error.code, 'BAD_REQUEST');
+
+  const badStatus = await app.inject({ method: 'GET', url: '/api/ipo?status=whatever' });
+  assert.equal(badStatus.statusCode, 400);
+});
+
+test('打新：刷新走公开数据源（离线打桩），把标的写进库并记录刷新时间与警告', async () => {
+  const originalFetch = globalThis.fetch;
+  const { clearHttpCache } = await import('../src/datasources/http.js');
+  globalThis.fetch = (async (input: unknown) => {
+    const url = String(input);
+    if (url.includes('datacenter-web.eastmoney.com')) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          result: {
+            data: [
+              {
+                SECURITY_CODE: '001381',
+                APPLY_CODE: '001381',
+                SECURITY_NAME_ABBR: '皇冠新材',
+                ISSUE_PRICE: 16.98,
+                ONLINE_APPLY_UPPER: 13500,
+                EACHBALLOT_SHARES: '500',
+                APPLY_DATE: '2026-10-19 00:00:00',
+                BALLOT_NUM_DATE: '2026-10-21 00:00:00',
+                TRADE_MARKET: '深交所主板',
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response('<html>502</html>', { status: 502 });
+  }) as unknown as typeof fetch;
+  clearHttpCache();
+  try {
+    const refreshed = await app.inject({ method: 'POST', url: '/api/ipo/refresh', payload: { markets: ['CN'] } });
+    assert.equal(refreshed.statusCode, 200, refreshed.body);
+    const result = json(refreshed);
+    assert.equal(result.inserted, 1);
+    assert.equal(result.fetched, 1);
+    assert.deepEqual(result.sources, ['eastmoney-ipo']);
+
+    const list = json(await app.inject({ method: 'GET', url: '/api/ipo?market=CN' }));
+    assert.equal(list.counts.total, 1);
+    assert.equal(list.counts.CN, 1);
+    assert.equal(list.items[0].code, '001381');
+    assert.equal(list.items[0].lotSize, 500);
+    assert.ok(list.lastRefreshAt, '刷新后必须能读到 lastRefreshAt');
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearHttpCache();
+  }
+});
+
+test('打新：手动录入 → 登记申购 → 登记中签自动入账 → 撤销/删除', async () => {
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/ipo',
+    payload: {
+      market: 'HK',
+      code: '09999',
+      name: '接口测试新股',
+      issuePrice: 12,
+      lotSize: 500,
+      maxShares: 5000,
+      subscribeEnd: '2000-01-01',
+      listingDate: '2999-01-01',
+    },
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  const offer = json(created);
+  assert.equal(offer.status, 'allotted', '申购已截止但未上市 → 待上市（中签缴款阶段）');
+  assert.equal(offer.subscription, null);
+
+  // 参数校验：缺名称 / 市场非法 / 股数非正 → 400。
+  for (const payload of [
+    { market: 'HK', code: '09999' },
+    { market: 'MOON', code: '09999', name: 'x' },
+  ]) {
+    const bad = await app.inject({ method: 'POST', url: '/api/ipo', payload });
+    assert.equal(bad.statusCode, 400, JSON.stringify(payload));
+  }
+  const badShares = await app.inject({ method: 'POST', url: `/api/ipo/${offer.id}/subscribe`, payload: { shares: 0 } });
+  assert.equal(badShares.statusCode, 400);
+
+  const subscribed = await app.inject({
+    method: 'POST',
+    url: `/api/ipo/${offer.id}/subscribe`,
+    payload: { shares: 1000, appliedAt: '2026-10-14' },
+  });
+  assert.equal(subscribed.statusCode, 200, subscribed.body);
+  assert.equal(json(subscribed).subscription.status, 'applied');
+  assert.equal(json(subscribed).subscription.appliedShares, 1000);
+
+  const detail = json(await app.inject({ method: 'GET', url: `/api/ipo/${offer.id}` }));
+  assert.equal(detail.subscription.appliedShares, 1000);
+
+  const missing = await app.inject({ method: 'GET', url: '/api/ipo/does-not-exist' });
+  assert.equal(missing.statusCode, 404);
+
+  // 撤销登记：只删登记，不动账本。
+  const removed = await app.inject({ method: 'DELETE', url: `/api/ipo/${offer.id}/subscription` });
+  assert.equal(removed.statusCode, 200);
+  assert.equal(json(removed).subscription, null);
+
+  // 重新登记后中签 500 股 → 自动建资产 + 写 ipo 买入流水。
+  await app.inject({ method: 'POST', url: `/api/ipo/${offer.id}/subscribe`, payload: { shares: 1000 } });
+  const allotted = await app.inject({
+    method: 'POST',
+    url: `/api/ipo/${offer.id}/allot`,
+    payload: { shares: 500, tradeDate: '2026-10-16', fee: 12 },
+  });
+  assert.equal(allotted.statusCode, 200, allotted.body);
+  const result = json(allotted);
+  assert.equal(result.assetCreated, true);
+  assert.equal(result.asset.code, '09999');
+  assert.equal(result.asset.shares, 500);
+  assert.equal(result.offer.subscription.status, 'allotted');
+  assert.equal(result.offer.subscription.assetId, result.asset.id);
+
+  const asset = json(await app.inject({ method: 'GET', url: `/api/assets/${result.asset.id}` }));
+  assert.equal(asset.transactions.length, 1, '中签只写一笔买入');
+  assert.equal(asset.transactions[0].source, 'ipo', '流水来源必须是 ipo（与人工买入区分）');
+  assert.equal(asset.transactions[0].shares, 500);
+  assert.equal(asset.transactions[0].fee, 12);
+
+  // 修正中签股数：覆盖而不是累加。
+  const corrected = await app.inject({
+    method: 'POST',
+    url: `/api/ipo/${offer.id}/allot`,
+    payload: { shares: 200, tradeDate: '2026-10-16', fee: 12 },
+  });
+  assert.equal(corrected.statusCode, 200, corrected.body);
+  const afterFix = json(await app.inject({ method: 'GET', url: `/api/assets/${result.asset.id}` }));
+  assert.equal(afterFix.transactions.length, 1);
+  assert.equal(afterFix.transactions[0].shares, 200);
+
+  // 已入账的那只再报「未中签」：必须 409（否则账本会凭空少一笔持仓）。
+  const bogusMissed = await app.inject({ method: 'POST', url: `/api/ipo/${offer.id}/allot`, payload: { shares: 0 } });
+  assert.equal(bogusMissed.statusCode, 409, '已按中签入账后不能直接改成未中签');
+  assert.equal(json(bogusMissed).error.code, 'CONFLICT');
+  const afterMissed = json(await app.inject({ method: 'GET', url: `/api/assets/${result.asset.id}` }));
+  assert.equal(afterMissed.transactions.length, 1, '被拒的请求不得改动已入账的流水');
+  assert.equal(afterMissed.transactions[0].shares, 200);
+
+  // 未中签（另一只新股）：0 股 → 状态变 missed，不建资产、不写流水。
+  const other = json(
+    await app.inject({
+      method: 'POST',
+      url: '/api/ipo',
+      payload: {
+        market: 'HK',
+        code: '09998',
+        name: '接口测试新股二',
+        issuePrice: 5,
+        lotSize: 100,
+        subscribeEnd: '2000-01-01',
+        listingDate: '2999-01-01',
+      },
+    }),
+  );
+  await app.inject({ method: 'POST', url: `/api/ipo/${other.id}/subscribe`, payload: { shares: 100 } });
+  const missed = await app.inject({ method: 'POST', url: `/api/ipo/${other.id}/allot`, payload: { shares: 0 } });
+  assert.equal(missed.statusCode, 200, missed.body);
+  assert.equal(json(missed).offer.subscription.status, 'missed');
+  assert.equal(json(missed).asset, null, '未中签不得产生资产');
+  const missedList = json(await app.inject({ method: 'GET', url: '/api/ipo?market=HK&q=09998' }));
+  assert.equal(missedList.items.length, 1);
+  assert.equal(missedList.counts.allotted, 0, '未中签不计入「已中签」统计');
+  assert.equal(missedList.counts.applied, 1, '未中签仍算「已登记」');
+
+  // 删除标的：连带删掉登记。
+  const deleted = await app.inject({ method: 'DELETE', url: `/api/ipo/${offer.id}` });
+  assert.equal(deleted.statusCode, 200);
+  const gone = await app.inject({ method: 'GET', url: `/api/ipo/${offer.id}` });
+  assert.equal(gone.statusCode, 404);
+  await app.inject({ method: 'DELETE', url: `/api/ipo/${other.id}` });
+
+  // 资产是用户账本，不该被删除标的顺手抹掉。
+  assert.equal((await app.inject({ method: 'GET', url: `/api/assets/${result.asset.id}` })).statusCode, 200);
+});
+
+test('打新：分析端点存在，且未配置模型时明确报错（不静默失败）', async () => {
+  const last = json(await app.inject({ method: 'GET', url: '/api/ipo/analyze/last' }));
+  assert.ok(
+    last === null || (typeof last === 'object' && last.kind === 'ipo-analysis'),
+    `从没跑过打新分析时必须返回 null（前端据此显示「还没有分析」），实际：${JSON.stringify(last)}`,
+  );
+
+  const started = await app.inject({ method: 'POST', url: '/api/ipo/analyze' });
+  assert.equal(started.statusCode, 400, 'agent stub 未配置 → 必须 400 而不是挂起');
+  assert.equal(json(started).error.code, 'NOT_CONFIGURED');
 });

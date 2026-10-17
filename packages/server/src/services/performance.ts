@@ -21,6 +21,7 @@
  * 同一年度内每个标的只取一次历史收盘价，之后 Dashboard 每次打开都是纯本地计算。
  */
 import {
+  MIN_ANNUALIZE_DAYS,
   type AssetSummary,
   type InstrumentType,
   type Market,
@@ -42,10 +43,14 @@ export const MAX_OPENING_LOOKUPS = 40;
 export const OPENING_VALUE_DEADLINE_MS = 6000;
 /** 期初估值的并发上限，与流水线/建议追踪保持一致。 */
 const OPENING_LOOKUP_CONCURRENCY = 3;
-/** 区间短于该天数时给出「年化会被放大」的提示。 */
-const SHORT_PERIOD_DAYS = 30;
 /** 面值过小的现金流（占位）直接忽略。 */
 const MIN_FLOW = 1e-6;
+
+/**
+ * 重新导出「允许年化的最短区间」——口径定义在 `@aia/shared`（服务端与界面共用一份），
+ * 这里转发是为了让 `services/performance` 的调用方/测试不必再记另一条 import 路径。
+ */
+export { MIN_ANNUALIZE_DAYS };
 
 /* ─────────────────────────────── 日期工具 ─────────────────────────────── */
 
@@ -490,6 +495,12 @@ export function computePerformance(input: PerformanceInput): PortfolioPerformanc
   let netInvested = 0;
   let realizedPnl = 0;
   let futureDated = 0;
+  /** 当年买入总支出（含费用）与卖出净收入（扣费用），用于「区间累计收益率」。 */
+  let buysTotal = 0;
+  let sellsTotal = 0;
+  /** 已实现部分的含费成本与净收入（当年卖出份额）。 */
+  let realizedCost = 0;
+  let realizedProceeds = 0;
 
   for (const asset of input.assets) {
     const rate = rateOf(asset.currency);
@@ -512,15 +523,21 @@ export function computePerformance(input: PerformanceInput): PortfolioPerformanc
       yearFlows.push(flow);
       // 净投入 = Σ(−现金流)：买入增加投入，卖出减少投入。
       netInvested -= amount;
+      if (amount < 0) buysTotal += -amount;
+      else sellsTotal += amount;
     }
 
     for (const sale of replaySales(asset.txs, asset.currency)) {
       if (!sale.tradeDate.startsWith(`${year}-`)) continue;
       const saleRate = rateOf(sale.currency);
       realizedPnl += sale.ledgerPnl * saleRate;
+      const cost = (sale.costBasis + sale.allocatedBuyFees) * saleRate;
+      const proceeds = sale.proceeds * saleRate;
+      realizedCost += cost;
+      realizedProceeds += proceeds;
       realizedFlows.push(
-        { date: sale.acquiredDate, amount: round4(-(sale.costBasis + sale.allocatedBuyFees) * saleRate) },
-        { date: sale.tradeDate, amount: round4(sale.proceeds * saleRate) },
+        { date: sale.acquiredDate, amount: round4(-cost) },
+        { date: sale.tradeDate, amount: round4(proceeds) },
       );
     }
   }
@@ -538,7 +555,7 @@ export function computePerformance(input: PerformanceInput): PortfolioPerformanc
   if (input.openingValue === null) {
     notes.push(`缺少 ${periodStart} 的期初持仓市值，当年年化不可度量`);
   } else if (input.openingValue === 0) {
-    notes.push(`期初（${periodStart}）无持仓：当年年化从当年首笔买入起算`);
+    notes.push(`期初（${periodStart}）无持仓：当年收益从当年首笔买入起算`);
   } else {
     notes.push(`期初持仓市值 ${formatMoney(input.openingValue, currency)}（按 ${periodStart} 收盘价折算）`);
   }
@@ -548,7 +565,28 @@ export function computePerformance(input: PerformanceInput): PortfolioPerformanc
   const realizedResult = solveXirr(realizedFlows);
   const inceptionResult = solveXirr(portfolioFlows);
 
-  if (yearResult.rate === null) {
+  /* ── 区间长度：不足 30 天不年化（几何年化会把短期波动放大成荒谬的数字） ── */
+  const cashFlowDays = flowSpanDays(yearFlows);
+  const realizedCashFlowDays = flowSpanDays(realizedFlows);
+  const annualizedReliable = cashFlowDays >= MIN_ANNUALIZE_DAYS;
+  const realizedAnnualizedReliable = realizedCashFlowDays >= MIN_ANNUALIZE_DAYS;
+
+  /* ── 区间累计（简单）收益率：不管资金时点，直接回答「赚亏百分之几」 ── */
+  const capital = (input.openingValue ?? 0) + buysTotal;
+  const cumulativePct =
+    input.openingValue === null || capital <= 0
+      ? null
+      : round4(((input.endingValue + sellsTotal - capital) / capital) * 100);
+  const realizedCumulativePct = realizedCost > 0 ? round4(((realizedProceeds - realizedCost) / realizedCost) * 100) : null;
+
+  if (!annualizedReliable && yearResult.rate !== null) {
+    // 有解但不该报：说明原因 + 保留「强行年化」的数值，口径完全透明。
+    notes.push(
+      `当年实际有资金 ${cashFlowDays} 天（不足 ${MIN_ANNUALIZE_DAYS} 天），几何年化会把短期波动放大成 ${
+        percent(yearResult.rate)?.toFixed(2) ?? '—'
+      }%，统计意义不大；卡片改为显示区间累计收益率。`,
+    );
+  } else if (yearResult.rate === null) {
     notes.push(
       yearResult.reason === 'insufficient-flows' || yearResult.reason === 'no-sign-change'
         ? '当年现金流不足（只有买入或只有卖出），无法求年化'
@@ -557,7 +595,11 @@ export function computePerformance(input: PerformanceInput): PortfolioPerformanc
           : '年化方程在合理利率区间内无解（现金流方向异常），已如实标记为不可度量',
     );
   }
-  if (realizedResult.rate === null) {
+  if (!realizedAnnualizedReliable && realizedResult.rate !== null) {
+    notes.push(
+      `当年卖出部分的持有区间 ${realizedCashFlowDays} 天（不足 ${MIN_ANNUALIZE_DAYS} 天），已实现年化同样不展示，改为显示已实现累计收益率。`,
+    );
+  } else if (realizedResult.rate === null) {
     notes.push(
       realizedResult.reason === 'insufficient-flows' || realizedResult.reason === 'no-sign-change'
         ? '当年没有卖出记录，已实现年化不适用'
@@ -568,12 +610,6 @@ export function computePerformance(input: PerformanceInput): PortfolioPerformanc
   }
 
   const days = daysBetween(periodStart, asOf);
-  // 提示按**实际现金流区间**（首笔 → 末笔）判断，而不是自然年长度：年初刚建仓时，
-  // 自然年有 200+ 天但真实资金在场只有几天，年化照样是噪声。
-  const flowDays = flowSpanDays(yearFlows);
-  if (flowDays > 0 && flowDays < SHORT_PERIOD_DAYS) {
-    notes.push(`当年实际现金流区间仅 ${flowDays} 天，年化会被短期波动放大，请结合原始收益解读`);
-  }
 
   return {
     year,
@@ -583,8 +619,13 @@ export function computePerformance(input: PerformanceInput): PortfolioPerformanc
     endingValue: round4(input.endingValue),
     netInvested: round4(netInvested),
     realizedPnl: round4(realizedPnl),
-    annualizedPct: percent(yearResult.rate),
-    realizedAnnualizedPct: percent(realizedResult.rate),
+    annualizedPct: annualizedReliable ? percent(yearResult.rate) : null,
+    realizedAnnualizedPct: realizedAnnualizedReliable ? percent(realizedResult.rate) : null,
+    cumulativePct,
+    realizedCumulativePct,
+    cashFlowDays,
+    annualizedReliable,
+    realizedAnnualizedReliable,
     sinceInceptionPct: percent(inceptionResult.rate),
     sinceInceptionFrom: firstBuyDay(input.assets.flatMap((asset) => asset.txs)),
     days,

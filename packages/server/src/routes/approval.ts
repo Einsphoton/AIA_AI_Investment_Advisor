@@ -27,7 +27,7 @@ import { recordAudit, runWithApprovalBypass } from '../agent/policy.js';
 import type { LoggerLike } from '../types/agent.js';
 
 /** Writes the approval flow is allowed to perform (mirrors the agent's own set). */
-const APPROVAL_WRITES: AllowWrite[] = ['asset', 'watchlist', 'advice', 'briefing', 'settings'];
+const APPROVAL_WRITES: AllowWrite[] = ['asset', 'watchlist', 'advice', 'briefing', 'settings', 'ipo'];
 
 const auditQuerySchema = z.object({
   // Clamped to 500 below rather than rejected: a too-large `limit` must not 400.

@@ -26,6 +26,7 @@ function stepsShort(task: ScheduleTaskDraft): string {
   const steps: string[] = [];
   if (task.runAssetAnalysis) steps.push('资产');
   if (task.runWatchlistAnalysis) steps.push('标的');
+  if (task.runIpoAnalysis) steps.push('打新');
   if (task.runAdvice) steps.push('建议');
   return steps.length > 0 ? steps.join('·') : '未选步骤';
 }
@@ -191,11 +192,16 @@ export function SchedulesCard(props: {
                         label={<span className="tiny">标的分析</span>}
                       />
                       <Checkbox
+                        checked={task.runIpoAnalysis}
+                        onChange={(checked) => update(task.id, { runIpoAnalysis: checked })}
+                        label={<span className="tiny" title="刷新 A股/港股/美股新股信息，并让 AI 给出是否申购的结论">打新分析</span>}
+                      />
+                      <Checkbox
                         checked={task.runAdvice}
                         onChange={(checked) => update(task.id, { runAdvice: checked })}
                         label={<span className="tiny">投资建议</span>}
                       />
-                      <span className="tiny mute">（三个都不选无法保存）</span>
+                      <span className="tiny mute">（四个都不选无法保存）</span>
                     </div>
                   </div>
                 )}

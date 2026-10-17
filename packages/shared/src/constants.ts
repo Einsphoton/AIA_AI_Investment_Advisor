@@ -8,6 +8,9 @@ import type {
   DataSourceCatalogueEntry,
   DataSourceConfig,
   InstrumentType,
+  IpoAdviceVerdict,
+  IpoMarketStatus,
+  IpoSubscriptionStatus,
   LlmConfig,
   Market,
   McpServerConfig,
@@ -15,6 +18,7 @@ import type {
   RangeKey,
   ReportStyle,
   ScheduleTask,
+  SourceId,
   ToolPolicy,
 } from './types.js';
 
@@ -923,6 +927,7 @@ export const DEFAULT_SCHEDULE_TASK: Omit<ScheduleTask, 'id'> = {
   dailyTime: '08:30',
   runAssetAnalysis: true,
   runWatchlistAnalysis: true,
+  runIpoAnalysis: true,
   runAdvice: true,
 };
 
@@ -931,6 +936,16 @@ export const DEFAULT_SCHEDULES: ScheduleTask[] = [];
 
 /** 单个实例最多可配置的定时任务数（与 MCP 服务器保持同一量级）。 */
 export const MAX_SCHEDULES = 20;
+
+/**
+ * 允许「年化」的最短区间（自然日）。
+ *
+ * 几何年化对短区间极度敏感：持有 1 天亏 0.45%，年化就是 −80%；涨 1% 年化就是 +3678%。
+ * 那不是收益，而是把一天的噪声外推成一年。所以**不足 30 天一律不年化**：
+ * 服务端把 `annualizedPct` 置为 null 并给出 `cumulativePct`（区间累计收益率），
+ * 界面相应地把卡片换成「累计收益率」，绝不让一个 −80% 挂在「年化收益率」下面不作解释。
+ */
+export const MIN_ANNUALIZE_DAYS = 30;
 
 export const DEFAULT_PERSONA: Persona = 'balanced';
 export const DEFAULT_REPORT_STYLE: ReportStyle = 'professional';
@@ -941,6 +956,64 @@ export const DEFAULT_WATCHLIST_CANDIDATE_LIMIT = 5;
  */
 export const DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS = 3;
 export const DEFAULT_ENFORCE_BUDGET = true;
+
+/* ────────────────────────────── 新股打新 (IPO) ────────────────────────────── */
+
+/** 新股阶段的中文标签（界面与 AI 提示词共用）。 */
+export const IPO_STATUS_LABELS: Record<IpoMarketStatus, string> = {
+  upcoming: '待申购',
+  subscribing: '申购中',
+  allotted: '待上市',
+  listed: '已上市',
+  unknown: '状态未知',
+};
+
+/** AI 申购倾向的中文标签。 */
+export const IPO_VERDICT_LABELS: Record<IpoAdviceVerdict, string> = {
+  subscribe: '建议申购',
+  neutral: '谨慎参与',
+  avoid: '建议放弃',
+};
+
+/** 我的申购记录状态的中文标签。 */
+export const IPO_SUBSCRIPTION_LABELS: Record<IpoSubscriptionStatus, string> = {
+  applied: '已申购',
+  allotted: '已中签',
+  missed: '未中签',
+};
+
+/**
+ * 打新列表的一次刷新最多回看多少天，以及每个市场最多取多少条。
+ *
+ * 新股是有时效的数据（招股期通常 3-5 天），一次取太多历史会让界面全是已上市新股；
+ * 太少又会漏掉「下周开始申购」的标的。180 天 + 每市场 60 条覆盖当前发行季。
+ */
+export const IPO_REFRESH_LOOKBACK_DAYS = 180;
+export const IPO_REFRESH_MAX_PER_MARKET = 60;
+/** 刷新结果的缓存时长：新股信息一天最多变几次，前端重复刷新不必打上游。 */
+export const IPO_REFRESH_CACHE_TTL_MS = 5 * 60_000;
+
+/**
+ * 打新数据源的展示名。
+ *
+ * 这些源**不进入** `SOURCE_CATALOGUE`：那份目录是「按市场/类型解析行情与财报」的
+ * provider 优先级链（设置页的股票/基金数据源下拉用它），而打新源只提供发行期数据，
+ * 不实现报价/财报接口，混进去会让用户把它选成某个市场的行情源。
+ */
+export const IPO_SOURCE_LABELS: Record<string, string> = {
+  'eastmoney-ipo': '东方财富·新股',
+  etnet: '經濟通·港股新股',
+  aastocks: '阿斯達克·港股新股',
+  nasdaq: '纳斯达克·IPO 日历',
+  manual: '手工录入',
+};
+
+/** 打新数据源按市场的首选顺序（也用于界面提示「这条数据来自哪里」）。 */
+export const IPO_SOURCES_BY_MARKET: Record<Market, SourceId[]> = {
+  CN: ['eastmoney-ipo'],
+  HK: ['etnet', 'eastmoney-ipo', 'aastocks'],
+  US: ['nasdaq'],
+};
 
 /**
  * Data-source catalogue. `priority` orders the automatic fallback chain

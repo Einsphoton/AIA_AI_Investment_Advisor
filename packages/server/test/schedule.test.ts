@@ -38,6 +38,7 @@ function task(over: Partial<ScheduleTask> = {}): ScheduleTask {
     dailyTime: over.dailyTime ?? '08:30',
     runAssetAnalysis: over.runAssetAnalysis ?? true,
     runWatchlistAnalysis: over.runWatchlistAnalysis ?? true,
+    runIpoAnalysis: over.runIpoAnalysis ?? true,
     runAdvice: over.runAdvice ?? true,
   };
 }
@@ -85,13 +86,28 @@ test('计划组合：只算启用的任务，按时间升序，最近一次 = �
 });
 
 test('步骤并集：多个任务同时到期时，某一步只要任一任务要它就跑', () => {
-  const assetOnly = task({ id: 'a', runAssetAnalysis: true, runWatchlistAnalysis: false, runAdvice: false });
-  const adviceOnly = task({ id: 'b', runAssetAnalysis: false, runWatchlistAnalysis: false, runAdvice: true });
-  assert.deepEqual(mergeTaskFlags([assetOnly, adviceOnly]), { skipAsset: false, skipWatchlist: true, skipAdvice: false });
-  assert.deepEqual(mergeTaskFlags([assetOnly]), { skipAsset: false, skipWatchlist: true, skipAdvice: true });
+  const assetOnly = task({ id: 'a', runAssetAnalysis: true, runWatchlistAnalysis: false, runIpoAnalysis: false, runAdvice: false });
+  const adviceOnly = task({ id: 'b', runAssetAnalysis: false, runWatchlistAnalysis: false, runIpoAnalysis: false, runAdvice: true });
+  const ipoOnly = task({ id: 'c', runAssetAnalysis: false, runWatchlistAnalysis: false, runIpoAnalysis: true, runAdvice: false });
+  assert.deepEqual(mergeTaskFlags([assetOnly, adviceOnly]), {
+    skipAsset: false,
+    skipWatchlist: true,
+    skipIpo: true,
+    skipAdvice: false,
+  });
+  assert.deepEqual(mergeTaskFlags([assetOnly]), { skipAsset: false, skipWatchlist: true, skipIpo: true, skipAdvice: true });
+  // 打新分析是 2026-10 新增的独立步骤：只要有一个任务要它，这次流水线就跑它。
+  assert.deepEqual(mergeTaskFlags([assetOnly, ipoOnly]), {
+    skipAsset: false,
+    skipWatchlist: true,
+    skipIpo: false,
+    skipAdvice: true,
+  });
   // 空集合（理论上不会发生）保守地跑全流程。
-  assert.deepEqual(mergeTaskFlags([]), { skipAsset: false, skipWatchlist: false, skipAdvice: false });
+  assert.deepEqual(mergeTaskFlags([]), { skipAsset: false, skipWatchlist: false, skipIpo: false, skipAdvice: false });
   assert.deepEqual(taskStepLabels(assetOnly), ['资产分析']);
+  assert.deepEqual(taskStepLabels(ipoOnly), ['打新分析']);
+  assert.deepEqual(taskStepLabels(task()), ['资产分析', '标的分析', '打新分析', '投资建议']);
   assert.equal(describeTask(task({ mode: 'interval', intervalMinutes: 30 })), '每 30 分钟');
   assert.equal(describeTask(task({ mode: 'daily', dailyTime: '08:45' })), '每天 08:45');
   assert.match(describeTask(task({ enabled: false })), /已停用/);
@@ -170,8 +186,9 @@ test('调度器：多个任务只武装一个定时器，到期的任务合并�
     // 再加一个停用任务（必须被完全忽略）。
     repo.saveSettings({
       schedules: [
-        task({ id: 'asset_only', name: '只看资产', mode: 'interval', intervalMinutes: 30, runWatchlistAnalysis: false, runAdvice: false }),
-        task({ id: 'advice_only', name: '只出建议', mode: 'interval', intervalMinutes: 30, runAssetAnalysis: false, runWatchlistAnalysis: false }),
+        task({ id: 'asset_only', name: '只看资产', mode: 'interval', intervalMinutes: 30, runWatchlistAnalysis: false, runIpoAnalysis: false, runAdvice: false }),
+        // 打新分析会真的去打四个上游（网络 I/O），这个用例必须保持离线：显式关掉。
+        task({ id: 'advice_only', name: '只出建议', mode: 'interval', intervalMinutes: 30, runAssetAnalysis: false, runWatchlistAnalysis: false, runIpoAnalysis: false }),
         task({ id: 'disabled', name: '停用的', enabled: false, mode: 'interval', intervalMinutes: 1 }),
       ],
     });

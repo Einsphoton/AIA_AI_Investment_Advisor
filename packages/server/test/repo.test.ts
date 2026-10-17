@@ -49,6 +49,7 @@ function task(over: Partial<ScheduleTask> = {}): ScheduleTask {
     dailyTime: over.dailyTime ?? '08:30',
     runAssetAnalysis: over.runAssetAnalysis ?? true,
     runWatchlistAnalysis: over.runWatchlistAnalysis ?? true,
+    runIpoAnalysis: over.runIpoAnalysis ?? true,
     runAdvice: over.runAdvice ?? true,
   };
 }
@@ -592,6 +593,8 @@ test('repo: export → import 往返一致（merge 去重 / replace 覆盖）', 
       transactions: 2,
       watchlist: 1,
       advice: 1,
+      ipoOffers: 0,
+      ipoSubscriptions: 0,
       skipped: 0,
       mode: 'merge',
     });
@@ -612,6 +615,8 @@ test('repo: export → import 往返一致（merge 去重 / replace 覆盖）', 
         transactions: [{ ...bundle.transactions[0]!, id: 'orphan', assetId: 'nope' } as never],
         watchlist: [],
         advice: [],
+        ipoOffers: [],
+        ipoSubscriptions: [],
       },
       'merge',
     );
@@ -733,6 +738,38 @@ test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重�
       result: null,
     });
     repo.setKv('fx.rates', '{"USD":7.1}');
+    // 打新数据也是用户数据：一键清除必须把它一起清掉（含中签后指向资产的订阅记录）。
+    repo.createIpoOffer({
+      id: 'ipo-1',
+      uid: 'CN:001381',
+      market: 'CN',
+      code: '001381',
+      name: '皇冠新材',
+      source: 'eastmoney-ipo',
+      issuePrice: 16.98,
+      currency: 'CNY',
+      lotSize: 500,
+      subscribeStart: '2026-10-19',
+      subscribeEnd: '2026-10-19',
+      listingDate: '2026-10-27',
+      createdAt: '2026-10-18T10:00:00.000+08:00',
+    });
+    repo.upsertIpoSubscription({
+      id: 'iposub-1',
+      offerUid: 'CN:001381',
+      market: 'CN',
+      code: '001381',
+      name: '皇冠新材',
+      status: 'allotted',
+      appliedShares: 500,
+      allottedShares: 500,
+      price: 16.98,
+      currency: 'CNY',
+      appliedAt: '2026-10-19',
+      allottedAt: '2026-10-21',
+      assetId: 'asset-1',
+      transactionId: 'tx-1',
+    });
     repo.saveSettings(
       settingsPatch({ llm: { apiKey: 'sk-keep-me' }, persona: 'steady', dataSources: { stockUS: { apiKey: 'fh-keep-me' } } }),
     );
@@ -753,12 +790,21 @@ test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重�
       auditEntries: 1,
       pendingWrites: 1,
       kvEntries: 1,
+      ipoOffers: 1,
+      ipoSubscriptions: 1,
       settingsReset: false,
-      deleted: 13,
+      deleted: 15,
     });
 
     // 每张表都真的空了。
-    assert.deepEqual(repo.exportAll(), { assets: [], transactions: [], watchlist: [], advice: [] });
+    assert.deepEqual(repo.exportAll(), {
+      assets: [],
+      transactions: [],
+      watchlist: [],
+      advice: [],
+      ipoOffers: [],
+      ipoSubscriptions: [],
+    });
     assert.equal(repo.listAdviceOutcomes().length, 0);
     assert.equal(repo.listRuns().length, 0);
     assert.equal(repo.listRunMessages('run-1').length, 0);

@@ -16,7 +16,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { renderToString } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
-import type { AgentRunSummary, AssetSummary, InferenceMetrics, SeriesPoint } from '@aia/shared';
+import type { AgentRunSummary, AssetSummary, InferenceMetrics, IpoOffer, SeriesPoint } from '@aia/shared';
 import {
   DEFAULT_LLM,
   LLM_PROVIDER_CUSTOM_ID,
@@ -57,6 +57,21 @@ import { extractMetrics, parseChartSpec, parseMarkdown } from '../src/components
 import { LlmProviderField } from '../src/pages/SettingsLlmProvider';
 import { ModelField } from '../src/pages/SettingsModelField';
 import { DangerZoneCard } from '../src/pages/SettingsDangerZone';
+import { sortIpoOffers } from '../src/pages/Ipo';
+import {
+  IPO_VERDICT_HINT,
+  IPO_VERDICT_TONE,
+  expectedReturnClass,
+  expectedReturnText,
+  expectedReturnValue,
+  expectedValueText,
+  expectedValueValue,
+  selectActionableIpoOffers,
+  truncateText,
+  verdictReasonText,
+  winRateText,
+  winRateValue,
+} from '../src/pages/ipoView';
 import { SchedulesCard } from '../src/pages/SettingsSchedules';
 import {
   buildInput,
@@ -73,6 +88,7 @@ const ROUTES: { path: string; expect: string[] }[] = [
   { path: '/watchlist', expect: ['我的标的'] },
   { path: '/compare', expect: ['选择对比标的', '财报对比'] },
   { path: '/advice', expect: ['AI 投资建议'] },
+  { path: '/ipo', expect: ['新股打新', 'IPO Desk'] },
   { path: '/chat', expect: ['AI Chat'] },
   { path: '/activity', expect: ['活动与审计'] },
   { path: '/settings', expect: ['设置'] },
@@ -110,9 +126,9 @@ test('未知路由回退到 Dashboard', () => {
   assert.ok(html.includes('Dashboard'), '未知路由未回退到 Dashboard');
 });
 
-test('侧边栏包含全部七个导航入口', () => {
+test('侧边栏包含全部八个导航入口', () => {
   const html = render('/');
-  for (const label of ['Dashboard', '我的资产', '我的标的', 'AI 投资建议', 'AI Chat', '活动与审计', '设置']) {
+  for (const label of ['Dashboard', '我的资产', '我的标的', '新股打新', 'AI 投资建议', 'AI Chat', '活动与审计', '设置']) {
     assert.ok(html.includes(label), `侧边栏缺少导航项「${label}」`);
   }
 });
@@ -182,14 +198,16 @@ test('Dashboard 工具栏提供「AI一键分析」，并走完整流水线（�
 
 test('Dashboard 第一行显示「年化收益率」「已实现年化收益率」，且在持仓统计卡片内', () => {
   const page = readSource('pages', 'Dashboard.tsx');
-  assert.ok(page.includes('label="年化收益率"'), '缺少「年化收益率」计数');
-  assert.ok(page.includes('label="已实现年化收益率"'), '缺少「已实现年化收益率」计数');
+  // 标签由 returnCardView 决定（区间过短时会换成「累计收益率」），两种口径都要在文件里。
+  for (const label of ["'年化收益率'", "'已实现年化收益率'", "'累计收益率'", "'已实现收益率'"]) {
+    assert.ok(page.includes(label), `缺少标签 ${label}`);
+  }
 
   // 位置：必须在第一行（title="持仓统计" 的卡片里），且在「计数与信号」之前。
   const firstRow = page.indexOf('title="持仓统计"');
   const secondCard = page.indexOf('title="计数与信号"');
-  const annualized = page.indexOf('label="年化收益率"');
-  const realized = page.indexOf('label="已实现年化收益率"');
+  const annualized = page.indexOf('label={view.annualizedLabel}');
+  const realized = page.indexOf('label={view.realizedLabel}');
   assert.ok(firstRow > 0 && secondCard > firstRow, '未找到持仓统计/计数与信号卡片');
   assert.ok(annualized > firstRow && annualized < secondCard, '「年化收益率」必须在第一行');
   assert.ok(realized > firstRow && realized < secondCard, '「已实现年化收益率」必须在第一行');
@@ -206,6 +224,25 @@ test('年化计数：绑定 XIRR 结果、写明口径、不可度量时显示 �
   // null（不可度量）必须如实显示 —，绝不用 0 顶替；fmtPct(null) 已经是 —。
   assert.ok(!/annualizedPct \?\? 0/.test(page), '不可度量不得用 0 顶替');
   assert.ok(!/realizedAnnualizedPct \?\? 0/.test(page), '不可度量不得用 0 顶替');
+});
+
+test('年化计数：区间不足 30 天不年化，卡片改用累计收益率（避免 −0.45% 显示成年化 −80%）', () => {
+  const page = readSource('pages', 'Dashboard.tsx');
+  // 展示口径集中在 returnCardView：年化为空时退回累计收益率，标签一起换。
+  assert.ok(/function returnCardView/.test(page), '必须集中处理「年化 vs 累计」的展示口径');
+  assert.ok(/annualized !== null \? '年化收益率'/.test(page), '年化可用时才用「年化收益率」标签');
+  assert.ok(page.includes("'累计收益率'"), '区间过短时必须改显示「累计收益率」');
+  assert.ok(page.includes("'已实现收益率'"), '已实现部分同理');
+  assert.ok(/annualized \?\? perf\.cumulativePct/.test(page), '年化为空时取累计收益率');
+  assert.ok(/annualizedReliable/.test(page), '副标题必须区分「已年化」与「不做年化」');
+  assert.ok(/MIN_ANNUALIZE_DAYS/.test(page), '30 天门槛必须来自共享常量，不能各写一份');
+  // 不能把年化数字直接写进卡片（那正是这次修掉的问题）。
+  assert.ok(!/value=\{fmtPct\(perf\.annualizedPct\)\}/.test(page), '卡片值不得直接取 annualizedPct（会绕过 30 天门槛）');
+  // 服务端口径与前端门槛必须同源。
+  const types = fs.readFileSync(path.resolve(SRC_DIR, '..', '..', 'shared', 'src', 'types.ts'), 'utf8');
+  for (const field of ['cumulativePct', 'annualizedReliable', 'cashFlowDays', 'realizedCumulativePct']) {
+    assert.ok(new RegExp(`\\b${field}\\b`).test(types), `契约缺少 ${field}`);
+  }
 });
 
 test('契约与接线：PortfolioPerformance 由服务端计算，dashboard 路由产出', () => {
@@ -1510,6 +1547,7 @@ function settingsStub(schedules: Draft['schedules']): Parameters<typeof toDraft>
       dailyTime: task.dailyTime,
       runAssetAnalysis: task.runAssetAnalysis,
       runWatchlistAnalysis: task.runWatchlistAnalysis,
+      runIpoAnalysis: task.runIpoAnalysis,
       runAdvice: task.runAdvice,
     })) as Parameters<typeof toDraft>[0]['schedules'],
     enforceBudget: true,
@@ -1575,10 +1613,28 @@ test('定时任务草稿：非法值在提交前就被拦下（时间 / 间隔 /
   assert.throws(() => toSchedulePayload({ ...draft, dailyTime: '25:99' }), /HH:mm/);
   assert.throws(() => toSchedulePayload({ ...draft, mode: 'interval', intervalMinutes: '' }), /必须是有效数字/);
   assert.throws(() => toSchedulePayload({ ...draft, mode: 'interval', intervalMinutes: 'abc' }), /必须是有效数字/);
+  // 四个步骤（含 2026-10 新增的打新分析）都不选才算空步骤。
   assert.throws(
-    () => toSchedulePayload({ ...draft, runAssetAnalysis: false, runWatchlistAnalysis: false, runAdvice: false }),
+    () =>
+      toSchedulePayload({
+        ...draft,
+        runAssetAnalysis: false,
+        runWatchlistAnalysis: false,
+        runIpoAnalysis: false,
+        runAdvice: false,
+      }),
     /至少要选择一个/,
   );
+  // 只勾「打新分析」是合法的：它是与资产/标的/建议并列的独立步骤。
+  const ipoOnly = toSchedulePayload({
+    ...draft,
+    runAssetAnalysis: false,
+    runWatchlistAnalysis: false,
+    runIpoAnalysis: true,
+    runAdvice: false,
+  });
+  assert.equal(ipoOnly.runIpoAnalysis, true);
+  assert.equal(ipoOnly.runAssetAnalysis, false);
   assert.throws(() => toSchedulePayload({ ...draft, name: '   ' }), /名称/);
 
   // 合法值：切换触发方式不会把另一个模式的配置改成默认值。
@@ -1603,7 +1659,7 @@ test('设置页定时任务：紧凑列表（一行一个任务）默认收起�
   // 一行内看全：名称 / 触发方式 / 步骤 / 下次运行。
   assert.ok(html.includes('工作日盘前'), '任务名未渲染');
   assert.ok(html.includes('每天 08:45'), '触发方式摘要未渲染');
-  assert.ok(html.includes('资产·标的·建议'), '步骤摘要未渲染');
+  assert.ok(html.includes('资产·标的·打新·建议'), '步骤摘要未渲染');
   assert.ok(html.includes('sched-row'), '必须用紧凑行渲染（不是每条任务一整块表单）');
   assert.ok(html.includes('下次'), '必须显示服务端返回的下次运行时间');
   // 默认收起：编辑表单（任务名称 / 触发方式 / 间隔输入）不进首屏 DOM。
@@ -1647,4 +1703,270 @@ test('设置页接线：定时任务走草稿 + 整体提交，Dashboard 徽标�
 
   const dashboard = readSource('pages', 'Dashboard.tsx');
   assert.ok(/signals\.nextRuns/.test(dashboard), 'Dashboard 徽标应显示任务数量');
+});
+
+/* ───────────────────────── 新股打新（IPO）───────────────────────── */
+
+/** 造一条最小的 IpoOffer，只填排序/展示断言用得到的字段。 */
+function ipoOffer(over: Partial<IpoOffer> & { code: string; name: string }): IpoOffer {
+  return {
+    id: `ipo-${over.code}`,
+    uid: `CN:${over.code}`,
+    market: 'CN',
+    subscribeCode: over.code,
+    source: 'eastmoney-ipo',
+    exchange: '',
+    board: '',
+    issuePrice: 0,
+    priceLow: 0,
+    priceHigh: 0,
+    currency: 'CNY',
+    lotSize: 0,
+    maxShares: 0,
+    subscribeStart: null,
+    subscribeEnd: null,
+    allotmentDate: null,
+    listingDate: null,
+    issueShares: 0,
+    raiseAmount: 0,
+    issuePe: 0,
+    industryPe: 0,
+    winningRate: 0,
+    oversubscribe: 0,
+    sponsor: '',
+    industry: '',
+    prospectusUrl: '',
+    status: 'subscribing',
+    advice: '',
+    verdict: null,
+    verdictReason: '',
+    suggestedShares: 0,
+    winProbability: 0,
+    expectedReturn: 0,
+    confidence: null,
+    qualityScore: 0,
+    adviceAt: null,
+    adviceRunId: null,
+    note: '',
+    createdAt: '2026-10-16T09:00:00.000+08:00',
+    updatedAt: '2026-10-16T09:00:00.000+08:00',
+    subscription: null,
+    ...over,
+  } as IpoOffer;
+}
+
+test('打新列表排序：默认按申购截止日升序，缺截止日与已上市的排最后（不冒充机会）', () => {
+  const soon = ipoOffer({ code: '000001', name: '明天截止', subscribeEnd: '2026-10-17' });
+  const later = ipoOffer({ code: '000002', name: '下周截止', subscribeEnd: '2026-10-23' });
+  const unknown = ipoOffer({ code: '000003', name: '上游没给日期', subscribeStart: null, subscribeEnd: null });
+  const listed = ipoOffer({ code: '000004', name: '已经上市', subscribeEnd: '2026-10-01', status: 'listed' });
+
+  const asc = sortIpoOffers([later, listed, unknown, soon], 'subscribeEnd', 'asc');
+  assert.deepEqual(asc.map((offer) => offer.code), ['000001', '000002', '000003', '000004']);
+
+  const desc = sortIpoOffers([soon, later], 'subscribeEnd', 'desc');
+  assert.deepEqual(desc.map((offer) => offer.code), ['000002', '000001']);
+
+  // AI 优质分默认从高到低（最值得看的排最前）。
+  const scored = sortIpoOffers(
+    [
+      ipoOffer({ code: 'A', name: 'a', qualityScore: 30 }),
+      ipoOffer({ code: 'B', name: 'b', qualityScore: 88 }),
+      ipoOffer({ code: 'C', name: 'c', qualityScore: 60 }),
+    ],
+    'qualityScore',
+    'desc',
+  );
+  assert.deepEqual(scored.map((offer) => offer.code), ['B', 'C', 'A']);
+
+  // 原数组不能被原地改（否则 React state 会被悄悄改写）。
+  const input = [later, soon];
+  sortIpoOffers(input, 'subscribeEnd', 'asc');
+  assert.deepEqual(input.map((offer) => offer.code), ['000002', '000001']);
+
+  // 按上市日排序时，没给上市日的同样沉底。
+  const byListing = sortIpoOffers(
+    [
+      ipoOffer({ code: 'X', name: 'x', listingDate: null }),
+      ipoOffer({ code: 'Y', name: 'y', listingDate: '2026-10-20' }),
+      ipoOffer({ code: 'Z', name: 'z', listingDate: '2026-10-18' }),
+    ],
+    'listingDate',
+    'asc',
+  );
+  assert.deepEqual(byListing.map((offer) => offer.code), ['Z', 'Y', 'X']);
+
+  // 已上市的一律沉底，即使它的申购截止日更早。
+  const mixed = sortIpoOffers(
+    [listed, ipoOffer({ code: 'N', name: '还没上市', subscribeEnd: '2026-11-30' })],
+    'subscribeEnd',
+    'desc',
+  );
+  assert.equal(mixed.at(-1)!.code, '000004');
+});
+
+test('打新接线：三个需求都在界面上有入口（收集 / AI 分析 / 中签入账）', () => {
+  const app = readSource('App.tsx');
+  assert.ok(/path="\/ipo"/.test(app) || /'\/ipo'/.test(app), 'App 必须注册 /ipo 路由');
+
+  const layout = readSource('components', 'Layout.tsx');
+  assert.ok(/新股打新/.test(layout), '侧边栏必须有「新股打新」入口');
+
+  const page = readSource('pages', 'Ipo.tsx');
+  assert.ok(/api\.ipo\.refresh/.test(page), '需求①：页面上必须能一键抓取三地新股');
+  assert.ok(/\/ipo\/analyze/.test(page), '需求②：必须能触发 AI 打新分析（SSE）');
+  assert.ok(/market === 'CN'|MARKETS/.test(page), '市场筛选要覆盖 A股/港股/美股');
+
+  const detail = readSource('pages', 'IpoDetailDialog.tsx');
+  assert.ok(/api\.ipo\.subscribe/.test(detail), '必须能登记「我申购了 N 股」');
+  assert.ok(/api\.ipo\.allot/.test(detail), '需求③：必须能回报中签股数');
+  assert.ok(/写入资产|入账/.test(detail), '中签入账必须在界面上说清楚会写进资产');
+
+  const advice = readSource('pages', 'Advice.tsx');
+  assert.ok(/api\.ipo\.list/.test(advice), 'AI 投资建议页要带上打新标的');
+  assert.ok(/打新/.test(advice), 'AI 投资建议页要有打新板块');
+});
+
+test('打新建议配色：建议放弃必须是红色（警示），建议申购是绿色（值得下手）', () => {
+  // 用户反馈：原来「放弃」是绿色（复用 badge-sell），读起来像好消息。颜色按风险语义定死。
+  assert.equal(IPO_VERDICT_TONE.avoid, 'ipo-avoid', '建议放弃必须是警示色');
+  assert.equal(IPO_VERDICT_TONE.subscribe, 'ipo-subscribe', '建议申购必须是机会色');
+  assert.equal(IPO_VERDICT_TONE.neutral, 'default');
+
+  const css = readSource('styles.css');
+  const avoidRule = /\.badge-ipo-avoid\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+  const subscribeRule = /\.badge-ipo-subscribe\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+  assert.ok(/rgba\(255,\s*90,\s*95/.test(avoidRule), '建议放弃要用红（--pos 系警示色）');
+  assert.ok(/rgba\(47,\s*191,\s*143/.test(subscribeRule), '建议申购要用绿（--neg 系机会色）');
+  // 不能再让「放弃」借用 badge-sell（那是行情里的卖出=绿）。
+  const iconCss = /\.badge-ipo-avoid[^}]*\}/.exec(css)?.[0] ?? '';
+  assert.ok(!/badge-sell/.test(iconCss));
+  assert.ok(IPO_VERDICT_HINT.avoid.includes('风险提示'), '颜色语义要在 tooltip 里写明，避免被当成涨跌色');
+
+  // 三个页面必须共用同一份口径，不能各写一份 VERDICT_TONE。
+  for (const page of ['Ipo.tsx', 'IpoDetailDialog.tsx', 'Advice.tsx']) {
+    const src = readSource('pages', page);
+    assert.ok(/IPO_VERDICT_TONE/.test(src), `${page} 必须用共享的 IPO_VERDICT_TONE`);
+    assert.ok(!/VERDICT_TONE\s*[:=]\s*\{/.test(src), `${page} 不得再自建一份 VERDICT_TONE`);
+  }
+});
+
+test('打新建议信息完整：胜率与预期收益都要有数、要能看懂单位', () => {
+  const offer = ipoOffer({ code: '09999', name: '测试标的', verdict: 'subscribe', winProbability: 0.65, expectedReturn: 18.5 });
+  assert.equal(winRateText(offer), '胜率 65%');
+  assert.equal(expectedReturnText(offer), '预期 +18.5%');
+  assert.equal(expectedValueText(offer), '期望值 +12%', '期望值 = 胜率 × 预期收益（0.65 × 18.5 ≈ 12）');
+  assert.equal(expectedReturnClass(offer), 'ipo-pos');
+
+  // 预期破发：必须显示负号并给出风险色，不能显示成「+」。
+  const bad = ipoOffer({ code: '09998', name: '破发标的', verdict: 'avoid', winProbability: 0.3, expectedReturn: -6 });
+  assert.equal(expectedReturnText(bad), '预期 -6%');
+  assert.equal(expectedReturnClass(bad), 'ipo-neg');
+
+  // 没分析过的：如实说「待分析 / 未评估」，绝不拿 0 冒充结论。
+  const fresh = ipoOffer({ code: '09997', name: '没分析' });
+  assert.equal(winRateText(fresh), '待分析');
+  assert.equal(expectedReturnText(fresh), '待分析');
+  assert.equal(expectedValueText(fresh), '待分析');
+  const analyzedNoNumbers = ipoOffer({ code: '09996', name: '旧结论', verdict: 'neutral' });
+  assert.equal(winRateText(analyzedNoNumbers), '胜率未评估', '老库里的结论没有胜率 → 明确说未评估');
+  assert.equal(expectedReturnText(analyzedNoNumbers), '预期收益未评估');
+  assert.equal(expectedValueText(analyzedNoNumbers), '期望值未评估');
+  // 详情卡用的是「只取值」版本（卡片自带标签），不能出现「胜率（AI 推算） 胜率未评估」这种重复。
+  assert.equal(winRateValue(offer), '65%');
+  assert.equal(expectedReturnValue(offer), '+18.5%');
+  assert.equal(expectedValueValue(offer), '+12%');
+  assert.equal(winRateValue(analyzedNoNumbers), '未评估');
+  assert.equal(expectedReturnValue(analyzedNoNumbers), '未评估');
+
+  // 三个页面都要把这两个数显示出来（列表列 / 详情卡 / 建议页列）。
+  for (const page of ['Ipo.tsx', 'IpoDetailDialog.tsx', 'Advice.tsx']) {
+    const src = readSource('pages', page);
+    assert.ok(/winRate(Text|Value)/.test(src), `${page} 必须显示胜率`);
+    assert.ok(/expectedReturn(Text|Value)/.test(src), `${page} 必须显示预期收益`);
+  }
+  // 中签率（上游）与胜率（AI 推算）必须分开表述，不能混为一谈。
+  const page = readSource('pages', 'Ipo.tsx');
+  assert.ok(/中签率.*回答「能不能买到」/.test(page), '界面要说明中签率与胜率的口径差异');
+});
+
+test('打新建议必须给出「简明理由」，并解释「高胜率为何本期不参与」', () => {
+  // ① AI 写入的一句话理由优先展示。
+  const stored = ipoOffer({
+    code: '001381',
+    name: '皇冠新材',
+    verdict: 'neutral',
+    winProbability: 0.75,
+    expectedReturn: 25,
+    verdictReason: '本月 A 股预算仅剩 734 元，一手 500 股 × 16.98 元 = 8,490 元打不起（标的本身不差）',
+  });
+  assert.equal(
+    verdictReasonText(stored),
+    '本月 A 股预算仅剩 734 元，一手 500 股 × 16.98 元 = 8,490 元打不起（标的本身不差）',
+    '有归档理由时直接用，不能再截断或改写',
+  );
+
+  // ② 老数据（升级前写入的结论）没有该字段：从建议正文的「结论」首句提取，
+  //    这样用户升级后立刻能看懂「胜率 75% 为什么不参与」——原因就写在结论里（预算不够）。
+  const legacy = ipoOffer({
+    code: '001381',
+    name: '皇冠新材',
+    verdict: 'neutral',
+    winProbability: 0.75,
+    advice:
+      '**结论**：中性观察，本次 **不申购（0 股）**。两条硬约束：①深主板 **1 手 500 股×16.98 元=8,490 元**，远超 A 股当月预算剩余 **734 元**；②定价折价仅 6.4%。\n\n**① 发行定价**：……',
+  });
+  const legacyReason = verdictReasonText(legacy);
+  assert.match(legacyReason, /中性观察/, '老数据要能从正文里提取结论');
+  assert.match(legacyReason, /预算剩余/, '预算缺口必须能读出来 —— 这正是用户困惑的答案');
+  assert.ok(!legacyReason.includes('**'), '提取时要剥掉 Markdown 加粗标记');
+  assert.ok(!legacyReason.includes('\n'), '要压成一行，便于列表展示');
+
+  // ③ 完全没有结论信息 → 空串（界面显示「—」），不编造理由。
+  assert.equal(verdictReasonText(ipoOffer({ code: '000001', name: '没分析' })), '');
+
+  // ④ 列表只放一行，完整内容在 title 里。
+  assert.equal(truncateText('一二三四五六', 4), '一二三四…');
+  assert.equal(truncateText('短理由', 10), '短理由');
+
+  // ⑤ 三个页面都要显示这条理由（列表列 / 详情 / 建议页「推荐理由」列）。
+  for (const page of ['Ipo.tsx', 'IpoDetailDialog.tsx', 'Advice.tsx']) {
+    const src = readSource('pages', page);
+    assert.ok(/verdictReasonText/.test(src), `${page} 必须显示一句话推荐理由`);
+    assert.ok(/truncateText|推荐理由/.test(src), `${page} 的理由要简明（截断或单独成列）`);
+  }
+  const advicePage = readSource('pages', 'Advice.tsx');
+  assert.ok(/推荐理由/.test(advicePage), '建议页要有「推荐理由」列');
+  assert.ok(/本期该不该打/.test(advicePage), '要说明结论含预算约束，不是单纯看空');
+  const detailPage = readSource('pages', 'IpoDetailDialog.tsx');
+  assert.ok(/推荐理由/.test(detailPage), '详情里要写明推荐理由');
+  // 口径提示：verdict 是「本期是否参与」，与「上市后涨不涨」是两件事。
+  assert.ok(/胜率高但本期不申购|胜率高但显示中性观察|本期不申购/.test(readSource('pages', 'Ipo.tsx')));
+});
+
+test('AI 投资建议页：建议放弃的标的不再占位，只报个数', () => {  const subscribing = ipoOffer({ code: 'A1', name: '值得打', verdict: 'subscribe', winProbability: 0.7, expectedReturn: 20 });
+  const neutral = ipoOffer({ code: 'A2', name: '中性', verdict: 'neutral' });
+  const avoided = ipoOffer({ code: 'A3', name: '已放弃', verdict: 'avoid', winProbability: 0.2, expectedReturn: -8 });
+  const fresh = ipoOffer({ code: 'A4', name: '刚刷新还没分析' });
+  const listed = ipoOffer({ code: 'A5', name: '已上市', status: 'listed', verdict: 'subscribe' });
+
+  const { actionable, avoided: avoidedList } = selectActionableIpoOffers([subscribing, neutral, avoided, fresh, listed]);
+  const codes = actionable.map((offer) => offer.code);
+  assert.deepEqual(codes, ['A1', 'A2', 'A4'], '建议放弃的不列进建议页；已上市的不是「还能下手的机会」');
+  assert.deepEqual(
+    avoidedList.map((offer) => offer.code),
+    ['A3'],
+    '放弃的标的要单独计数（页面上要说明「另有 N 只建议放弃」）',
+  );
+
+  // 建议页的登记入口：必须复用打新详情浮窗（同一套申购/中签校验），并直接滚到登记段。
+  const advice = readSource('pages', 'Advice.tsx');
+  assert.ok(/IpoDetailDialog/.test(advice), '建议页要能直接打开登记浮窗（需求：在建议页也能登记）');
+  assert.ok(/focusRegister/.test(advice), '打开时必须定位到登记段，而不是让用户自己找');
+  assert.ok(/setRegisterId/.test(advice), '每行都要有登记入口');
+  assert.ok(/api\.ipo\.subscribe|IpoDetailDialog/.test(advice));
+
+  const detail = readSource('pages', 'IpoDetailDialog.tsx');
+  assert.ok(/focusRegister/.test(detail), '浮窗要支持 focusRegister');
+  assert.ok(/scrollIntoView/.test(detail), 'focusRegister 要真的把视图带过去');
 });

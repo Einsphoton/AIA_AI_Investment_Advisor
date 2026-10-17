@@ -30,6 +30,8 @@ export interface ScheduleTaskDraft {
   dailyTime: string;
   runAssetAnalysis: boolean;
   runWatchlistAnalysis: boolean;
+  /** 2026-10 新增：打新分析（刷新新股信息 + 是否申购结论）。 */
+  runIpoAnalysis: boolean;
   runAdvice: boolean;
 }
 
@@ -72,6 +74,7 @@ export function newScheduleDraft(over: Partial<ScheduleTaskDraft> = {}): Schedul
     dailyTime: DEFAULT_SCHEDULE_TASK.dailyTime,
     runAssetAnalysis: DEFAULT_SCHEDULE_TASK.runAssetAnalysis,
     runWatchlistAnalysis: DEFAULT_SCHEDULE_TASK.runWatchlistAnalysis,
+    runIpoAnalysis: DEFAULT_SCHEDULE_TASK.runIpoAnalysis,
     runAdvice: DEFAULT_SCHEDULE_TASK.runAdvice,
     ...over,
   };
@@ -88,6 +91,7 @@ export function toScheduleDraft(task: ScheduleTask): ScheduleTaskDraft {
     dailyTime: task.dailyTime ?? DEFAULT_SCHEDULE_TASK.dailyTime,
     runAssetAnalysis: task.runAssetAnalysis !== false,
     runWatchlistAnalysis: task.runWatchlistAnalysis !== false,
+    runIpoAnalysis: task.runIpoAnalysis !== false,
     runAdvice: task.runAdvice !== false,
   };
 }
@@ -144,7 +148,7 @@ const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 export function toSchedulePayload(draft: ScheduleTaskDraft): ScheduleTask {
   const name = draft.name.trim();
   if (!name) throw new Error('定时任务必须有名称');
-  if (!draft.runAssetAnalysis && !draft.runWatchlistAnalysis && !draft.runAdvice) {
+  if (!draft.runAssetAnalysis && !draft.runWatchlistAnalysis && !draft.runIpoAnalysis && !draft.runAdvice) {
     throw new Error(`定时任务「${name}」至少要选择一个要跑的步骤`);
   }
   const dailyTime = draft.dailyTime.trim();
@@ -168,6 +172,7 @@ export function toSchedulePayload(draft: ScheduleTaskDraft): ScheduleTask {
     dailyTime: TIME_RE.test(dailyTime) ? dailyTime : DEFAULT_SCHEDULE_TASK.dailyTime,
     runAssetAnalysis: draft.runAssetAnalysis,
     runWatchlistAnalysis: draft.runWatchlistAnalysis,
+    runIpoAnalysis: draft.runIpoAnalysis,
     runAdvice: draft.runAdvice,
   };
 }

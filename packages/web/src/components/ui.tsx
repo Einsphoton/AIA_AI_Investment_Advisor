@@ -85,7 +85,19 @@ export function Button({ variant = 'default', size = 'md', loading, className = 
 
 /* ──────────────────────────────── Badge ──────────────────────────────────── */
 
-export function Badge({ children, tone = 'default', title }: { children: ReactNode; tone?: 'default' | 'buy' | 'sell' | 'ai' | 'manual' | 'warn' | 'ok'; title?: string }) {
+export function Badge({
+  children,
+  tone = 'default',
+  title,
+}: {
+  children: ReactNode;
+  /**
+   * `ipo-subscribe` / `ipo-avoid` 是**打新风险语义**（绿=值得下手、红=建议放弃），
+   * 与行情/买卖的红涨绿跌相反，故单独成色，不复用 `buy` / `sell`。
+   */
+  tone?: 'default' | 'buy' | 'sell' | 'ai' | 'manual' | 'warn' | 'ok' | 'ipo-subscribe' | 'ipo-avoid';
+  title?: string;
+}) {
   const toneClass = tone === 'default' ? '' : `badge-${tone}`;
   return (
     <span className={`badge ${toneClass}`} title={title}>

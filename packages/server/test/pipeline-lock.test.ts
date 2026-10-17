@@ -110,7 +110,8 @@ test('D7 + D3：tick 与手动流水线共享锁；运行期间 nextRunAt() 绝�
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aia-lock-'));
   const repo = createRepo(path.join(dir, 'advisor.db'));
   repo.migrate();
-  const base = { intervalMinutes: 1, dailyTime: '08:30', runAssetAnalysis: true, runWatchlistAnalysis: true, runAdvice: true };
+  // runIpoAnalysis 显式关掉：打新步骤会真的去打四个上游（网络 I/O），本用例必须保持离线。
+  const base = { intervalMinutes: 1, dailyTime: '08:30', runAssetAnalysis: true, runWatchlistAnalysis: true, runIpoAnalysis: false, runAdvice: true };
   const task = (over: Partial<ScheduleTask> = {}): ScheduleTask => ({
     id: 'sched_1',
     name: '测试任务',

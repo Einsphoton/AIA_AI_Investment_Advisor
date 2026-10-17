@@ -342,23 +342,51 @@ test('当年没有卖出 → 已实现年化 null（不适用），不是 0', ()
   assert.ok(perf.notes.some((note) => note.includes('当年没有卖出记录')));
 });
 
-test('短期区间提示按实际现金流判断：昨天刚买、今天算年化必须提示会被放大', () => {
-  // 自然年已经过了 200+ 天，但真实资金在场只有 1 天 —— 提示必须按现金流区间给。
+test('短期区间不年化：昨天买入今天亏 0.45% → 不给 −80% 的年化，改给区间累计收益率', () => {
+  // 真实反馈场景：100 股 @42.66 买入，次日市值 4247（区间 −0.45%）。
+  // 几何年化会算出 (4247/4266)^365 − 1 ≈ −80.39% —— 数字没错，但等于把一天的波动外推成一年。
+  const txs = [tx('buy', 100, 42.66, '2026-10-15')];
   const perf = computePerformance({
     year: 2026,
     asOf: '2026-10-16',
     currency: 'CNY',
-    assets: [{ id: 'a-cn', name: '测试标的', currency: 'CNY', txs: [tx('buy', 100, 10, '2026-10-15')] }],
+    assets: [{ id: 'a-cn', name: '测试标的', currency: 'CNY', txs }],
     openingValue: 0,
-    endingValue: 1010,
+    endingValue: 4247,
     rateOf: () => 1,
   });
-  assert.ok(perf.annualizedPct !== null, '1 天也能算，但必须提示');
-  assert.ok(perf.days > 200, '自然年区间是长的');
+
+  assert.equal(perf.cashFlowDays, 1, '实际有资金的只有 1 天');
+  assert.equal(perf.annualizedReliable, false);
+  assert.equal(perf.annualizedPct, null, '不足 30 天不得给出年化数字');
+  assert.equal(perf.cumulativePct, -0.4454, '改为给出区间累计收益率（−19 / 4266）');
   assert.ok(
-    perf.notes.some((note) => note.includes('实际现金流区间仅 1 天')),
-    `缺少短期提示：${perf.notes.join(' | ')}`,
+    perf.notes.some((note) => note.includes('不足 30 天') && note.includes('-80.3')),
+    `说明里要写清「强行年化会是多少」：${perf.notes.join(' | ')}`,
   );
+});
+
+test('区间够长（≥30 天）才给年化：40 天赚 10% → 年化 ≈ 133%，并同时给出累计 10%', () => {
+  const txs = [tx('buy', 100, 10, '2026-01-05')];
+  const perf = computePerformance({
+    year: 2026,
+    asOf: '2026-02-14', // 40 天
+    currency: 'CNY',
+    assets: [{ id: 'a-cn', name: '测试标的', currency: 'CNY', txs }],
+    openingValue: 0,
+    endingValue: 1100,
+    rateOf: () => 1,
+  });
+  const expected = (1100 / 1000) ** (365 / 40) - 1;
+  assert.equal(perf.cashFlowDays, 40);
+  assert.equal(perf.annualizedReliable, true);
+  assert.ok(perf.annualizedPct !== null);
+  assert.ok(
+    Math.abs(perf.annualizedPct! / 100 - expected) < 1e-6,
+    `期望年化 ${(expected * 100).toFixed(2)}%，实际 ${perf.annualizedPct}`,
+  );
+  assert.equal(perf.cumulativePct, 10, '累计收益率只有 10%');
+  assert.ok(!perf.notes.some((note) => note.includes('不足 30 天')));
 });
 
 test('当年已实现年化：两笔现金流有解析解，锚点在加权平均买入日', () => {

@@ -15,6 +15,8 @@ import type {
   Creator,
   ImportMode,
   ImportResult,
+  IpoMarketStatus,
+  Market,
   PendingWriteStatus,
   ToolRisk,
   WatchItemStatus,
@@ -27,8 +29,13 @@ import type {
   AuditRow,
   ChatMessageRow,
   ChatSessionRow,
+  IpoOfferPatch,
+  IpoOfferRow,
+  IpoSubscriptionRow,
   NewAdvice,
   NewAsset,
+  NewIpoOffer,
+  NewIpoSubscription,
   NewStep,
   NewTx,
   NewWatch,
@@ -47,6 +54,9 @@ export interface ExportBundle {
   transactions: TxRow[];
   watchlist: WatchRow[];
   advice: AdviceRow[];
+  /** 新股打新：标的 + 我的申购记录（老备份缺失时按空数组处理）。 */
+  ipoOffers: IpoOfferRow[];
+  ipoSubscriptions: IpoSubscriptionRow[];
 }
 
 /** 自选池筛选：`all` 用于 prompt / 备份 / 计数，其余用于列表展示。 */
@@ -132,6 +142,26 @@ export interface Repo {
   /** 追踪窗口之外的旧结果（用于清理已删除建议的残留）。 */
   deleteAdviceOutcomesForMissingAdvice(): number;
 
+  /* ── 新股打新 (IPO) ────────────────────────────────────────────────────── */
+  /**
+   * 打新标的列表。默认返回**全部**（含已上市），由调用方按状态/时间过滤：
+   * 界面需要看「近期已上市」来复盘，AI 需要看「待申购」来决定打不打。
+   */
+  listIpoOffers(filter?: { market?: Market; status?: IpoMarketStatus; limit?: number }): IpoOfferRow[];
+  getIpoOffer(id: string): IpoOfferRow | undefined;
+  /** 按稳定业务键 `market:code` 查（刷新时判断插入还是更新）。 */
+  findIpoOfferByUid(uid: string): IpoOfferRow | undefined;
+  createIpoOffer(input: NewIpoOffer): IpoOfferRow;
+  updateIpoOffer(id: string, patch: IpoOfferPatch): IpoOfferRow | undefined;
+  /** 删除标的（同时删除其申购记录，避免悬挂记录）。 */
+  deleteIpoOffer(id: string): boolean;
+  /** 我的申购记录（一只新股最多一条），按 key 为 offerUid。 */
+  listIpoSubscriptions(): IpoSubscriptionRow[];
+  getIpoSubscription(offerUid: string): IpoSubscriptionRow | undefined;
+  /** 插入或按 `offerUid` 更新（登记申购、录入中签都用它，重复调用收敛到一条）。 */
+  upsertIpoSubscription(input: NewIpoSubscription): IpoSubscriptionRow;
+  deleteIpoSubscription(id: string): boolean;
+
   /* ── agent runs ────────────────────────────────────────────────────────── */
   createRun(input: Omit<RunRow, 'finishedAt' | 'summary' | 'error' | 'turns' | 'promptTokens' | 'completionTokens'> & Partial<RunRow>): RunRow;
   updateRun(id: string, patch: Partial<Omit<RunRow, 'id'>>): RunRow | undefined;
@@ -204,4 +234,4 @@ export interface Repo {
 }
 
 /** Alias kept for readability in route modules. */
-export type { AssetRow, TxRow, WatchRow, AdviceRow, AdviceOutcomeRow, RunRow, StepRow };
+export type { AssetRow, TxRow, WatchRow, AdviceRow, AdviceOutcomeRow, RunRow, StepRow, IpoOfferRow, IpoSubscriptionRow };

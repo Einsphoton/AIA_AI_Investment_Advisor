@@ -13,6 +13,9 @@ import type {
   ChatRole,
   Creator,
   InstrumentType,
+  IpoAdviceVerdict,
+  IpoMarketStatus,
+  IpoSubscriptionStatus,
   LlmConfig,
   Market,
   Persona,
@@ -266,6 +269,144 @@ export interface ChatMessageRow {
   toolCallId: string | null;
   runId: string | null;
   createdAt: string;
+}
+
+/* ─────────────────────────── 新股打新 (IPO) rows ──────────────────────────── */
+
+/**
+ * `ipo_offers` 的一行。
+ *
+ * `uid`（`market:code`）是稳定业务键：新股刷新时上游可能改变主键（新库 id），
+ * 但 uid 不变，因此订阅记录、AI 结论与界面选中项都挂 uid 而不是行 id。
+ */
+export interface IpoOfferRow {
+  id: string;
+  uid: string;
+  market: Market;
+  code: string;
+  subscribeCode: string;
+  name: string;
+  source: string;
+  exchange: string;
+  board: string;
+  issuePrice: number;
+  priceLow: number;
+  priceHigh: number;
+  currency: string;
+  lotSize: number;
+  maxShares: number;
+  subscribeStart: string | null;
+  subscribeEnd: string | null;
+  allotmentDate: string | null;
+  listingDate: string | null;
+  issueShares: number;
+  raiseAmount: number;
+  issuePe: number;
+  industryPe: number;
+  winningRate: number;
+  oversubscribe: number;
+  sponsor: string;
+  industry: string;
+  prospectusUrl: string;
+  status: IpoMarketStatus;
+  advice: string;
+  verdict: IpoAdviceVerdict | null;
+  /** 一句话结论理由（必填，由 `save_ipo_analysis` 写入）。 */
+  verdictReason: string;
+  suggestedShares: number;
+  /** AI 推算的上市后正收益概率 0–1（与上游中签率 `winningRate` 不同）。 */
+  winProbability: number;
+  /** AI 推算的上市后预期收益（%，可为负）。 */
+  expectedReturn: number;
+  confidence: number;
+  qualityScore: number;
+  adviceAt: string | null;
+  adviceRunId: string | null;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `ipo_subscriptions` 的一行。 */
+export interface IpoSubscriptionRow {
+  id: string;
+  offerUid: string;
+  market: Market;
+  code: string;
+  name: string;
+  status: IpoSubscriptionStatus;
+  appliedShares: number;
+  allottedShares: number;
+  price: number;
+  fee: number;
+  currency: string;
+  appliedAt: string;
+  allottedAt: string | null;
+  assetId: string | null;
+  transactionId: string | null;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `createIpoOffer` 的入参（刷新与人工录入共用）。 */
+export interface NewIpoOffer {
+  id: string;
+  uid: string;
+  market: Market;
+  code: string;
+  subscribeCode?: string;
+  name: string;
+  source?: string;
+  exchange?: string;
+  board?: string;
+  issuePrice?: number;
+  priceLow?: number;
+  priceHigh?: number;
+  currency?: string;
+  lotSize?: number;
+  maxShares?: number;
+  subscribeStart?: string | null;
+  subscribeEnd?: string | null;
+  allotmentDate?: string | null;
+  listingDate?: string | null;
+  issueShares?: number;
+  raiseAmount?: number;
+  issuePe?: number;
+  industryPe?: number;
+  winningRate?: number;
+  oversubscribe?: number;
+  sponsor?: string;
+  industry?: string;
+  prospectusUrl?: string;
+  status?: IpoMarketStatus;
+  /** 注意：AI 结论字段（`verdict` 等）不在这里 —— 刷新/人工录入只写发行要素，
+   *  结论一律经 `updateIpoOffer`（`IpoOfferPatch`）由 `save_ipo_analysis` 落库。 */
+  note?: string;
+  createdAt?: string;
+}
+
+/** `updateIpoOffer` 的部分更新；`undefined` = 不动。 */
+export type IpoOfferPatch = Partial<Omit<IpoOfferRow, 'id' | 'uid' | 'createdAt'>>;
+
+export interface NewIpoSubscription {
+  id: string;
+  offerUid: string;
+  market: Market;
+  code: string;
+  name: string;
+  status?: IpoSubscriptionStatus;
+  appliedShares?: number;
+  allottedShares?: number;
+  price?: number;
+  fee?: number;
+  currency?: string;
+  appliedAt: string;
+  allottedAt?: string | null;
+  assetId?: string | null;
+  transactionId?: string | null;
+  note?: string;
+  createdAt?: string;
 }
 
 /* ───────────────────────────── input shapes ───────────────────────────────── */

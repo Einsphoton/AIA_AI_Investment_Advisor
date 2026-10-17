@@ -165,6 +165,74 @@ export const SCHEMA_STATEMENTS: string[] = [
      updated_at TEXT NOT NULL DEFAULT ''
    )`,
 
+  /* ── 新股打新：打新标的（按 uid 整体覆盖刷新） ────────────────────────────── */
+  `CREATE TABLE IF NOT EXISTS ipo_offers (
+     id TEXT PRIMARY KEY,
+     uid TEXT NOT NULL UNIQUE,
+     market TEXT NOT NULL DEFAULT 'CN',
+     code TEXT NOT NULL DEFAULT '',
+     subscribe_code TEXT NOT NULL DEFAULT '',
+     name TEXT NOT NULL DEFAULT '',
+     source TEXT NOT NULL DEFAULT 'manual',
+     exchange TEXT NOT NULL DEFAULT '',
+     board TEXT NOT NULL DEFAULT '',
+     issue_price REAL NOT NULL DEFAULT 0,
+     price_low REAL NOT NULL DEFAULT 0,
+     price_high REAL NOT NULL DEFAULT 0,
+     currency TEXT NOT NULL DEFAULT 'CNY',
+     lot_size REAL NOT NULL DEFAULT 0,
+     max_shares REAL NOT NULL DEFAULT 0,
+     subscribe_start TEXT,
+     subscribe_end TEXT,
+     allotment_date TEXT,
+     listing_date TEXT,
+     issue_shares REAL NOT NULL DEFAULT 0,
+     raise_amount REAL NOT NULL DEFAULT 0,
+     issue_pe REAL NOT NULL DEFAULT 0,
+     industry_pe REAL NOT NULL DEFAULT 0,
+     winning_rate REAL NOT NULL DEFAULT 0,
+     oversubscribe REAL NOT NULL DEFAULT 0,
+     sponsor TEXT NOT NULL DEFAULT '',
+     industry TEXT NOT NULL DEFAULT '',
+     prospectus_url TEXT NOT NULL DEFAULT '',
+     status TEXT NOT NULL DEFAULT 'unknown',
+     advice TEXT NOT NULL DEFAULT '',
+     verdict TEXT,
+     verdict_reason TEXT NOT NULL DEFAULT '',
+     suggested_shares REAL NOT NULL DEFAULT 0,
+     win_probability REAL NOT NULL DEFAULT 0,
+     expected_return REAL NOT NULL DEFAULT 0,
+     confidence REAL NOT NULL DEFAULT 0,
+     quality_score REAL NOT NULL DEFAULT 0,
+     advice_at TEXT,
+     advice_run_id TEXT,
+     note TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
+
+  /* ── 新股打新：我的申购 / 中签记录（一只新股最多一条） ────────────────────── */
+  `CREATE TABLE IF NOT EXISTS ipo_subscriptions (
+     id TEXT PRIMARY KEY,
+     offer_uid TEXT NOT NULL UNIQUE,
+     market TEXT NOT NULL DEFAULT 'CN',
+     code TEXT NOT NULL DEFAULT '',
+     name TEXT NOT NULL DEFAULT '',
+     status TEXT NOT NULL DEFAULT 'applied',
+     applied_shares REAL NOT NULL DEFAULT 0,
+     allotted_shares REAL NOT NULL DEFAULT 0,
+     price REAL NOT NULL DEFAULT 0,
+     fee REAL NOT NULL DEFAULT 0,
+     currency TEXT NOT NULL DEFAULT 'CNY',
+     applied_at TEXT NOT NULL DEFAULT '',
+     allotted_at TEXT,
+     asset_id TEXT,
+     transaction_id TEXT,
+     note TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
+
   `CREATE TABLE IF NOT EXISTS agent_runs (
      id TEXT PRIMARY KEY,
      kind TEXT NOT NULL,
@@ -280,6 +348,10 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS idx_audit_run ON audit_log(run_id)',
   'CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_writes(status, created_at)',
   'CREATE INDEX IF NOT EXISTS idx_run_messages ON agent_run_messages(run_id, idx)',
+  'CREATE INDEX IF NOT EXISTS idx_ipo_offers_market ON ipo_offers(market, subscribe_start DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_ipo_offers_status ON ipo_offers(status)',
+  'CREATE INDEX IF NOT EXISTS idx_ipo_offers_listing ON ipo_offers(listing_date)',
+  'CREATE INDEX IF NOT EXISTS idx_ipo_subscriptions_status ON ipo_subscriptions(status)',
 ];
 
 /** Applies pragmas, creates missing tables/columns/indexes. Idempotent. */
@@ -310,6 +382,11 @@ export function migrateSchema(db: DatabaseSync): void {
   ensureColumn(db, 'agent_run_messages', 'reasoning_content', 'TEXT');
   // 定时任务数组（2026-10）：旧库只有单任务的 schedule_* 列，读取时迁移到这一列。
   ensureColumn(db, 'settings', 'schedules', "TEXT NOT NULL DEFAULT '[]'");
+  // 打新结论的「胜率 + 预期收益」（2026-10 补）：只有 AI 分析会写，老库给 0 = 未评估。
+  ensureColumn(db, 'ipo_offers', 'win_probability', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn(db, 'ipo_offers', 'expected_return', 'REAL NOT NULL DEFAULT 0');
+  // 一句话结论理由（2026-10-17 补）：高胜率却判「本期不参与」时必须能说明绑定约束（预算/一手金额）。
+  ensureColumn(db, 'ipo_offers', 'verdict_reason', "TEXT NOT NULL DEFAULT ''");
 
   for (const statement of INDEX_STATEMENTS) db.exec(statement);
 }

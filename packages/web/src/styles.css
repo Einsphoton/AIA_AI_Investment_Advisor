@@ -763,6 +763,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 }
 .badge-buy { background: var(--pos-soft); color: #ff9ba1; border-color: rgba(255, 90, 95, 0.4); }
 .badge-sell { background: var(--neg-soft); color: #7ee7c4; border-color: rgba(47, 191, 143, 0.4); }
+/* 打新建议专用色：**风险语义**，绿=值得下手、红=建议放弃。
+   不复用 .badge-buy/.badge-sell（那两组是行情/买卖语义的红涨绿跌），
+   否则「建议放弃」会跟「卖出」一样显示成绿色，读起来像好消息。 */
+.badge-ipo-subscribe { background: rgba(47, 191, 143, 0.16); color: #7ee7c4; border-color: rgba(47, 191, 143, 0.42); }
+.badge-ipo-avoid { background: rgba(255, 90, 95, 0.16); color: #ff9ba1; border-color: rgba(255, 90, 95, 0.45); }
 .badge-ai {
   background: rgba(212, 175, 55, 0.16);
   color: var(--gold-100);
@@ -1060,6 +1065,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .scroll-y { overflow-y: auto; }
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
+/* 打新专用：机会=绿、风险=红（与行情红涨绿跌相反），只用在打新页面/板块。 */
+.ipo-pos { color: #7ee7c4; }
+.ipo-neg { color: #ff9ba1; }
 .flat { color: var(--text-dim); }
 .strong { font-weight: 600; }
 .small { font-size: 12px; }
@@ -1075,6 +1083,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .kv { display: grid; grid-template-columns: minmax(88px, auto) 1fr; gap: 7px 14px; font-size: 13px; }
 .kv dt { color: var(--text-dim); }
 .kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+/* 新股打新浮窗里的小节标题（发行要素 / AI 打新建议 / 我的打新登记）。
+   与 .card-title 区分：这里是同一张卡片内部的分段，字号更小、带金色贝线。 */
+.section-title {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--gold-200);
+  padding-bottom: 6px; margin-bottom: 10px;
+  border-bottom: 1px solid var(--gold-hair);
+}
+.tiny-gap-list { margin: 4px 0 0 16px; }
 
 .spinner {
   width: 16px; height: 16px; border-radius: 99px;

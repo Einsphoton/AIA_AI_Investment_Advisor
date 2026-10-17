@@ -39,6 +39,7 @@ import {
 import { fundInfo, fundQuote, fundSearch, fundSeries } from './fund.js';
 import { emFinancials } from './financials.js';
 import { globalIndices } from './indices.js';
+import { collectIpoOffers as collectIpoSources, type IpoCollectOptions } from './ipo.js';
 import { keyedFundamentals, keyedQuote, keyedSeries } from './keyed.js';
 import { macroBundle, macroReport } from './macro.js';
 import { newsSearch } from './news.js';
@@ -46,6 +47,7 @@ import { normalizeUsTicker, tencentFundamentals, tencentQuote, tencentSeries } f
 import { tryText, errorMessage, clearHttpCache } from './http.js';
 import type {
   DataSourceSlot,
+  IpoCollectResult,
   MacroBundle,
   ProviderQuote,
   ProviderSeries,
@@ -676,6 +678,18 @@ export async function getNews(query: string, limit = 8): Promise<Sourced<NewsIte
     warnings.push(`资讯检索失败：${errorMessage(error)}`);
     return { value: [], sources: [], warnings };
   }
+}
+
+/* ──────────────────────────────── 新股打新 ───────────────────────────────── */
+
+/**
+ * 打新数据源入口（A股/港股/美股）。
+ *
+ * 这里只做转发：具体适配器在 `./ipo.ts`，它自带缓存与逐市场容错，故意不接入
+ * `providerChain` —— 打新源不实现报价/财报接口，不应出现在行情数据源的优先级链里。
+ */
+export async function collectIpoOffers(options: IpoCollectOptions = {}): Promise<IpoCollectResult> {
+  return collectIpoSources(options);
 }
 
 /* ─────────────────────────────── web search ─────────────────────────────── */

@@ -72,20 +72,21 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 "schedules": [
   { "id": "sched_morning", "name": "工作日盘前", "enabled": true, "mode": "daily",
     "dailyTime": "08:45", "intervalMinutes": 1440,
-    "runAssetAnalysis": true, "runWatchlistAnalysis": false, "runAdvice": true },
+    "runAssetAnalysis": true, "runWatchlistAnalysis": false, "runIpoAnalysis": true, "runAdvice": true },
   { "id": "sched_weekend", "name": "周末挖标的", "enabled": false, "mode": "interval",
     "intervalMinutes": 360, "dailyTime": "08:30",
-    "runAssetAnalysis": false, "runWatchlistAnalysis": true, "runAdvice": false }
+    "runAssetAnalysis": false, "runWatchlistAnalysis": true, "runIpoAnalysis": false, "runAdvice": false }
 ]
 ```
 
 | 规则 | 说明 |
 | --- | --- |
 | 替换语义 | `PUT /api/settings` 里 `schedules` **整体替换**（与 `mcpServers` 相同）；省略该字段 = 保持不变；`[]` = 删光所有任务并停止排程 |
-| 每条任务 | `id`（稳定标识，`[A-Za-z0-9_-]{1,40}`，同一数组内不可重复）、`name`、`enabled`（停用后配置保留但不排程）、`mode`（`interval` \| `daily`，**没有** `off`）、`intervalMinutes`（≥1，从上次跑完起算）、`dailyTime`（`HH:mm` 本地时间）、三个步骤开关 |
-| 校验 | `dailyTime` 必须是合法的 24 小时时间（`25:99` → 400）；三个步骤**至少选一个**（全关的任务没有任何意义 → 400）；`id` 重复 → 400；最多 20 个任务 |
+| 每条任务 | `id`（稳定标识，`[A-Za-z0-9_-]{1,40}`，同一数组内不可重复）、`name`、`enabled`（停用后配置保留但不排程）、`mode`（`interval` \| `daily`，**没有** `off`）、`intervalMinutes`（≥1，从上次跑完起算）、`dailyTime`（`HH:mm` 本地时间）、四个步骤开关（资产 / 标的 / **打新** / 建议） |
+| 校验 | `dailyTime` 必须是合法的 24 小时时间（`25:99` → 400）；四个步骤**至少选一个**（全关的任务没有任何意义 → 400）；`id` 重复 → 400；最多 20 个任务 |
 | 生效 | 保存后调度器立即 `reload()`，无需重启；同一时刻到期的多个任务**合并成一次运行**（步骤取并集），跑完各自重排 |
 | 旧库 / 旧备份 | 旧库的 `schedule_*` 单任务列在读取时迁移成「一个任务」（`mode='off'` → 空数组）；旧备份里的 `settings.schedule` 对象同样兼容；写回时旧列会同步第一个启用任务，方便回滚到旧版本 |
+| 打新步骤默认开 | 旧任务/旧备份里没有 `runIpoAnalysis` 时按 **`true`** 补（多一步不破坏任何已有数据；只想省钱可在设置页关掉） |
 | 观察 | `GET /api/dashboard` 的 `signals.scheduleEnabled`（是否至少有一个启用任务）、`signals.nextRunAt`（最近一次）与 `signals.nextRuns[]`（`{id,name,nextRunAt}`，按时间升序）来自**实时调度器**；设置页据此逐个任务显示下次运行时间 |
 
 ## 3. 仪表盘（/api/dashboard）
@@ -96,6 +97,11 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
     - `annualizedPct` = **XIRR（资金加权，实际天数/365）**：期初（上一年最后一天）持仓市值按各自 ≤ 该日的**最后收盘价**估值，
       叠加当年每笔买卖的真实现金流（买入含费 / 卖出扣费），期末取当前总市值。**不是**「收益率 ÷ 天数 × 365」的外推
     - `realizedAnnualizedPct` = 只算**当年卖出**部分：账面成本（移动加权平均，含分摊买入费用）锚定在这些份额的**加权平均买入日**
+    - **不足 30 天（`MIN_ANNUALIZE_DAYS`）一律不年化**：几何年化对短区间极度敏感（持有 1 天亏 0.45% → 年化 −80%；涨 1% → 年化 +3678%），
+      那不是收益，而是把一天的噪声外推成一年。此时 `annualizedPct = null`、`annualizedReliable = false`，改用
+      `cumulativePct`（区间累计收益率 = `(期末市值 + 卖出净额 − 买入含费 − 期初市值) / (期初市值 + 买入含费)`）展示；
+      `notes` 会同时写明「强行年化会是多少」。`cashFlowDays` = 当年**实际有资金**的天数（首笔 → 末笔现金流，不是自然年长度）。
+      已实现部分同理：`realizedAnnualizedReliable === false` 时用 `realizedCumulativePct`（已实现累计收益率）兜底
     - `sinceInceptionPct` = 全周期年化（首次买入 → 今天，同口径，仅需账本 + 期末市值）
     - 期初估值失败（缺历史收盘价 / 取数超时）时 `openingValue`、`annualizedPct` 一律为 `null`，`notes` 写明原因 —— **绝不用 0 或估算值冒充**；
       当年没有卖出时 `realizedAnnualizedPct` 同样为 `null`（不适用，而不是 0）
@@ -195,10 +201,18 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 因此「池外」意味着该建议**跳过了「AI 标的分析」的质量分门槛**，界面据此提示用户先复核。
 标的的 `expectedReturn` 旁边新增 `expectedReturnHorizon`（预期多久到达，自由文本，≤40 字）。
 
+**与打新的关系**：流水线多了一步「打新分析」（可在定时任务里单独开关，见 §2），并且汇总提示词里带上
+当前在招的新股与用户已登记的申购，要求模型把「打新占用现金」与月度预算一起考虑。打新结论**不写成
+`advice` 行**（建议确认会直接写资产，不适合承载「建议申购」这类尚未成交的标的），而是落在
+`ipo_offers.advice / verdict / verdictReason / suggestedShares / winProbability / expectedReturn`，由 `/ipo` 页与建议页的
+「打新建议」板块呈现（见 §12）。建议页只列**未被建议放弃**的在招标的（放弃的不会占用当月现金，
+只报个数），并可从每行直接打开登记浮窗回报申购 / 中签；建议页与 `/ipo` 页都有「推荐理由」一列，
+直接显示 AI 写的一句话理由（`verdictReason`），老数据自动从建议正文的结论首句提取。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/advice` | `{ items: AdviceItem[], budget: BudgetStatus }`；`?status=pending\|confirmed\|rejected` |
-| POST | `/api/advice/generate` | **AI 投资建议**（SSE）：先跑资产分析 → 标的分析 → 汇总生成建议（受预算约束） |
+| POST | `/api/advice/generate` | **AI 投资建议**（SSE）：先跑资产分析 → 标的分析 → **打新分析** → 汇总生成建议（受预算约束） |
 | POST | `/api/advice/:id/reject` | 驳回（本次不采纳）→ `AdviceItem`（`status=rejected`） |
 | POST | `/api/advice/:id/confirm` | 入参 `ConfirmAdviceInput`（实际份额/单价/日期）→ `{ advice: AdviceItem, asset: AssetDetail }`，写入交易并更新持仓。**与 `/api/assets/:id/transactions` 同源校验**：卖出份额超过持仓、或卖出日期早于可用持仓形成时间 → **409 CONFLICT** |
 | GET | `/api/advice/last` | 最近一次建议生成运行 `AgentRunSummary \| null` |
@@ -265,8 +279,8 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 
 ### 9.1 AI 流水线互斥
 
-调度器的定时 tick 与 4 条手动 SSE 入口（`POST /api/assets/analyze`、`POST /api/watchlist/analyze`、
-`POST /api/advice/generate`、`POST /api/agent/run-now`）共享同一把**非阻塞锁**
+调度器的定时 tick 与 5 条手动 SSE 入口（`POST /api/assets/analyze`、`POST /api/watchlist/analyze`、
+`POST /api/ipo/analyze`、`POST /api/advice/generate`、`POST /api/agent/run-now`）共享同一把**非阻塞锁**
 （`packages/server/src/services/pipeline-lock.ts`）。同一时刻只允许**一条**流水线运行：
 
 - 锁被占用时，手动入口**立即**返回 `error`（消息含「已有 AI 流水线正在运行，请稍后再试」）
@@ -369,7 +383,92 @@ audit_log / pending_writes / kv`，返回逐表删除行数（`ClearDataResult`�
 **不返回任何 API Key**：LLM 与数据源 Key 只报「是否已配置」。每条链路独立降级，
 一次探测失败不会把整份报告变成 500。
 
-## 12. 前端路由
+## 12. 新股打新（/api/ipo）
+
+新股信息、AI 申购建议与「中签自动入账」的完整闭环（界面：`/ipo`）。数据来源与字段口径见
+`docs/SOURCES.md §8`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/ipo?market=&status=&q=&limit=` | `IpoListResponse`：`{ items, total, counts, lastRefreshAt, warnings }` |
+| POST | `/api/ipo/refresh` | 抓取 A股/港股/美股新股 → `IpoRefreshResult`；入参 `{ markets?: ('CN'\|'HK'\|'US')[], limitPerMarket? }` |
+| POST | `/api/ipo` | 手工录入/修正一只新股 → `IpoOffer`（上游缺数据时的兜底） |
+| GET | `/api/ipo/:id` | 详情 → `IpoOffer`（`:id` 可用内部 id 或 uid，如 `HK:06157`） |
+| DELETE | `/api/ipo/:id` | 删除标的（连带删除申购登记，**不动**账本） |
+| POST | `/api/ipo/:id/subscribe` | 登记「我申购了 N 股」→ `IpoOffer`；入参 `{ shares, price?, note?, appliedAt? }` |
+| DELETE | `/api/ipo/:id/subscription` | 撤销登记 → `IpoOffer`（已中签入账的返回 **409**） |
+| POST | `/api/ipo/:id/allot` | 登记中签结果 → `IpoAllotResult`；入参 `{ shares, price?, fee?, tradeDate?, note? }` |
+| POST | `/api/ipo/analyze` | SSE：跑 `ipo-analysis` 流水线（AI 打新分析），事件与 `/api/assets/analyze` 同构 |
+| GET | `/api/ipo/analyze/last` | 最近一次打新分析摘要（没有则 `null`） |
+
+### 12.1 状态与结论口径
+
+`IpoMarketStatus`（**由日期推导，不存「手选状态」**）：
+
+| 值 | 含义 | 推导规则（`deriveIpoStatus`） |
+| --- | --- | --- |
+| `upcoming` | 待申购 | 有申购开始日且尚未到 |
+| `subscribing` | 申购中 | 今天 ≤ 申购截止日 |
+| `allotted` | 待上市 | 申购已截止但还没上市（有上市日/中签日即算） |
+| `listed` | 已上市 | 上市日 ≤ 今天 |
+| `unknown` | 状态未知 | 上游没给任何日期（不猜） |
+
+`IpoOffer.verdict` 由 AI 打新分析写入，取值 `subscribe` / `neutral` / `avoid`，并附
+`verdictReason`（一句话理由，8–80 字）、`suggestedShares`（必须是每手股数的整数倍）、`confidence`、
+`qualityScore`、`advice`（Markdown）。
+
+**`verdict` 是「本期该不该打」，不是「股票好不好」**（这是界面最容易误解的地方）：
+
+| verdict | 含义 | `suggestedShares` |
+| --- | --- | --- |
+| `subscribe` | 标的值得 **且** 本期可执行（预算够、至少买得起一手） | 必须 ≥ 1 手 |
+| `neutral` | 标的不算差、但本期不参与（**最常见：本月预算不足 / 一手入场费太贵**；也可能定价区间未收窄、等暗盘） | 恒为 0 |
+| `avoid` | 标的不值得（定价 / 基本面 / 破发风险） | 恒为 0 |
+
+因此「胜率 75% 却判 neutral」是合法组合 —— 但 `verdictReason` 必须写清绑定约束
+（例：`本月 A 股预算仅剩 734 元，一手 500 股 × 16.98 元 = 8,490 元打不起（标的本身不差）`），
+界面「推荐理由」列直接展示这句话，详情里有口径说明。`save_ipo_analysis` 会机械校验自洽性
+（`bad_request`，避免出现用户无法理解的结论）：
+
+1. `subscribe` 必须 `suggestedShares ≥ 1 手`，且 `winProbability ≥ 0.5`、`expectedReturn > 0`；
+2. `neutral` / `avoid` 的 `suggestedShares` 必须为 `0`；
+3. `avoid` 不允许出现在 `winProbability ≥ 0.6` 且 `expectedReturn > 0` 的标的上 —— 若因资金约束放弃，判 `neutral` 并写明缺口；若确实看空，把胜率/预期收益调到与结论同向；
+4. `verdictReason` 必填（8–80 字，超长也拒绝）。
+
+**建议必须给出胜率与预期收益**（`winProbability` / `expectedReturn`，两者都是 `save_ipo_analysis` 的必填参数，
+缺失或 `advice` 正文里读不到这两个数会被驳回 `bad_request`）：
+
+| 字段 | 单位 | 含义 | 与另一个指标的区别 |
+| --- | --- | --- | --- |
+| `winningRate` | % | 上游公告的**中签率** | 「能不能买到」——这是发行数据，随刷新更新 |
+| `winProbability` | 0–1 | AI 推算的**胜率**（上市后正收益 / 不破发概率） | 「买到之后赚不赚」——这是结论，只由分析写入 |
+| `expectedReturn` | % | AI 推算的**预期收益**（相对发行价的涨幅，可为负） | 破发预期写负数 |
+| 期望值 | % | 界面派生：`winProbability × expectedReturn` | 只按「打中一手」算，**不含中签率**（避免被误读成每次申购的收益） |
+
+三个结论字段（含 `verdictReason` / `suggestedShares`）都是**本地结论**：`POST /api/ipo/refresh` 只覆盖发行要素，
+永远不会清空它们；未分析的标的返回 `0` / `''`，界面显示「未评估 / 待分析 / —」，不拿 0 冒充结论。
+`save_ipo_analysis` 若收到 `winProbability = 65` 这类百分数写法，会折算为 `0.65` 并在返回里说明，
+不会静默丢弃结论。
+
+界面的打新颜色是**风险语义**（绿=值得下手、红=建议放弃），与行情「红涨绿跌」相反，
+见 `styles.css` 的 `.badge-ipo-subscribe` / `.badge-ipo-avoid`。
+
+「AI 投资建议」页（§5）的打新板块只列 `subscribing` / `upcoming` 且**未被建议放弃**的标的，
+并支持直接打开登记浮窗回报申购 / 中签（复用 `/api/ipo/:id/subscribe`、`/api/ipo/:id/allot`）。
+
+### 12.2 中签入账（`POST /api/ipo/:id/allot`）的关键约束
+
+1. `shares > 0`：自动建（或复用）资产 + 写一笔 `kind='buy'`、`source='ipo'` 的流水，价格取入参
+   `price`，缺省用发行价；`shares = 0` 记为 **未中签**，只改状态、**不写账本**。
+2. **重复登记 = 修正**：删除上一次由打新流程写入的流水后按新股数重写（不会累加成两笔持仓）；
+   若该资产期间已有卖出，返回 **409** 并提示先在「我的资产」里手工调整（避免账本出现无买入的卖出）。
+3. 已按中签入账后再报 `shares = 0` 返回 **409**（必须先撤销资产，否则账本会凭空少一笔持仓）。
+4. **不受预算闸门拦截**：中签缴款是已发生的真实现金支出，账必须记；只在超出该市场当月预算剩余时
+   在 `warnings` 里提示。
+5. 未定价（`issuePrice = 0` 且只有区间）时必须显式传 `price`，否则 **400** —— 绝不用 0 成本入账。
+6. `subscription.assetId` 指向账本资产；`subscribeIpo` 拒绝已上市标的与超过申购上限的股数（**409**）。
+
+## 13. 前端路由
 
 | 路径 | 页面 |
 | --- | --- |
@@ -378,6 +477,7 @@ audit_log / pending_writes / kv`，返回逐表删除行数（`ClearDataResult`�
 | `/watchlist` | 我的标的 |
 | `/compare` | 财报对比（2-4 个标的并排看关键财务指标 + 三表明细） |
 | `/advice` | AI 投资建议 |
+| `/ipo` | 新股打新（三地新股 · AI 申购建议 · 中签自动入账） |
 | `/chat` | AI Chat |
 | `/activity` | 活动与审计 |
 | `/settings` | 设置 |

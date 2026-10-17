@@ -75,6 +75,7 @@ export function planNextRuns(tasks: ScheduleTask[], from = Date.now()): Schedule
 export interface PipelineStepFlags {
   skipAsset: boolean;
   skipWatchlist: boolean;
+  skipIpo: boolean;
   skipAdvice: boolean;
 }
 
@@ -92,6 +93,7 @@ export function mergeTaskFlags(tasks: ScheduleTask[]): PipelineStepFlags {
   return {
     skipAsset: !step((task) => task.runAssetAnalysis),
     skipWatchlist: !step((task) => task.runWatchlistAnalysis),
+    skipIpo: !step((task) => task.runIpoAnalysis),
     skipAdvice: !step((task) => task.runAdvice),
   };
 }
@@ -108,6 +110,7 @@ export function taskStepLabels(task: ScheduleTask): string[] {
   const steps: string[] = [];
   if (task.runAssetAnalysis) steps.push('资产分析');
   if (task.runWatchlistAnalysis) steps.push('标的分析');
+  if (task.runIpoAnalysis) steps.push('打新分析');
   if (task.runAdvice) steps.push('投资建议');
   return steps;
 }

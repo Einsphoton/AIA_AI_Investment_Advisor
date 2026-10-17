@@ -187,3 +187,80 @@
 4. **缓存**：报价 TTL 60s、K 线/净值 TTL 5min、宏观 TTL 30min，进程内 Map + LRU 上限。
 5. **绝不静默给 0**：数据缺失时把原因写入 `warnings[]`，UI 与 Agent 都要能看到。
 6. **合规**：仅使用公开可访问的数据接口，请求频率保持低频（避免被限流），带正常 UA，不绕过登录/付费墙。
+
+## 8. 新股打新（A 股 / 港股 / 美股）
+
+实现：`packages/server/src/datasources/ipo.ts`（归一化草稿）→ `services/ipo.ts`（落库/刷新/入账）。
+全部**零 API Key**，2026-10-16 于本机实测（36 条新股、4 个源、无警告）。缓存 TTL 5 分钟/市场。
+
+| 市场 | 端点 | 实测 | 用途 |
+| --- | --- | --- | --- |
+| A 股 | `https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPTA_APP_IPOAPPLY&columns=ALL&sortColumns=APPLY_DATE&sortTypes=-1&pageSize=N&pageNumber=1&filter=(APPLY_DATE>='YYYY-MM-DD')&source=WEB&client=WEB` | ✅ 200（12 条） | 唯一的 A 股源，字段最全 |
+| 港股①（招股中） | `https://www.etnet.com.hk/www/tc/stocks/ipo-calendar.php` | ✅ 200 | 页面内嵌 `listing_ipo_array:[…]` JSON：招股价区间、招股起止日、**公布结果日**、每手、行业 |
+| 港股②（已上市） | `https://hk.eastmoney.com/ipolist.html` | ✅ 200（52 页，倒序） | HTML 表格：招股价、招股数（万股）、募资额（亿）、招股开始日、上市日 |
+| 港股③（补速率） | `https://www.aastocks.com/tc/stocks/market/ipo/upcomingipo.aspx` / `listedipo.aspx` | ✅ 200 | **按表头标签定位列**：中签率、超购倍数、每手（招股中页也能独立给价格区间） |
+| 美股 | `https://api.nasdaq.com/api/ipo/calendar?date=YYYY-MM` | ✅ 200（空月份返回 `code:1002` + `null` 段） | `data.priced.rows` + `data.upcoming.upcomingTable.rows` |
+
+### 8.1 字段映射（← 上游）
+
+| 归一化字段 | A 股（东财） | 港股（etnet / 东财 / 阿斯達克） | 美股（纳斯达克） |
+| --- | --- | --- | --- |
+| `code` / `subscribeCode` | `SECURITY_CODE` / `APPLY_CODE` | `stockcode` / 代码列 / 名称格里的 `.HK` | `proposedTickerSymbol` |
+| `name` | `SECURITY_NAME_ABBR` | `stocknametc` / 名称列（剥状态徽章） / 名称列 | `companyName` |
+| `issuePrice` | `ISSUE_PRICE` | 区间**收窄成一个价**才算发行价（etnet/东财/阿斯達克同规则） | `priced` 行的 `proposedSharePrice` 下限；`upcoming` 行为 0 |
+| `priceLow/High` | — | `offerpricefrom/to` 或招股价列 | `proposedSharePrice` 解析出的最小/最大值 |
+| `lotSize` | `EACHBALLOT_SHARES` | `boardlot` / — / 每手股數列 | 固定 1（美股最小 1 股） |
+| `maxShares` | `ONLINE_APPLY_UPPER` | — | — |
+| `subscribeStart/End` | `APPLY_DATE`（起=止） | `applicationstart/end`；东财只给开始日 → `subscribeEnd=null` | 无公开申购期：`subscribeEnd = expectedPriceDate ?? pricedDate` |
+| `allotmentDate` | `BALLOT_NUM_DATE` | etnet `resultdate` | `pricedDate ?? expectedPriceDate` |
+| `listingDate` | `LISTING_DATE` | `listdate` / 上市日期列 | 同上 |
+| `issueShares` | `ISSUE_NUM`（万股 → 股） | 招股数列（万股 → 股） | `sharesOffered`（去掉千分位） |
+| `raiseAmount` | `TOTAL_RAISE_FUNDS`（亿元 → 元） | 募集资金列（亿 → 元） | `dollarValueOfSharesOffered` |
+| `issuePe` / `industryPe` | `AFTER_ISSUE_PE` / `INDUSTRY_PE_NEW` | — | — |
+| `winningRate` | `ONLINE_ISSUE_LWR` | 阿斯達克 中籤率（按上游百分比原值，如 `100` 表示 100%） | — |
+| `oversubscribe` | — | 阿斯達克 超額倍數 | — |
+| `sponsor` / `industry` | `RECOMMEND_ORG` / `INDUSTRY_NAME` | etnet `naturetc` / 行業列 | — |
+| `prospectusUrl` | `https://data.eastmoney.com/notices/detail/{code}/{INFO_CODE}.html` | — | EDGAR 公司检索页（`type=424B4`） |
+
+### 8.1.1 AI 结论字段（不来自上游）
+
+`verdict` / `verdictReason` / `suggestedShares` / `winProbability` / `expectedReturn` / `confidence` / `qualityScore` / `advice`
+**只由 `save_ipo_analysis` 写入**，刷新（`POST /api/ipo/refresh`）与手工录入都不碰它们（详见 `docs/API.md §12.1`）：
+
+| 字段 | 单位 | 含义 | 谁写 |
+| --- | --- | --- | --- |
+| `winningRate` | % | 网上中签率（上游公告，回答「能不能买到」） | 数据源（阿斯達克 / 东财） |
+| `winProbability` | 0–1 | 胜率：上市后正收益（不破发）的概率（回答「买到之后赚不赚」） | AI（必填，缺失即驳回） |
+| `expectedReturn` | % | 预期收益：上市后相对发行价的涨幅，破发写负数 | AI（必填） |
+| `verdictReason` | 文本 | 一句话理由：为什么是 subscribe / neutral / avoid（写清预算缺口或标的风险） | AI（必填，8–80 字） |
+
+`save_ipo_analysis` 同时要求 `advice` 正文里能读到这两个数（否则 `bad_request` 并提示补齐），
+因为用户要的是「建议里能看到胜率与预期收益」，只写字段不算完整；它还会校验 `verdict` 与
+`winProbability` / `expectedReturn` / `suggestedShares` 的**自洽性**（例如「胜率 75% + 预期 +25%」不得判
+`avoid`，要判 `neutral` 并在理由里写资金缺口），详见 `docs/API.md §12.1`。
+
+### 8.2 合并与优先级
+
+- 每个市场独立 `try/catch`：**单市场失败只变成 `warnings`（如「港股打新数据源不可用：…」），成功市场照常返回**。
+- 港股三源合并顺序 `etnet → 东财 → 阿斯達克`（`IPO_SOURCES_BY_MARKET`），同代码**去重后按非空字段补齐**：
+  `0`/空串视为「本次上游没给」，不覆盖已有值；`source` 保留**先到（优先级更高）**的源，避免价格来自东财、署名却是阿斯達克。
+- 美股按 `limit` 截断前**先按上市日倒序**，否则往回的旧月份会把当期标的挤掉（2026-10 实测踩过：limit=12 时返回 4 月的 SPAC）。
+
+### 8.3 已知覆盖缺口（**不是故障，界面按「上游未提供」展示**）
+
+| 缺口 | 说明 |
+| --- | --- |
+| 北交所（`920xxx`）每手/募资额 | 上游报表对北交所不返回 `EACHBALLOT_SHARES` / `TOTAL_RAISE_FUNDS` → `lotSize=0`、`raiseAmount=0`，界面显示「未提供」，不猜 |
+| 港股已上市行的申购期 | 东财列表只给「招股日期」（开始日）→ `subscribeEnd=null`；**不拿上市日冒充截止日** |
+| 港股已上市行的发行价 | 阿斯達克的「招股價」列对 A+H 标的口径无法核实（可能显示 A 股价格）→ 该列**有意不采集**，`issuePrice` 留 0 |
+| 港股的 `oversubscribe` 出处 | 数值来自阿斯達克，但行的 `source` 仍是主源（etnet/东财）—— 来源标注存在已知不精确，文档如实记录 |
+| 美股申购期 | 官方日历没有公开申购窗口，用定价日代替截止日（界面据此排序/判阶段） |
+| 美股超额认购 | 上游不提供，**不拿募资额反推算** |
+| 中签结果自动获取 | **有意不做**：中签结果只从用户回填（「我抽中了 N 股」）驱动，避免把券商口径的猜测写进账本 |
+| 胜率与预期收益 | **不是上游数据**，没有可核实的公开来源：由 AI 依据中签率/超购倍数、可比估值折价、市场情绪与破发案例**推算**。界面一律标注「AI 推算」并写明口径差异，不当成事实；2026-10 之前写入的老结论没有这两个字段，界面显示「未评估」并提示重跑分析 |
+
+### 8.4 入账纪律
+
+`POST /api/ipo/:id/allot` 把中签股数写进 `assets` + `transactions`（`source='ipo'`，可在「我的资产」里区分打新建仓）：
+重复回报是**修正**（删旧流水再写新，不累加）；`shares=0` 只记状态；未定价且未传缴款价 → 400 而不用 0 成本入账；
+中签缴款**不受预算闸门拦截**（钱已经花了），只在超出当月预算时写 `warnings`。契约见 `docs/API.md §12`。

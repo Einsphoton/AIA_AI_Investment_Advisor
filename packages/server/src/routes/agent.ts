@@ -16,7 +16,7 @@ import { getAgent, getRepo } from '../registry.js';
 import { openSse } from './sse.js';
 import { NOT_CONFIGURED_MESSAGE } from '../agent/llm.js';
 import type { AgentRunRequest, AgentRuntime, LoggerLike } from '../types/agent.js';
-import { runAssetAnalysis, runWatchlistAnalysis, type PipelineContext } from '../services/analytics.js';
+import { runAssetAnalysis, runIpoAnalysis, runWatchlistAnalysis, type PipelineContext } from '../services/analytics.js';
 import { latestRunSummary, runFullPipeline } from '../services/advice.js';
 import { runExclusive } from '../services/pipeline-lock.js';
 
@@ -121,7 +121,15 @@ async function streamPipeline(
 
 function parseKind(raw: unknown): AgentRunKind | undefined {
   const value = typeof raw === 'string' ? raw.trim() : '';
-  const allowed: AgentRunKind[] = ['asset-analysis', 'watchlist-analysis', 'advice', 'chat', 'scheduled', 'custom'];
+  const allowed: AgentRunKind[] = [
+    'asset-analysis',
+    'watchlist-analysis',
+    'ipo-analysis',
+    'advice',
+    'chat',
+    'scheduled',
+    'custom',
+  ];
   return allowed.includes(value as AgentRunKind) ? (value as AgentRunKind) : undefined;
 }
 
@@ -134,6 +142,10 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/api/watchlist/analyze', async (request, reply) => {
     await streamPipeline(request, app, reply, 'manual:watchlist-analysis', (context) => runWatchlistAnalysis(context));
+  });
+
+  app.post('/api/ipo/analyze', async (request, reply) => {
+    await streamPipeline(request, app, reply, 'manual:ipo-analysis', (context) => runIpoAnalysis(context));
   });
 
   app.post('/api/advice/generate', async (request, reply) => {
@@ -191,5 +203,6 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
 
   app.get('/api/assets/analyze/last', async () => latestRunSummary(getRepo(), 'asset-analysis'));
   app.get('/api/watchlist/analyze/last', async () => latestRunSummary(getRepo(), 'watchlist-analysis'));
+  app.get('/api/ipo/analyze/last', async () => latestRunSummary(getRepo(), 'ipo-analysis'));
   app.get('/api/advice/last', async () => latestRunSummary(getRepo(), 'advice'));
 }

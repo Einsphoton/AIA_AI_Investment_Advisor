@@ -16,7 +16,7 @@
  */
 import { Link } from 'react-router-dom';
 import type { DashboardPayload, PortfolioPerformance, Quote } from '@aia/shared';
-import { MARKET_LABELS, REPORT_STYLE_MAP, PERSONA_MAP } from '@aia/shared';
+import { MARKET_LABELS, MIN_ANNUALIZE_DAYS, REPORT_STYLE_MAP, PERSONA_MAP } from '@aia/shared';
 import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { useAsync } from '../api/hooks';
@@ -38,9 +38,15 @@ function returnTone(value: number | null | undefined): 'default' | 'pos' | 'neg'
 function performanceHint(perf: PortfolioPerformance, kind: 'portfolio' | 'realized', currency: string): string {
   const lines: string[] = [];
   if (kind === 'portfolio') {
-    lines.push(`区间：${perf.periodStart} → ${perf.periodEnd}（${perf.days} 天）。`);
+    lines.push(`区间：${perf.periodStart} → ${perf.periodEnd}（自然年 ${perf.days} 天，其中实际有资金 ${perf.cashFlowDays} 天）。`);
     lines.push(`期初持仓市值：${perf.openingValue === null ? '不可得' : fmtMoney(perf.openingValue, currency)}（按 ${perf.periodStart} 收盘价折算）。`);
     lines.push(`期末持仓市值：${fmtMoney(perf.endingValue, currency)}；当年净投入：${fmtSignedMoney(perf.netInvested, currency)}。`);
+    if (perf.cumulativePct !== null) {
+      lines.push(`区间累计收益率（不考虑资金进出时点）：${fmtPct(perf.cumulativePct)}。`);
+    }
+    if (!perf.annualizedReliable) {
+      lines.push(`区间不足 ${MIN_ANNUALIZE_DAYS} 天，不做年化（几何年化会把一天的波动放大成全年）。`);
+    }
     lines.push(
       `全周期年化（${perf.sinceInceptionFrom ?? '尚无买入'} 起）：${
         perf.sinceInceptionPct === null ? '不可度量' : fmtPct(perf.sinceInceptionPct)
@@ -49,12 +55,46 @@ function performanceHint(perf: PortfolioPerformance, kind: 'portfolio' | 'realiz
   } else {
     lines.push(`口径：只统计 ${perf.year} 年卖出掉的那部分份额。`);
     lines.push('账面法（移动加权平均）没有批次，成本因此锚定在这些份额的加权平均买入日。');
+    if (perf.realizedCumulativePct !== null) {
+      lines.push(`已实现累计收益率（含费用）：${fmtPct(perf.realizedCumulativePct)}。`);
+    }
+    if (!perf.realizedAnnualizedReliable && perf.realizedCumulativePct !== null) {
+      lines.push(`卖出份额的持有区间不足 ${MIN_ANNUALIZE_DAYS} 天，不做年化。`);
+    }
     lines.push(
-      `当年已实现盈亏（账本口径，不含费用）：${fmtSignedMoney(perf.realizedPnl, currency)}；年化结果含交易费用。`,
+      `当年已实现盈亏（账本口径，不含费用）：${fmtSignedMoney(perf.realizedPnl, currency)}；收益率含交易费用。`,
     );
   }
   lines.push(...perf.notes);
   return lines.join('\n');
+}
+
+/**
+ * 展示口径：**年化只在区间够长时给**。
+ *
+ * 不足 `MIN_ANNUALIZE_DAYS` 天时后端的 `annualizedPct` 就是 null（见 services/performance.ts），
+ * 这里退回「区间累计收益率」，并连标签一起换掉 —— 不能让一个 −80% 的年化数字挂在
+ * 「年化收益率」下面而没有任何解释（真实反馈：一天亏 0.45% 显示成年化 −80.39%）。
+ */
+function returnCardView(perf: PortfolioPerformance): {
+  annualizedLabel: string;
+  annualizedValue: number | null;
+  realizedLabel: string;
+  realizedValue: number | null;
+} {
+  const annualized = perf.annualizedPct;
+  const realizedAnnualized = perf.realizedAnnualizedPct;
+  return {
+    annualizedLabel: annualized !== null ? '年化收益率' : perf.cumulativePct !== null ? '累计收益率' : '年化收益率',
+    annualizedValue: annualized ?? perf.cumulativePct,
+    realizedLabel:
+      realizedAnnualized !== null
+        ? '已实现年化收益率'
+        : perf.realizedCumulativePct !== null
+          ? '已实现收益率'
+          : '已实现年化收益率',
+    realizedValue: realizedAnnualized ?? perf.realizedCumulativePct,
+  };
 }
 
 export function DashboardPage() {
@@ -74,6 +114,7 @@ export function DashboardPage() {
   // 旧服务端可能没有 performance 字段（滚动升级 / 缓存旧包）：缺了就不渲染这两个计数，
   // 而不是让整页崩掉。左上角版本徽标会把「前后端版本不一致」直接标出来。
   const perf = portfolio?.performance;
+  const view = perf ? returnCardView(perf) : null;
   const indices = liveIndices.data && liveIndices.data.length > 0 ? liveIndices.data : payload?.indices ?? [];
   const fxLines = portfolio
     ? Object.entries(portfolio.fxRates ?? {})
@@ -166,25 +207,32 @@ export function DashboardPage() {
                 tone={portfolio.realizedPnl > 0 ? 'pos' : portfolio.realizedPnl < 0 ? 'neg' : 'default'}
                 sub="卖出部分累计落袋"
               />
-              {/* 年化收益率 / 已实现年化收益率：XIRR（资金加权，含费用），
-                  口径与降级原因在悬浮说明里逐条写明 —— 不可度量时显示 — 而不是 0。 */}
-              {perf && (
+              {/* 年化收益率 / 已实现年化收益率：XIRR（资金加权，含费用）。
+                  区间不足 30 天时不做年化，卡片自动换成「累计收益率」并注明原因 ——
+                  「一天亏 0.45%」显示成年化 −80% 会误导人（真实反馈）。 */}
+              {perf && view && (
                 <>
                   <StatCard
-                    label="年化收益率"
-                    value={fmtPct(perf.annualizedPct)}
-                    tone={returnTone(perf.annualizedPct)}
-                    sub={`${perf.year} 年至今 · ${perf.days} 天 · XIRR`}
+                    label={view.annualizedLabel}
+                    value={fmtPct(view.annualizedValue)}
+                    tone={returnTone(view.annualizedValue)}
+                    sub={
+                      perf.annualizedReliable
+                        ? `${perf.year} 年至今 · ${perf.cashFlowDays} 天 · XIRR`
+                        : `仅 ${perf.cashFlowDays} 天 · 不做年化`
+                    }
                     hint={performanceHint(perf, 'portfolio', portfolio.currency)}
                   />
                   <StatCard
-                    label="已实现年化收益率"
-                    value={fmtPct(perf.realizedAnnualizedPct)}
-                    tone={returnTone(perf.realizedAnnualizedPct)}
+                    label={view.realizedLabel}
+                    value={fmtPct(view.realizedValue)}
+                    tone={returnTone(view.realizedValue)}
                     sub={
-                      perf.realizedAnnualizedPct === null
+                      perf.realizedCumulativePct === null
                         ? '当年没有卖出记录'
-                        : `当年卖出落袋 ${fmtSignedMoney(perf.realizedPnl, portfolio.currency)}`
+                        : perf.realizedAnnualizedReliable
+                          ? `当年卖出落袋 ${fmtSignedMoney(perf.realizedPnl, portfolio.currency)}`
+                          : '持有不足 30 天 · 不做年化'
                     }
                     hint={performanceHint(perf, 'realized', portfolio.currency)}
                   />

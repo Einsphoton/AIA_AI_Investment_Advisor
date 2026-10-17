@@ -8,6 +8,7 @@
  * contains `llm.apiKey` — only `hasApiKey` / `apiKeyMasked` metadata. Importing
  * restores the non-secret settings and never touches the stored API key.
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -18,6 +19,8 @@ import {
   type BackupPayload,
   type ImportMode,
   type ImportResult,
+  type IpoOffer,
+  type IpoSubscription,
   type LlmConfig,
   type Settings,
   type Transaction,
@@ -25,9 +28,15 @@ import {
 
 import { badRequest, notFound } from '../errors.js';
 import type { ExportBundle, Repo, SettingsPatch } from '../types/repo.js';
-import type { AdviceRow, AssetRow, RunRow, StoredSettings, TxRow, WatchRow } from '../types/models.js';
+import type { AdviceRow, AssetRow, IpoOfferRow, IpoSubscriptionRow, RunRow, StoredSettings, TxRow, WatchRow } from '../types/models.js';
 import { maskApiKey, maskDataSourceConfig, nowIso, round4, safeMessage, settingsPatch, toNumber } from '../db/util.js';
 import { toAdviceItem, toAssetSummary, toRunSummary, toTransaction, toWatchItem } from './portfolio.js';
+import {
+  toIpoOffer,
+  toIpoOfferRow,
+  toIpoSubscription,
+  toIpoSubscriptionRow,
+} from './ipo.js';
 
 export const BACKUP_SCHEMA = 'ai-investment-advisor/backup' as const;
 export const BACKUP_VERSION = 1;
@@ -61,6 +70,8 @@ export function buildBackupPayload(
     transactions: bundle.transactions.map(toTransaction),
     watchlist: bundle.watchlist.map(toWatchItem),
     advice: bundle.advice.map(toAdviceItem),
+    ipoOffers: bundle.ipoOffers.map((row) => toIpoOffer(row, bundle.ipoSubscriptions.find((sub) => sub.offerUid === row.uid) ?? null)),
+    ipoSubscriptions: bundle.ipoSubscriptions.map(toIpoSubscription),
   };
 
   try {
@@ -112,7 +123,7 @@ const MARKETS = new Set(['CN', 'HK', 'US']);
 const TYPES = new Set(['stock', 'etf', 'fund']);
 const CREATORS = new Set(['manual', 'ai']);
 const TX_KINDS = new Set(['buy', 'sell']);
-const TX_SOURCES = new Set(['manual', 'ai', 'advice']);
+const TX_SOURCES = new Set(['manual', 'ai', 'advice', 'ipo']);
 const ACTIONS = new Set(['buy', 'sell']);
 const STATUSES = new Set(['pending', 'confirmed', 'rejected', 'expired']);
 
@@ -128,7 +139,7 @@ export function validateBackupPayload(input: unknown): BackupPayload {
   if (raw.schema !== undefined && raw.schema !== BACKUP_SCHEMA) {
     throw badRequest(`备份数据无效：schema 应为 ${BACKUP_SCHEMA}`, { schema: raw.schema });
   }
-  for (const key of ['assets', 'transactions', 'watchlist', 'advice'] as const) {
+  for (const key of ['assets', 'transactions', 'watchlist', 'advice', 'ipoOffers', 'ipoSubscriptions'] as const) {
     if (raw[key] !== undefined && !Array.isArray(raw[key])) {
       throw badRequest(`备份数据无效：${key} 应为数组`);
     }
@@ -144,6 +155,10 @@ export function validateBackupPayload(input: unknown): BackupPayload {
     transactions: (raw.transactions ?? []) as Transaction[],
     watchlist: (raw.watchlist ?? []) as BackupPayload['watchlist'],
     advice: (raw.advice ?? []) as BackupPayload['advice'],
+    ipoOffers: Array.isArray(raw.ipoOffers) ? (raw.ipoOffers as BackupPayload['ipoOffers']) : undefined,
+    ipoSubscriptions: Array.isArray(raw.ipoSubscriptions)
+      ? (raw.ipoSubscriptions as BackupPayload['ipoSubscriptions'])
+      : undefined,
     runs: Array.isArray(raw.runs) ? (raw.runs as BackupPayload['runs']) : undefined,
     settings: isRecord(raw.settings) ? (raw.settings as BackupPayload['settings']) : undefined,
   };
@@ -288,7 +303,28 @@ export function toExportBundle(payload: BackupPayload, fallbackUpdatedAt = nowIs
     });
   }
 
-  return { assets, transactions, watchlist, advice };
+  // 打新：标的与申购记录分开校验，申购记录必须能对应到一只已导入的标的（由 repo 兜底丢弃孤儿）。
+  const ipoOffers: IpoOfferRow[] = [];
+  for (const item of payload.ipoOffers ?? []) {
+    if (!isRecord(item)) continue;
+    if (!MARKETS.has(String(item.market ?? ''))) continue;
+    const row = toIpoOfferRow(item as unknown as IpoOffer, fallbackUpdatedAt);
+    if (!row.uid || !row.name) continue;
+    if (!row.id) row.id = crypto.randomUUID();
+    ipoOffers.push(row);
+  }
+
+  const ipoSubscriptions: IpoSubscriptionRow[] = [];
+  for (const item of payload.ipoSubscriptions ?? []) {
+    if (!isRecord(item)) continue;
+    if (!MARKETS.has(String(item.market ?? ''))) continue;
+    const row = toIpoSubscriptionRow(item as unknown as IpoSubscription);
+    if (!row.offerUid) continue;
+    if (!row.id) row.id = crypto.randomUUID();
+    ipoSubscriptions.push(row as IpoSubscriptionRow);
+  }
+
+  return { assets, transactions, watchlist, advice, ipoOffers, ipoSubscriptions };
 }
 
 export function importBackupPayload(repo: Repo, input: unknown, mode: ImportMode = 'merge'): ImportResult {
@@ -387,6 +423,7 @@ function legacyScheduleToTasks(raw: Record<string, unknown>): StoredSettings['sc
       dailyTime,
       runAssetAnalysis: raw.runAssetAnalysis !== false,
       runWatchlistAnalysis: raw.runWatchlistAnalysis !== false,
+      runIpoAnalysis: raw.runIpoAnalysis !== false,
       runAdvice: raw.runAdvice !== false,
     },
   ];

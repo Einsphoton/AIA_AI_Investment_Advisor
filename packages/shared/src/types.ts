@@ -39,13 +39,19 @@ export type AdviceStatus = 'pending' | 'confirmed' | 'rejected' | 'expired';
 /** Transaction direction. */
 export type TxKind = 'buy' | 'sell';
 
-/** Origin of a transaction record. */
-export type TxSource = 'manual' | 'ai' | 'advice';
+/**
+ * Origin of a transaction record.
+ *
+ * `ipo` = 打新中签缴款自动入账（`POST /api/ipo/:id/allot`）：金额与份额由中签结果决定，
+ * 与人工录入、AI 建议、建议确认区分开，便于在交易记录里追溯来源。
+ */
+export type TxSource = 'manual' | 'ai' | 'advice' | 'ipo';
 
 /** Kind of autonomous agent run. */
 export type AgentRunKind =
   | 'asset-analysis'
   | 'watchlist-analysis'
+  | 'ipo-analysis'
   | 'advice'
   | 'chat'
   | 'scheduled'
@@ -67,6 +73,14 @@ export type SourceId =
   | 'eastmoney-fund'
   | 'eastmoney-macro'
   | 'eastmoney-news'
+  /** 东方财富新股数据：A股数据中心报表 + 港股新股列表页（零 Key）。 */
+  | 'eastmoney-ipo'
+  /** 經濟通 etnet 港股新股日历（零 Key，页面内嵌 JSON）。 */
+  | 'etnet'
+  /** 阿斯達克 AAStocks 港股新股列表（零 Key，HTML 表格）。 */
+  | 'aastocks'
+  /** 纳斯达克官方 IPO 日历（零 Key）。 */
+  | 'nasdaq'
   | 'bing'
   | 'duckduckgo'
   | 'tavily'
@@ -146,6 +160,8 @@ export interface ScheduleTask {
   /** 该任务连带执行的流水线步骤；三项全关的任务会被服务端拒绝。 */
   runAssetAnalysis: boolean;
   runWatchlistAnalysis: boolean;
+  /** 打新分析：对新股/次新股标的做财报 / 招股书 / 基本面与申购建议。 */
+  runIpoAnalysis: boolean;
   runAdvice: boolean;
 }
 
@@ -657,6 +673,267 @@ export interface BudgetStatus {
   markets: MarketBudgetStatus[];
 }
 
+/* ─────────────────────────────── 新股打新 (IPO) ───────────────────────────── */
+
+/**
+ * 新股当前所处的市场阶段，由服务端按上游状态与日期确定性推导
+ * （见 `services/ipo.ts` 的 `deriveIpoStatus`），**不是**上游直接给的字段。
+ *
+ * - `upcoming`    尚未开始招股/申购（或上游只给了「待发行」）
+ * - `subscribing` 招股中 / 可申购（申购期未结束）
+ * - `allotted`    已定价或已公布中签，等待上市
+ * - `listed`      已上市
+ * - `unknown`     上游没给足够日期，无法判断（不猜）
+ */
+export type IpoMarketStatus = 'upcoming' | 'subscribing' | 'allotted' | 'listed' | 'unknown';
+
+/**
+ * AI 对一只新股的申购倾向 —— 注意这是**本期是否执行**的综合判断，不是单纯的「股票好坏」：
+ *
+ * - `subscribe`：标的值得 + 本期可执行（预算够、能买至少一手）→ 必须给 suggestedShares > 0；
+ * - `neutral`：标的不算差、但本期不执行，必须在 `verdictReason` 写清绑定的约束
+ *   （最常见：本月该市场预算不足 / 一手入场费太贵 / 定价区间未收窄 / 等暗盘）→ suggestedShares 恒为 0；
+ * - `avoid`：标的不值得（定价、基本面、破发风险）→ suggestedShares 恒为 0。
+ *
+ * 因此「胜率高但判 neutral」是完全合法的组合，但**必须**用理由说明是资金约束而不是看空；
+ * 反过来 `avoid` 不允许出现在胜率≥60% 且预期收益为正的标的上（见 `save_ipo_analysis` 的一致性校验）。
+ */
+export type IpoAdviceVerdict = 'subscribe' | 'neutral' | 'avoid';
+
+/** 我的申购记录状态：已登记申购 / 已中签（含入账）/ 未中签。 */
+export type IpoSubscriptionStatus = 'applied' | 'allotted' | 'missed';
+
+/**
+ * 一只新股（打新标的）。
+ *
+ * 与 `watchlist` / `assets` 分开建表的原因：新股有「申购代码、招股区间、中签率、上市日」
+ * 这些**只在发行期存在**的字段，且刷新时按 `uid` 整体覆盖，与用户自选池的生命周期不同。
+ * 上游没有的字段一律给 0 / null，界面与 AI 提示词都按「未提供」处理，绝不用 0 冒充。
+ */
+export interface IpoOffer {
+  id: string;
+  /** 稳定业务键 `market:上市代码（缺失时用申购代码）`，刷新与订阅关联都按它进行。 */
+  uid: string;
+  market: Market;
+  /** 上市交易代码；尚未确定时为空串。 */
+  code: string;
+  /** 申购代码（A 股 732/787 开头；港股/美股通常等于上市代码）。 */
+  subscribeCode: string;
+  name: string;
+  /** 实际拿到这条数据的数据源。 */
+  source: SourceId;
+  /** 交易所，例如 上交所 / 深交所 / 港交所 / 纳斯达克。 */
+  exchange: string;
+  /** 板块，例如 主板 / 创业板 / 科创板 / 北交所 / 主板-GEM。 */
+  board: string;
+  /** 发行价；未定价为 0。 */
+  issuePrice: number;
+  /** 招股价区间下限 / 上限（港股常用）；未提供为 0。 */
+  priceLow: number;
+  priceHigh: number;
+  currency: string;
+  /** 最小申购单位：A 股 500/1000 股，港股每手股数；0 = 上游未提供。 */
+  lotSize: number;
+  /** 单一账户申购上限（股）；0 = 未提供。 */
+  maxShares: number;
+  /** 申购 / 招股开始日（YYYY-MM-DD）。 */
+  subscribeStart: string | null;
+  /** 申购 / 招股截止日。 */
+  subscribeEnd: string | null;
+  /** 中签号公布日 / 定价日。 */
+  allotmentDate: string | null;
+  /** 上市日。 */
+  listingDate: string | null;
+  /** 发行总量（股）。 */
+  issueShares: number;
+  /** 募资额（按 `currency` 计）。 */
+  raiseAmount: number;
+  /** 发行市盈率。 */
+  issuePe: number;
+  /** 行业市盈率（A 股）。 */
+  industryPe: number;
+  /** 网上中签率（%）。 */
+  winningRate: number;
+  /** 超额认购倍数（港股公开发售 / 美股 oversubscription）。 */
+  oversubscribe: number;
+  /** 保荐机构 / 主承销商。 */
+  sponsor: string;
+  industry: string;
+  /** 招股说明书 / 上市公告链接（可为空，AI 用 fetch_url 深读）。 */
+  prospectusUrl: string;
+  status: IpoMarketStatus;
+  /** AI 打新分析（Markdown：基本面 / 财务 / 招股书要点 / 宏观与政商环境 / 风险 / 结论）。 */
+  advice: string;
+  /** AI 给出的申购倾向；尚未分析为 null。 */
+  verdict: IpoAdviceVerdict | null;
+  /**
+   * 一句话结论理由（≤ 80 字）：**为什么是这个 verdict**。
+   *
+   * 必须写清「绑定约束」：定价折价/基本面/破发风险，或「本月预算只剩 X 元、一手要 Y 元」这类资金约束。
+   * 界面的「推荐理由」列就显示这一条 —— 只有胜率/预期收益数字而没有理由，用户会觉得结论自相矛盾。
+   */
+  verdictReason: string;
+  /** AI 建议的申购股数（已按申购上限与中签概率折算）。 */
+  suggestedShares: number;
+  /**
+   * AI 推算的「上市后正收益」概率 0–1（即不破发的胜率）；0 = 还没评估。
+   *
+   * 与 `winningRate`（上游公告的中签率）是两件事：中签率回答「我能不能买到」，
+   * 胜率回答「买到之后赚不赚」，界面必须分开显示，不能互相冒充。
+   */
+  winProbability: number;
+  /** AI 推算的上市后相对发行价的预期收益（%），可为负；0 = 还没评估。 */
+  expectedReturn: number;
+  /** AI 置信度 0–1。 */
+  confidence: number;
+  /** 0–100 打新评分（越高越值得申购）。 */
+  qualityScore: number;
+  adviceAt: string | null;
+  /** 产出该结论的 run id（可在「活动与审计」里回放）。 */
+  adviceRunId: string | null;
+  /** 人工备注。 */
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+  /** 我的申购 / 中签记录；null = 还没登记。 */
+  subscription: IpoSubscription | null;
+}
+
+/** 我的一笔打新登记（一只新股最多一条）。 */
+export interface IpoSubscription {
+  id: string;
+  /** 关联 `IpoOffer.uid`（新股刷新后 offer id 可能重建，uid 不变）。 */
+  offerUid: string;
+  market: Market;
+  code: string;
+  name: string;
+  status: IpoSubscriptionStatus;
+  /** 登记的申购股数。 */
+  appliedShares: number;
+  /** 中签股数；0 = 未中签。 */
+  allottedShares: number;
+  /** 缴款单价（默认取发行价）。 */
+  price: number;
+  fee: number;
+  currency: string;
+  /** 申购登记日（YYYY-MM-DD）。 */
+  appliedAt: string;
+  /** 中签 / 入账日（YYYY-MM-DD）；未中签为 null。 */
+  allottedAt: string | null;
+  /** 中签入账后的资产 id；null = 尚未入账。 */
+  assetId: string | null;
+  /** 入账产生的交易 id。 */
+  transactionId: string | null;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `GET /api/ipo` — 列表 + 计数 + 上次刷新时间。 */
+export interface IpoListResponse extends ListResponse<IpoOffer> {
+  counts: {
+    total: number;
+    CN: number;
+    HK: number;
+    US: number;
+    /** 当前可申购（招股中）。 */
+    subscribing: number;
+    /** 我已登记申购（含已中签/未中签）。 */
+    applied: number;
+    /** 我已中签且已入账。 */
+    allotted: number;
+  };
+  /** 最近一次成功刷新时间（ISO）；从未刷新为 null。 */
+  lastRefreshAt: string | null;
+  /** 刷新过程中的非致命问题（数据源不可用等），必须原样展示。 */
+  warnings: string[];
+}
+
+/** `POST /api/ipo/refresh` 的回执。 */
+export interface IpoRefreshResult {
+  /** 上游返回的新股条数（去重后）。 */
+  fetched: number;
+  inserted: number;
+  updated: number;
+  byMarket: { market: Market; count: number }[];
+  sources: SourceId[];
+  /** 每个市场各自的问题（例如「港股数据源不可用」）。 */
+  warnings: string[];
+  refreshedAt: string;
+}
+
+/** `POST /api/ipo/:id/subscribe` — 登记「我申购了 N 股」。 */
+export interface IpoSubscribeInput {
+  shares: number;
+  /** 申购价；省略时取发行价。 */
+  price?: number;
+  note?: string;
+  /** 申购日；省略时取服务端当天。 */
+  appliedAt?: string;
+}
+
+/**
+ * `POST /api/ipo/:id/allot` — 登记中签结果。
+ *
+ * `shares > 0` 时会**自动在账本里建资产 + 买入流水**（`source='ipo'`，成本 = 中签价 + 费用），
+ * 因此这是「打新闭环」的落点；`shares = 0` 表示未中签，只更新状态、不写账本。
+ */
+export interface IpoAllotInput {
+  /** 中签股数；0 = 未中签。 */
+  shares: number;
+  /** 缴款单价；省略时取发行价。 */
+  price?: number;
+  fee?: number;
+  /** 入账交易日（YYYY-MM-DD）；省略时取服务端当天。 */
+  tradeDate?: string;
+  note?: string;
+}
+
+/** `POST /api/ipo/:id/allot` 的响应：新股 + 入账后的资产（未中签时 asset 为 null）。 */
+export interface IpoAllotResult {
+  offer: IpoOffer;
+  asset: AssetDetail | null;
+  /** true = 本次新建了资产；false = 复用已有资产（同一只票二次入账）。 */
+  assetCreated: boolean;
+  /**
+   * 非阻断提示（例如「本次缴款已超出当月预算」）。预算只约束 AI 买入建议，
+   * **不会**阻止真实中签入账——钱已经缴了，账必须记上，提示只是提醒。
+   */
+  warnings: string[];
+}
+
+/**
+ * `POST /api/ipo` — 手动录入一只新股。
+ *
+ * 上游（尤其是美股/港股小盘新股）偶尔缺数据，或用户从券商 App 看到更准的招股信息时，
+ * 允许人工录入；`source` 固定为 `manual`，刷新时**不会**被上游覆盖名称与申购日期以外的
+ * 人工备注，但会被上游更新的发行价/上市日修正。
+ */
+export interface IpoUpsertInput {
+  market: Market;
+  code: string;
+  name: string;
+  subscribeCode?: string;
+  exchange?: string;
+  board?: string;
+  issuePrice?: number;
+  priceLow?: number;
+  priceHigh?: number;
+  lotSize?: number;
+  maxShares?: number;
+  subscribeStart?: string;
+  subscribeEnd?: string;
+  allotmentDate?: string;
+  listingDate?: string;
+  issuePe?: number;
+  industryPe?: number;
+  winningRate?: number;
+  sponsor?: string;
+  industry?: string;
+  prospectusUrl?: string;
+  note?: string;
+}
+
 /* ─────────────────────────────── dashboard ────────────────────────────────── */
 
 /**
@@ -683,10 +960,32 @@ export interface PortfolioPerformance {
   netInvested: number;
   /** 当年已实现盈亏（与账本口径一致：不含交易费用）。 */
   realizedPnl: number;
-  /** 当年组合年化收益率（XIRR，含费用），百分数；null = 不可度量。 */
+  /**
+   * 当年组合年化收益率（XIRR，含费用），百分数；`null` = 不可度量**或区间过短不年化**。
+   *
+   * 注意 XIRR 是几何年化：只持有 1 天时，−0.45% 的区间收益会年化成 −80% —— 数学上没错，
+   * 但把一天的波动外推成全年没有统计意义。因此**不足 30 天一律不年化**（`annualizedReliable
+   * = false`），界面改为展示 {@link cumulativePct}（区间累计收益率），原因写在 `notes` 里。
+   */
   annualizedPct: number | null;
-  /** 当年已实现年化收益率（仅当年卖出部分，含费用），百分数；null = 当年无卖出或不可度量。 */
+  /** 当年已实现年化收益率（仅当年卖出部分，含费用），百分数；null = 当年无卖出 / 持有期过短 / 不可度量。 */
   realizedAnnualizedPct: number | null;
+  /**
+   * 区间累计（简单）收益率 %：
+   * `(期末市值 + 卖出净额 − 买入含费 − 期初市值) / (期初市值 + 买入含费)`。
+   *
+   * 不考虑资金进出的**时点**（那是 XIRR 的职责），但它是「这段时间到底赚了/亏了百分之几」的直接答案，
+   * 用于年化不可信时替代展示；`null` = 期初市值未知。
+   */
+  cumulativePct: number | null;
+  /** 当年已实现的累计收益率 %：已实现净盈亏（含费）/ 卖出份额的含费成本；null = 当年无卖出。 */
+  realizedCumulativePct: number | null;
+  /** 当年**实际有资金在场**的自然日数（首笔 → 末笔现金流），不是自然年长度。 */
+  cashFlowDays: number;
+  /** 区间是否够长到可以年化（`cashFlowDays >= 30`）；false 时 `annualizedPct` 必为 null。 */
+  annualizedReliable: boolean;
+  /** 当年已实现部分是否够长到可以年化（卖出份额的加权买入日 → 卖出日）。 */
+  realizedAnnualizedReliable: boolean;
   /** 全周期年化收益率（首次买入至今，XIRR，含费用）；null = 不可度量。 */
   sinceInceptionPct: number | null;
   /** 全周期起点（首次交易日）；null = 还没有任何买入。 */
@@ -1121,7 +1420,7 @@ export type AgentEvent =
       type: 'entity';
       runId: string;
       action: 'created' | 'updated' | 'deleted';
-      entity: 'asset' | 'watchlist' | 'advice' | 'briefing' | 'settings';
+      entity: 'asset' | 'watchlist' | 'ipo' | 'advice' | 'briefing' | 'settings';
       id: string;
       label: string;
     }
@@ -1158,6 +1457,9 @@ export interface BackupPayload {
   transactions: Transaction[];
   watchlist: WatchItem[];
   advice: AdviceItem[];
+  /** 新股打新：打新标的与我的申购记录（老备份没有这两项，读取时按空数组处理）。 */
+  ipoOffers?: IpoOffer[];
+  ipoSubscriptions?: IpoSubscription[];
   runs?: AgentRunSummary[];
   settings?: Omit<Settings, 'llm'> & { llm: Omit<LlmConfig, 'apiKey'> };
 }
@@ -1167,6 +1469,8 @@ export interface ImportResult {
   transactions: number;
   watchlist: number;
   advice: number;
+  ipoOffers: number;
+  ipoSubscriptions: number;
   skipped: number;
   mode: ImportMode;
 }
@@ -1187,6 +1491,10 @@ export interface ClearDataResult {
   advice: number;
   /** 建议结果追踪（可重算的物化缓存）。 */
   adviceOutcomes: number;
+  /** 新股打新：打新标的。 */
+  ipoOffers: number;
+  /** 新股打新：我的申购 / 中签记录。 */
+  ipoSubscriptions: number;
   runs: number;
   steps: number;
   runMessages: number;

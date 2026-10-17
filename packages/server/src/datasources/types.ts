@@ -49,6 +49,53 @@ export interface Sourced<T> {
   warnings: string[];
 }
 
+/* ───────────────────────────── 新股打新 (IPO) ─────────────────────────────── */
+
+/**
+ * 上游抓到的一只新股（**未落库**）。
+ *
+ * 刻意不带 `id`/`uid`/AI 结论：这些是本地概念（uid 由 `services/ipo.ts` 按
+ * `market:code` 生成，AI 结论由打新分析写入），数据源只负责「上游有什么」。
+ */
+export interface IpoOfferDraft {
+  market: Market;
+  /** 上市交易代码；上游未给时为空串（落库时用申购代码兜底生成 uid）。 */
+  code: string;
+  subscribeCode: string;
+  name: string;
+  source: SourceId;
+  exchange: string;
+  board: string;
+  issuePrice: number;
+  priceLow: number;
+  priceHigh: number;
+  currency: string;
+  lotSize: number;
+  maxShares: number;
+  subscribeStart: string | null;
+  subscribeEnd: string | null;
+  allotmentDate: string | null;
+  listingDate: string | null;
+  issueShares: number;
+  raiseAmount: number;
+  issuePe: number;
+  industryPe: number;
+  winningRate: number;
+  oversubscribe: number;
+  sponsor: string;
+  industry: string;
+  prospectusUrl: string;
+}
+
+/** 一次打新数据收集的结果（逐市场给计数与问题，便于界面显示哪个源挂了）。 */
+export interface IpoCollectResult {
+  offers: IpoOfferDraft[];
+  sources: SourceId[];
+  /** 真实故障/降级（例如「港交所接口超时」）。 */
+  warnings: string[];
+  byMarket: { market: Market; count: number; sources: SourceId[] }[];
+}
+
 export interface ProviderQuote {
   quote: Quote;
   source: SourceId;
