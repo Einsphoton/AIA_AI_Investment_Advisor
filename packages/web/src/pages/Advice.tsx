@@ -4,12 +4,29 @@
  */
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { MARKETS, MARKET_LABELS, IPO_SOURCE_LABELS } from '@aia/shared';
+import {
+  MARKETS,
+  MARKET_LABELS,
+  IPO_SOURCE_LABELS,
+  OPTION_STRATEGY_INTENT,
+  OPTION_STRATEGY_LABELS,
+  OPTION_TYPE_LABELS,
+} from '@aia/shared';
 import type { AdviceItem, AdviceOutcome, IpoOffer } from '@aia/shared';
 import { api } from '../api/client';
 import { useAgentActivity, useAgentRefresh } from '../api/agentActivity';
 import { toApiError, useAsync } from '../api/hooks';
 import { fmtDate, fmtDateTime, fmtMoney, fmtNum, fmtPct, fmtPrice, fmtShares, pnlClass, safeNumber, todayIso } from '../format';
+import { ConfirmOptionAdviceDialog } from './ConfirmOptionAdviceDialog';
+import {
+  OPTION_STRATEGY_TONE,
+  assignmentProbabilityHint,
+  expiryCountdown,
+  liquidityText,
+  optionAssignmentConsequence,
+  optionCollateralText,
+  optionDataLine,
+} from './optionView';
 import { IpoDetailDialog } from './IpoDetailDialog';
 import {
   IPO_VERDICT_HINT,
@@ -78,6 +95,8 @@ export function AdvicePage() {
   const [nonce, setNonce] = useState(0);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [confirmTarget, setConfirmTarget] = useState<AdviceItem | null>(null);
+  /** 期权建议的最终确认弹窗（与股票那份分开：写的是卖出合约而不是股票流水）。 */
+  const [optionTarget, setOptionTarget] = useState<AdviceItem | null>(null);
 
   const list = useAsync(() => api.advice.list(status), [status, nonce]);
   const last = useAsync(() => api.advice.last(), [nonce]);
@@ -97,6 +116,13 @@ export function AdvicePage() {
   useAgentRefresh(() => setNonce((value) => value + 1));
 
   const items = list.data?.items ?? [];
+  /**
+   * 期权建议与股票建议分开渲染：期权要讲的是「行权价 / 到期 / 年化 / 安全垫 / 被行权概率 /
+   * 担保占用」，塞进股票那张表里只会两边都读不清。
+   */
+  const optionItems = items.filter((item) => item.instrument === 'option');
+  const stockItems = items.filter((item) => item.instrument !== 'option');
+  const optionPending = optionItems.filter((item) => item.status === 'pending').length;
   /** 正在招股 / 待申购的新股：这是会与买入建议抢当月现金的部分。 */
   const ipoLive: IpoOffer[] = (ipo.data?.items ?? []).filter(
     (offer) => offer.status === 'subscribing' || offer.status === 'upcoming',
@@ -175,8 +201,8 @@ export function AdvicePage() {
         }
       >
         <div className="tiny mute mb-2">
-          点击「AI 投资建议」会先跑<strong>资产分析 → 标的分析 → 打新分析</strong>，再汇总生成买入 / 卖出建议；买入建议受下方月度预算约束，
-          打新缴款同样占用当月资金。
+          点击「AI 投资建议」会先跑<strong>资产分析 → 标的分析 → 打新分析 → 期权卖权</strong>，再汇总生成买入 / 卖出 / 期权卖权建议；
+          买入建议受下方月度预算约束，打新缴款同样占用当月资金，卖 Put 的担保现金在「设置 → 期权卖权」里填。
           <br />
           每条建议都会 <strong>结合你的持仓与「我的标的」</strong>给出，并标注来源：<Badge tone="manual">持仓</Badge> 加仓 / 减仓、
           <Badge tone="ai">我的标的</Badge> 来自候选池、<Badge tone="warn">池外</Badge> 表示既非持仓也不在「我的标的」中
@@ -220,6 +246,143 @@ export function AdvicePage() {
                 </div>
               );
             })}
+          </div>
+        )}
+      </Card>
+
+      {/* 正股买卖建议排在最前面：它是本页最主要、也最常被处理的内容；
+          打新与期权卖权各自独立成卡片，排在它后面。 */}
+      <Card
+        title={
+          <span className="center gap-2">
+            建议列表（{stockItems.length}）
+            {optionItems.length > 0 && <Badge tone="ai">期权另有 {optionItems.length} 条</Badge>}
+          </span>
+        }
+        actions={<Segmented value={status} options={STATUS_OPTIONS} onChange={setStatus} />}
+      >
+        <ErrorAlert error={list.error} onRetry={list.reload} />
+
+        {list.loading && !list.data && <Loading label="正在加载建议…" />}
+
+        {!list.loading && items.length === 0 && (
+          <Empty
+            title={status === 'pending' ? '暂无待处理建议' : status === 'confirmed' ? '暂无已确认建议' : '暂无已驳回建议'}
+            hint={
+              status === 'pending'
+                ? '点击上方「AI 投资建议」让 Agent 结合持仓、标的与预算生成建议。'
+                : '切换上方分段控件可以看到其他状态的建议。'
+            }
+          />
+        )}
+
+        {!list.loading && items.length > 0 && stockItems.length === 0 && (
+          <div className="tiny mute">本批建议都是期权卖权，已在下方「期权卖权建议」卡片里逐条展开。</div>
+        )}
+
+        {stockItems.length > 0 && (
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>资产名称</th>
+                  <th>建议</th>
+                  <th className="num">目标份额</th>
+                  <th className="num">目标单价</th>
+                  <th className="num">建议金额</th>
+                  <th style={{ width: 268 }}>理由</th>
+                  <th className="num">置信度</th>
+                  <th>给出建议的日期</th>
+                  <th className="right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stockItems.map((item) => {
+                  return (
+                    <tr key={item.id} style={item.status === 'pending' ? undefined : { opacity: 0.62 }}>
+                      <td>
+                        <div className="strong">{item.assetName || item.code}</div>
+                        {/* 市场 + 资产类型：股票 / 场内基金 / 场外基金一眼可辨。 */}
+                        <div className="tiny center gap-2 wrap">
+                          <MarketTag market={item.market} />
+                          <InstrumentTypeTag type={item.type} />
+                          <span className="mono mute">{item.code}</span>
+                        </div>
+                        {/* 来源必须可见：池外建议意味着它跳过了「AI 标的分析」的候选池筛选。 */}
+                        <div className="mt-1">
+                          <Badge tone={ORIGIN_TONE[item.origin]} title={ORIGIN_HINT[item.origin]}>
+                            来源：{ORIGIN_LABEL[item.origin]}
+                          </Badge>
+                        </div>
+                        {outcomeById.get(item.id) && (
+                          <div className="mt-1 tiny" title={outcomeHint(outcomeById.get(item.id)!)}>
+                            <span className={`strong ${pnlClass(outcomeById.get(item.id)!.adviceReturnPct)}`}>
+                              实际 {fmtPct(outcomeById.get(item.id)!.adviceReturnPct)}
+                            </span>
+                            {outcomeById.get(item.id)!.benchmarkCode !== '' ? (
+                              <span className={`mute ${pnlClass(outcomeById.get(item.id)!.excessPct)}`}>
+                                {' '}
+                                · 超额 {fmtPct(outcomeById.get(item.id)!.excessPct)}
+                              </span>
+                            ) : (
+                              <span className="mute"> · 无基准</span>
+                            )}
+                          </div>
+                        )}
+                      </td>
+                      <td>
+                        <Badge tone={item.action === 'buy' ? 'buy' : 'sell'}>{item.action === 'buy' ? '买入' : '卖出'}</Badge>
+                      </td>
+                      <td className="num">{fmtShares(item.targetShares)}</td>
+                      <td className="num">{fmtPrice(item.targetPrice, item.currency)}</td>
+                      <td className="num">{fmtMoney(item.amount, item.currency)}</td>
+                      <td style={{ maxWidth: 268 }}>
+                        {/* 列表里只留两行摘要（去掉 Markdown 标记），全文放进悬浮浮窗，
+                            避免长理由把整行撑高、把表格挤得难读。 */}
+                        {item.reason ? (
+                          <HoverTip
+                            label={`查看完整理由：${item.assetName || item.code}`}
+                            title={`${item.assetName || item.code} · ${item.action === 'buy' ? '买入' : '卖出'}理由`}
+                            content={<Markdown text={item.reason} variant="compact" />}
+                          >
+                            <span className="hovertip-clamp">{summarizeReason(item.reason)}</span>
+                            <span className="hovertip-more">悬浮 / 点击查看全文</span>
+                          </HoverTip>
+                        ) : (
+                          <span className="mute">—</span>
+                        )}
+                      </td>
+                      <td className="num">{fmtPct(item.confidence * 100, 0, false)}</td>
+                      <td className="nowrap">{fmtDateTime(item.createdAt)}</td>
+                      <td>
+                        {item.status === 'pending' ? (
+                          <div className="row-actions">
+                            <Button size="sm" variant="primary" onClick={() => setConfirmTarget(item)}>
+                              确认
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              loading={busyId === item.id}
+                              onClick={() => void reject(item)}
+                            >
+                              驳回
+                            </Button>
+                          </div>
+                        ) : (
+                          <div className="right tiny mute nowrap">
+                            {item.status === 'confirmed'
+                              ? `已买入 ${fmtShares(item.executedShares)} @ ${fmtPrice(item.executedPrice, item.currency)}`
+                              : '已驳回'}
+                            {item.decidedAt && <div>{fmtDateTime(item.decidedAt)}</div>}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </Card>
@@ -356,138 +519,61 @@ export function AdvicePage() {
         )}
       </Card>
 
+      {/* 期权卖权建议：用独立卡片而不是表格行 —— 安全垫、被行权概率、担保占用、
+          数据口径这些数字塞进股票那张表只会两边都读不清。 */}
+      <Card
+        title={
+          <span className="center gap-2">
+            期权卖权建议
+            {optionItems.length > 0 && <Badge tone="ai">{optionItems.length} 条</Badge>}
+            {optionPending > 0 && <Badge tone="warn">待确认 {optionPending}</Badge>}
+          </span>
+        }
+        actions={
+          <Button
+            loading={running}
+            title="单独跑一次期权卖权分析：资产/标的 → 期权链 → 卖权建议"
+            onClick={() => run({ path: '/options/analyze', title: 'AI 期权卖权建议' })}
+          >
+            AI 期权卖权建议
+          </Button>
+        }
+      >
+        <div className="tiny mute mb-2">
+          卖期权的首要目标是<b>安全地把权利金收进来</b>，所以每张卡片都把「安不安全」摊开：行权价与现价的距离（安全垫）、
+          被行权概率、年化 / 静态收益率、流动性、担保占用，以及这组数字的来源与是否延迟。
+          <br />
+          现金担保卖 Put <b>只在标的足够划算时才做</b>：被行权就是按行权价收股，收股数量与占用现金写在卡片上。
+          点「确认」后会弹出<b>最终确认</b>弹窗（可改合约价格与合约时间）；到期自动结算的结果在「期权卖权」页跟踪。
+        </div>
+        {optionItems.length === 0 ? (
+          <div className="tiny mute">
+            本批没有期权卖权建议（期权只做港股 / 美股，A 股没有个股期权）。
+            {settings.data?.option?.runWithPipeline === false
+              ? '当前「设置 → 期权卖权」里关掉了「随 AI 投资建议一起跑」，所以流水线不会产出期权建议，可点右上角单独跑一次。'
+              : '如果持仓与「我的标的」里都没有可卖权的标的，就不会有期权建议。'}
+          </div>
+        ) : (
+          <div className="flex" style={{ flexDirection: 'column', gap: 10 }}>
+            {optionItems.map((item) => (
+              <OptionAdviceCard
+                key={item.id}
+                item={item}
+                busyId={busyId}
+                onConfirm={setOptionTarget}
+                onReject={(target) => void reject(target)}
+              />
+            ))}
+          </div>
+        )}
+      </Card>
+
       <IpoDetailDialog
         id={registerId}
         focusRegister
         onClose={() => setRegisterId(null)}
         onChanged={() => setNonce((value) => value + 1)}
       />
-
-      <Card
-        title={`建议列表（${items.length}）`}
-        actions={<Segmented value={status} options={STATUS_OPTIONS} onChange={setStatus} />}
-      >
-        <ErrorAlert error={list.error} onRetry={list.reload} />
-
-        {list.loading && !list.data && <Loading label="正在加载建议…" />}
-
-        {!list.loading && items.length === 0 && (
-          <Empty
-            title={status === 'pending' ? '暂无待处理建议' : status === 'confirmed' ? '暂无已确认建议' : '暂无已驳回建议'}
-            hint={
-              status === 'pending'
-                ? '点击上方「AI 投资建议」让 Agent 结合持仓、标的与预算生成建议。'
-                : '切换上方分段控件可以看到其他状态的建议。'
-            }
-          />
-        )}
-
-        {items.length > 0 && (
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>资产名称</th>
-                  <th>建议</th>
-                  <th className="num">目标份额</th>
-                  <th className="num">目标单价</th>
-                  <th className="num">建议金额</th>
-                  <th style={{ width: 268 }}>理由</th>
-                  <th className="num">置信度</th>
-                  <th>给出建议的日期</th>
-                  <th className="right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((item) => {
-                  return (
-                    <tr key={item.id} style={item.status === 'pending' ? undefined : { opacity: 0.62 }}>
-                      <td>
-                        <div className="strong">{item.assetName || item.code}</div>
-                        {/* 市场 + 资产类型：股票 / 场内基金 / 场外基金一眼可辨。 */}
-                        <div className="tiny center gap-2 wrap">
-                          <MarketTag market={item.market} />
-                          <InstrumentTypeTag type={item.type} />
-                          <span className="mono mute">{item.code}</span>
-                        </div>
-                        {/* 来源必须可见：池外建议意味着它跳过了「AI 标的分析」的候选池筛选。 */}
-                        <div className="mt-1">
-                          <Badge tone={ORIGIN_TONE[item.origin]} title={ORIGIN_HINT[item.origin]}>
-                            来源：{ORIGIN_LABEL[item.origin]}
-                          </Badge>
-                        </div>
-                        {outcomeById.get(item.id) && (
-                          <div className="mt-1 tiny" title={outcomeHint(outcomeById.get(item.id)!)}>
-                            <span className={`strong ${pnlClass(outcomeById.get(item.id)!.adviceReturnPct)}`}>
-                              实际 {fmtPct(outcomeById.get(item.id)!.adviceReturnPct)}
-                            </span>
-                            {outcomeById.get(item.id)!.benchmarkCode !== '' ? (
-                              <span className={`mute ${pnlClass(outcomeById.get(item.id)!.excessPct)}`}>
-                                {' '}
-                                · 超额 {fmtPct(outcomeById.get(item.id)!.excessPct)}
-                              </span>
-                            ) : (
-                              <span className="mute"> · 无基准</span>
-                            )}
-                          </div>
-                        )}
-                      </td>
-                      <td>
-                        <Badge tone={item.action === 'buy' ? 'buy' : 'sell'}>{item.action === 'buy' ? '买入' : '卖出'}</Badge>
-                      </td>
-                      <td className="num">{fmtShares(item.targetShares)}</td>
-                      <td className="num">{fmtPrice(item.targetPrice, item.currency)}</td>
-                      <td className="num">{fmtMoney(item.amount, item.currency)}</td>
-                      <td style={{ maxWidth: 268 }}>
-                        {/* 列表里只留两行摘要（去掉 Markdown 标记），全文放进悬浮浮窗，
-                            避免长理由把整行撑高、把表格挤得难读。 */}
-                        {item.reason ? (
-                          <HoverTip
-                            label={`查看完整理由：${item.assetName || item.code}`}
-                            title={`${item.assetName || item.code} · ${item.action === 'buy' ? '买入' : '卖出'}理由`}
-                            content={<Markdown text={item.reason} variant="compact" />}
-                          >
-                            <span className="hovertip-clamp">{summarizeReason(item.reason)}</span>
-                            <span className="hovertip-more">悬浮 / 点击查看全文</span>
-                          </HoverTip>
-                        ) : (
-                          <span className="mute">—</span>
-                        )}
-                      </td>
-                      <td className="num">{fmtPct(item.confidence * 100, 0, false)}</td>
-                      <td className="nowrap">{fmtDateTime(item.createdAt)}</td>
-                      <td>
-                        {item.status === 'pending' ? (
-                          <div className="row-actions">
-                            <Button size="sm" variant="primary" onClick={() => setConfirmTarget(item)}>
-                              确认
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              loading={busyId === item.id}
-                              onClick={() => void reject(item)}
-                            >
-                              驳回
-                            </Button>
-                          </div>
-                        ) : (
-                          <div className="right tiny mute nowrap">
-                            {item.status === 'confirmed'
-                              ? `已买入 ${fmtShares(item.executedShares)} @ ${fmtPrice(item.executedPrice, item.currency)}`
-                              : '已驳回'}
-                            {item.decidedAt && <div>{fmtDateTime(item.decidedAt)}</div>}
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
 
       <Card
         title={
@@ -676,6 +762,17 @@ export function AdvicePage() {
           setNonce((value) => value + 1);
         }}
       />
+
+      {/* 期权建议的最终确认：可改合约价格 / 合约时间 / 张数 / 行权价，并写明被行权后果。 */}
+      <ConfirmOptionAdviceDialog
+        item={optionTarget}
+        onClose={() => setOptionTarget(null)}
+        onDone={(message) => {
+          setOptionTarget(null);
+          toast.success('已建立卖出合约', `${message}。到期结算在「期权卖权」页跟踪。`);
+          setNonce((value) => value + 1);
+        }}
+      />
     </div>
   );
 }
@@ -707,6 +804,155 @@ function outcomeHint(row: AdviceOutcome): string {
 function summarizeReason(reason: string): string {
   const text = toPlainText(parseMarkdown(reason)).replace(/\s+/g, ' ').trim();
   return text || reason;
+}
+
+/* ─────────────────────── 期权卖权建议卡片（独立视觉） ─────────────────────── */
+
+/** 卡片里的单个指标块（与 stat-card 区分：这里是同一张卡片内部的读数）。 */
+function OptionMetric(props: { label: string; value: string; sub?: string; tone?: string }) {
+  return (
+    <div className="panel option-metric">
+      <div className="tiny mute">{props.label}</div>
+      <div className={`strong mono ${props.tone ?? ''}`}>{props.value}</div>
+      {props.sub && <div className="tiny mute">{props.sub}</div>}
+    </div>
+  );
+}
+
+/**
+ * 期权建议必须独立成卡（而不是塞进股票那张表的某一行）。
+ *
+ * 理由：判断「这个权利金值不值得收」需要同时看到 安全垫 / 被行权概率 / 年化与静态收益 /
+ * 流动性 / 担保占用 / 数据来源与延迟 —— 六个数字加两段后果说明，一行表格装不下，
+ * 挤进去只会两边都读不清。
+ */
+export function OptionAdviceCard(props: {
+  item: AdviceItem;
+  busyId: string | null;
+  onConfirm: (item: AdviceItem) => void;
+  onReject: (item: AdviceItem) => void;
+}) {
+  const { item } = props;
+  const plan = item.option;
+  if (!plan) {
+    return (
+      <div className="panel option-card">
+        <Alert tone="warn">
+          {item.assetName || item.code} 被标记为期权建议，但合约方案字段为空（`option=null`），无法确认。请重新生成建议。
+        </Alert>
+      </div>
+    );
+  }
+  const currency = plan.currency || item.currency;
+  const multiplier = plan.multiplier > 0 ? plan.multiplier : 0;
+  const metrics = plan.metrics;
+  const collateralLabel = metrics.collateralKind === 'shares' ? '担保占用（持股）' : '担保占用（现金）';
+  const collateralValue = fmtMoney(metrics.collateral, currency);
+
+  return (
+    <div className="panel option-card">
+      <div className="between wrap gap-2">
+        <div className="center gap-2 wrap">
+          <Badge tone="ai">期权</Badge>
+          <Badge tone={OPTION_STRATEGY_TONE[plan.strategy]}>{OPTION_STRATEGY_LABELS[plan.strategy]}</Badge>
+          <span className="strong">{item.assetName || item.code}</span>
+          <MarketTag market={item.market} />
+          <span className="mono tiny mute">
+            {item.code} · {plan.optionCode} · {OPTION_TYPE_LABELS[plan.optionType]}
+          </span>
+          <Badge tone={ORIGIN_TONE[item.origin]} title={ORIGIN_HINT[item.origin]}>
+            {`来源：${ORIGIN_LABEL[item.origin]}`}
+          </Badge>
+        </div>
+        {item.status === 'pending' ? (
+          <div className="row-actions">
+            <Button size="sm" variant="primary" onClick={() => props.onConfirm(item)}>
+              确认
+            </Button>
+            <Button size="sm" variant="ghost" loading={props.busyId === item.id} onClick={() => props.onReject(item)}>
+              驳回
+            </Button>
+          </div>
+        ) : (
+          <div className="right tiny mute nowrap">
+            {item.status === 'confirmed' ? '已确认（已建立卖出合约）' : '已驳回'}
+            {item.decidedAt && <div>{fmtDateTime(item.decidedAt)}</div>}
+          </div>
+        )}
+      </div>
+
+      <div className="tiny muted mt-1">{OPTION_STRATEGY_INTENT[plan.strategy]}</div>
+
+      <div className="grid-4 mt-2">
+        <OptionMetric
+          label="行权价"
+          value={fmtPrice(plan.strike, currency)}
+          sub={`标的现价 ${fmtPrice(plan.underlyingPrice, currency)}`}
+        />
+        <OptionMetric label="到期日" value={fmtDate(plan.expiry)} sub={expiryCountdown(plan.expiry)} />
+        <OptionMetric label="张数" value={fmtNum(plan.contracts, 0)} sub={`${fmtNum(multiplier, 0)} 股/张`} />
+        <OptionMetric
+          label="权利金（每股价 / 总额）"
+          value={fmtPrice(plan.premium, currency)}
+          sub={`合计 ${fmtMoney(metrics.premiumIncome, currency)}（已扣费用）`}
+        />
+        <OptionMetric
+          label="年化收益率"
+          value={fmtPct(metrics.annualizedYieldPct, 2, false)}
+          sub={`静态 ${fmtPct(metrics.staticYieldPct, 2, false)}`}
+          tone="pos"
+        />
+        <OptionMetric
+          label="安全垫（距行权价）"
+          value={fmtPct(metrics.downsideProtectionPct, 2, false)}
+          sub="越低越容易被行权"
+        />
+        <OptionMetric
+          label="被行权概率"
+          value={fmtPct(metrics.assignmentProbability * 100, 1, false)}
+          sub={assignmentProbabilityHint(item.market)}
+        />
+        <OptionMetric label={collateralLabel} value={collateralValue} sub={optionCollateralText(plan)} />
+      </div>
+
+      <div className="tiny mute mt-2">{liquidityText(metrics.liquidityScore)} · 盈亏平衡价 {fmtPrice(metrics.breakeven, currency)}</div>
+
+      {/* 数据口径：卖权定价的基础，来源 / 时间 / 是否延迟必须逐条标注。 */}
+      <div className="tiny mt-1">
+        数据口径：{optionDataLine(plan)}
+        {plan.delayed && <span className="warn">（延迟 / 收盘价，不能当成实时价）</span>}
+      </div>
+
+      {/* 被行权后果：卖 Call 交股 / 卖 Put 按行权价收股并占用现金，股数与现金都要写出来。 */}
+      <div className="tiny warn mt-1">
+        {optionAssignmentConsequence({
+          optionType: plan.optionType,
+          strike: plan.strike,
+          multiplier,
+          contracts: plan.contracts,
+          currency,
+          collateralNote: plan.collateralNote,
+        })}
+      </div>
+
+      {plan.warnings.length > 0 && (
+        <div className="mt-2">
+          <Alert tone="warn">
+            <ul style={{ margin: 0, paddingLeft: 18 }}>
+              {plan.warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          </Alert>
+        </div>
+      )}
+
+      <div className="mt-2">
+        <div className="tiny mute mb-1">AI 理由</div>
+        <Markdown text={item.reason} variant="compact" />
+      </div>
+    </div>
+  );
 }
 
 /* ─────────────────────────── 确认建议（写入资产） ──────────────────────────── */

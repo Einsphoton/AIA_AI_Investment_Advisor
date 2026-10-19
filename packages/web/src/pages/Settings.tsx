@@ -33,6 +33,7 @@ import { BackupCard } from './SettingsBackup';
 import { DangerZoneCard } from './SettingsDangerZone';
 import { ToolPolicyCard } from './SettingsToolPolicy';
 import { McpServersCard } from './SettingsMcpServers';
+import { OptionSettingsCard } from './SettingsOption';
 import { SchedulesCard } from './SettingsSchedules';
 import { buildInput, isDirty, toDraft, type Draft } from './settingsDraft';
 
@@ -485,6 +486,9 @@ export function SettingsPage() {
           />
         </div>
       </Card>
+
+      {/* 期权卖权：可用现金（现金担保卖 Put 的额度）+ 到期结算模式 + 是否随建议流水线跑。 */}
+      <OptionSettingsCard value={draft.option} onChange={(next) => patch({ option: next })} />
 
       {/* AI 定时任务：数组形态，可并存多个任务（触发方式与步骤各自独立）。 */}
       <SchedulesCard

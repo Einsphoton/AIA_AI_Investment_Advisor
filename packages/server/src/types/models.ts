@@ -6,6 +6,7 @@
  */
 import type {
   AdviceAction,
+  AdviceInstrument,
   AdviceOutcomeStatus,
   AdviceStatus,
   AgentRunKind,
@@ -18,6 +19,15 @@ import type {
   IpoSubscriptionStatus,
   LlmConfig,
   Market,
+  OptionAdvicePlan,
+  OptionCollateralKind,
+  OptionMarket,
+  OptionPositionStatus,
+  OptionSettings,
+  OptionSettlementStatus,
+  OptionSettlementVerdict,
+  OptionStrategy,
+  OptionType,
   Persona,
   ReportStyle,
   ScheduleTask,
@@ -48,6 +58,8 @@ export interface StoredSettings {
   toolPolicy: ToolPolicy;
   /** P1-2: configured MCP servers. */
   mcpServers: McpServerConfig[];
+  /** 期权卖权：各市场可用现金 + 到期结算模式（见 OptionSettings）。 */
+  option: OptionSettings;
   lastRunAt: string | null;
   updatedAt: string;
 }
@@ -177,6 +189,8 @@ export interface AdviceRow {
   code: string;
   market: Market;
   type: InstrumentType;
+  /** 'stock' | 'option'：决定确认时写股票流水还是写期权合约。 */
+  instrument: AdviceInstrument;
   action: AdviceAction;
   targetShares: number;
   targetPrice: number;
@@ -188,6 +202,8 @@ export interface AdviceRow {
   executedPrice: number | null;
   createdAt: string;
   decidedAt: string | null;
+  /** 卖权方案（`instrument='option'` 时非空，读库时已 JSON 解析）。 */
+  option: OptionAdvicePlan | null;
 }
 
 /**
@@ -469,6 +485,8 @@ export interface NewAdvice {
   code: string;
   market: Market;
   type: InstrumentType;
+  /** 默认 'stock'（不传即为股票建议，老调用点不用改）。 */
+  instrument?: AdviceInstrument;
   action: AdviceAction;
   targetShares: number;
   targetPrice: number;
@@ -477,6 +495,136 @@ export interface NewAdvice {
   confidence: number;
   status: AdviceStatus;
   createdAt: string;
+  /** 卖权方案（`instrument='option'` 时必填，写库时序列化为 JSON）。 */
+  optionPlan?: OptionAdvicePlan | null;
+}
+
+/* ─────────────────────── 期权卖权：持仓与到期结算的行结构 ─────────────────── */
+
+/** `option_contracts` 一行（一笔卖出的合约）。 */
+export interface OptionContractRow {
+  id: string;
+  adviceId: string | null;
+  strategy: OptionStrategy;
+  market: OptionMarket;
+  underlyingCode: string;
+  underlyingName: string;
+  underlyingAssetId: string | null;
+  optionCode: string;
+  optionType: OptionType;
+  strike: number;
+  expiry: string;
+  contracts: number;
+  multiplier: number;
+  currency: string;
+  premium: number;
+  fee: number;
+  premiumIncome: number;
+  collateralKind: OptionCollateralKind;
+  collateral: number;
+  underlyingPriceAtOpen: number;
+  status: OptionPositionStatus;
+  openedAt: string;
+  closedAt: string | null;
+  closePrice: number | null;
+  realizedPnl: number | null;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NewOptionContract {
+  id: string;
+  adviceId?: string | null;
+  strategy: OptionStrategy;
+  market: OptionMarket;
+  underlyingCode: string;
+  underlyingName?: string;
+  underlyingAssetId?: string | null;
+  optionCode: string;
+  optionType: OptionType;
+  strike: number;
+  expiry: string;
+  contracts: number;
+  multiplier: number;
+  currency: string;
+  premium: number;
+  fee?: number;
+  premiumIncome: number;
+  collateralKind: OptionCollateralKind;
+  collateral: number;
+  underlyingPriceAtOpen?: number;
+  status?: OptionPositionStatus;
+  openedAt: string;
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 部分更新：`undefined` = 不改。 */
+export interface OptionContractPatch {
+  underlyingName?: string;
+  underlyingAssetId?: string | null;
+  status?: OptionPositionStatus;
+  closedAt?: string | null;
+  closePrice?: number | null;
+  realizedPnl?: number | null;
+  note?: string;
+  updatedAt?: string;
+}
+
+/** `option_settlements` 一行（一个合约最多一条，按 contract_id 幂等）。 */
+export interface OptionSettlementRow {
+  id: string;
+  contractId: string;
+  expiry: string;
+  evaluatedAt: string;
+  referencePrice: number;
+  priceSource: string;
+  verdict: OptionSettlementVerdict;
+  itmAmount: number;
+  itmPct: number;
+  status: OptionSettlementStatus;
+  action: 'none' | 'shares_delivered' | 'shares_received' | 'pending';
+  transactionId: string | null;
+  assetId: string | null;
+  realizedPnl: number;
+  note: string;
+  createdAt: string;
+}
+
+export interface NewOptionSettlement {
+  id: string;
+  contractId: string;
+  expiry: string;
+  evaluatedAt: string;
+  referencePrice: number;
+  priceSource: string;
+  verdict: OptionSettlementVerdict;
+  itmAmount: number;
+  itmPct: number;
+  status: OptionSettlementStatus;
+  action: 'none' | 'shares_delivered' | 'shares_received' | 'pending';
+  transactionId?: string | null;
+  assetId?: string | null;
+  realizedPnl?: number;
+  note?: string;
+  createdAt: string;
+}
+
+export interface OptionSettlementPatch {
+  evaluatedAt?: string;
+  referencePrice?: number;
+  priceSource?: string;
+  verdict?: OptionSettlementVerdict;
+  itmAmount?: number;
+  itmPct?: number;
+  status?: OptionSettlementStatus;
+  action?: OptionSettlementRow['action'];
+  transactionId?: string | null;
+  assetId?: string | null;
+  realizedPnl?: number;
+  note?: string;
 }
 
 export interface NewStep {

@@ -252,6 +252,10 @@ export function toAdviceItem(row: AdviceRow): AdviceItem {
     code: row.code,
     market: row.market,
     type: row.type,
+    // 期权卖权建议与股票建议共用同一张表：instrument 决定界面与确认流程的分流
+    // （股票写交易流水，期权写 option_contracts）。老数据没有这一列，兜底成
+    // 'stock'——前端若拿到 undefined 会把两种建议都当股票渲染。
+    instrument: row.instrument ?? 'stock',
     action: row.action,
     // 来源由链接字段推导：带 assetId = 持仓；带 watchItemId = 我的标的；都没有 = 池外。
     // 写入时 tools.ts 会按 code 反查补全链接，所以这里能如实反映建议依据的池子。
@@ -267,6 +271,8 @@ export function toAdviceItem(row: AdviceRow): AdviceItem {
     decidedAt: row.decidedAt,
     executedShares: row.executedShares === null ? null : round4(toNumber(row.executedShares)),
     executedPrice: row.executedPrice === null ? null : round4(toNumber(row.executedPrice)),
+    // 卖权方案：`instrument='option'` 时非空（合约条件、服务端算好的指标与数据口径）。
+    option: row.option ?? null,
   };
 }
 

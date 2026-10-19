@@ -9,6 +9,7 @@
  * Owner: agent-engine.
  */
 import {
+  DEFAULT_OPTION_SETTINGS,
   DEFAULT_PERSONA,
   DEFAULT_REPORT_STYLE,
   DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
@@ -16,10 +17,16 @@ import {
   INSTRUMENT_TYPES,
   INSTRUMENT_TYPE_LABELS,
   MARKETS,
+  MARKET_CURRENCY,
   MARKET_LABELS,
+  OPTION_STRATEGY_LABELS,
   PERSONA_MAP,
   type AgentRun,
   type BudgetStatus,
+  type OptionCandidate,
+  type OptionChainSnapshot,
+  type OptionMarket,
+  type OptionSettings,
   type Persona,
   type ReportStyle,
 } from '@aia/shared';
@@ -36,6 +43,7 @@ import { compactHolding, computePosition, hasOpenPosition, round, sparkFrom, typ
 import { executeTool, type AllowWrite } from '../agent/tools.js';
 import { readBriefing } from './briefing.js';
 import { listIpoPayload, refreshIpoOffers } from './ipo.js';
+import { loadOptionChain, screenOptionCandidates } from './options.js';
 
 export interface PipelineContext {
   agent: AgentRuntime;
@@ -47,6 +55,10 @@ export interface PipelineContext {
 const MAX_ASSETS = 12;
 /** 单次打新分析最多处理多少只（控制提示词体积与轮次）。 */
 const MAX_IPO_OFFERS = 8;
+/** 单次期权卖权分析最多抓几条期权链（港股报告 6.7MB/标的，4 条已够覆盖主要担保来源）。 */
+const MAX_OPTION_UNDERLYINGS = 4;
+/** 每个标的预取多少个候选（明细让模型自己用 list_option_chain 查，避免提示词膨胀）。 */
+const MAX_OPTION_CANDIDATES = 3;
 const MAX_WATCH_REFRESH = 20;
 /** 资产分析预取的财报期数（新 → 旧）：4 期足够看趋势，同时控制提示词 token。 */
 const FINANCIAL_PERIODS = 4;
@@ -72,6 +84,8 @@ export interface SafeSettings {
   watchlistCandidateLimit: number;
   /** P3 淘汰阈值：连续多少次确认退役后才真正删除（0 = 永不删除）。 */
   watchlistRetireDeleteRuns: number;
+  /** 期权卖权设置（可用现金/结算模式/是否随流水线跑）；读不到时用默认值。 */
+  option: OptionSettings;
 }
 
 /** Settings read that never throws during boot/tests. */
@@ -86,6 +100,7 @@ export function safeSettings(repo: Repo): SafeSettings {
         typeof settings.watchlistRetireDeleteRuns === 'number'
           ? settings.watchlistRetireDeleteRuns
           : DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
+      option: settings.option ?? DEFAULT_OPTION_SETTINGS,
     };
   } catch {
     return {
@@ -93,6 +108,7 @@ export function safeSettings(repo: Repo): SafeSettings {
       reportStyle: DEFAULT_REPORT_STYLE,
       watchlistCandidateLimit: DEFAULT_WATCHLIST_CANDIDATE_LIMIT,
       watchlistRetireDeleteRuns: DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
+      option: DEFAULT_OPTION_SETTINGS,
     };
   }
 }
@@ -212,6 +228,29 @@ export async function collectMacro(): Promise<Record<string, unknown>> {
   };
 }
 
+/**
+ * 通用预算器：payload 里的列表超预算时从**尾部**丢弃（并告诉模型丢了几个），
+ * 口径与 `fitGoalPayload` 完全一致（见下方注释：24k 估算 token 的由来）。
+ */
+function fitPayload<T extends Record<string, unknown>>(
+  payload: T,
+  listKey: keyof T & string,
+  countKey?: keyof T & string,
+): { json: string; dropped: number } {
+  const list = payload[listKey] as unknown as unknown[];
+  let kept = list;
+  const build = (): string =>
+    JSON.stringify({ ...payload, [listKey]: kept, ...(countKey === undefined ? {} : { [countKey]: kept.length }) });
+  let json = build();
+  let dropped = 0;
+  while (estimateTokens(json) > MAX_GOAL_PAYLOAD_TOKENS && kept.length > 1) {
+    kept = kept.slice(0, kept.length - 1);
+    dropped += 1;
+    json = build();
+  }
+  return { json, dropped };
+}
+
 /** Serializes the pre-fetched payload, dropping trailing holdings if it is too big. */
 function fitGoalPayload(payload: {
   持仓数量: number;
@@ -220,19 +259,12 @@ function fitGoalPayload(payload: {
   宏观: unknown;
   持仓明细: Array<{ 标的信息: unknown; 市场数据: Record<string, unknown>; 数据缺失: string[] }>;
 }): { json: string; droppedHoldings: number } {
-  let details = payload.持仓明细;
-  let json = JSON.stringify({ ...payload, 持仓明细: details });
-  let droppedHoldings = 0;
   // Drop from the tail (the model is told, so nothing is silently lost). Each
   // single holding is independently bounded by `collectInstrumentData`
   // (20 K-line points / 3 news / 10 fund holdings / 4 statement periods), so the
   // loop always terminates with a payload that fits.
-  while (estimateTokens(json) > MAX_GOAL_PAYLOAD_TOKENS && details.length > 1) {
-    details = details.slice(0, details.length - 1);
-    droppedHoldings += 1;
-    json = JSON.stringify({ ...payload, 持仓数量: details.length, 持仓明细: details });
-  }
-  return { json, droppedHoldings };
+  const { json, dropped } = fitPayload(payload as unknown as Record<string, unknown>, '持仓明细', '持仓数量');
+  return { json, droppedHoldings: dropped };
 }
 
 /** Runs the 资产分析 pipeline (writes `assets.ai_summary` + dashboard briefing). */
@@ -650,6 +682,361 @@ export async function runIpoAnalysis(context: PipelineContext): Promise<AgentRun
   });
   logger.info(`ipo analysis run ${run.id} finished (${run.status}) after ${run.turns} turns`);
   return run;
+}
+
+/* ─────────────────────────── 期权卖权建议 ───────────────────────────────── */
+
+/** 距到期的自然日（数据口径：按 UTC 日期算，过期返回负数）。 */
+function daysUntil(expiry: string, from = Date.now()): number {
+  const at = Date.parse(`${expiry}T00:00:00Z`);
+  if (!Number.isFinite(at)) return 0;
+  return Math.floor((at - from) / 86_400_000);
+}
+
+/** 候选合约 → 提示词里的紧凑表示（只保留决策需要的字段，口径与工具返回一致）。 */
+function compactOptionCandidate(candidate: OptionCandidate): Record<string, unknown> {
+  const { quote, metrics } = candidate;
+  return {
+    策略: OPTION_STRATEGY_LABELS[candidate.strategy],
+    合约: quote.code,
+    方向: quote.type,
+    行权价: quote.strike,
+    到期日: quote.expiry,
+    剩余天数: daysUntil(quote.expiry),
+    买价: quote.bid,
+    卖价: quote.ask,
+    中间价: quote.mid,
+    乘数: quote.multiplier,
+    权利金收入: metrics.premiumIncome,
+    静态收益率: metrics.staticYieldPct,
+    年化收益率: metrics.annualizedYieldPct,
+    安全垫: metrics.downsideProtectionPct,
+    被行权概率: metrics.assignmentProbability,
+    流动性分: metrics.liquidityScore,
+    未平仓: quote.openInterest,
+    价差: quote.spreadPct,
+  };
+}
+
+/** 卖 Put 的池内标的个数上限（每个市场）。期权链抓取很重（港股每日报告 6.7MB），必须限流。 */
+const MAX_OPTION_PUT_UNDERLYINGS = 2;
+
+/** 把可能缺失/非法的数字收成 0（设置里的现金、池内评分都可能缺失）。 */
+function finiteNumber(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** 期权卖权阶段的可分析范围。 */
+export interface OptionAdviceScope {
+  /** 覆盖式卖 Call 的担保物：港股/美股股票与 ETF 持仓的代码。 */
+  coveredCodes: string[];
+  /** 现金担保卖 Put 的标的：观察池里的港股/美股标的（账户没有持股，只有现金担保）。 */
+  putUnderlyings: Array<{ market: OptionMarket; code: string; name: string; price: number }>;
+  /**
+   * 是否存在任何担保物。
+   *
+   * 卖 Call 的担保物是**持股**，卖 Put 的担保物是**现金** —— 两者任一存在就有可分析范围。
+   * 只看持股会让「填了期权可用现金」的用户永远拿不到卖 Put 建议。
+   */
+  hasCollateral: boolean;
+}
+
+/**
+ * 从观察池挑出「现金担保卖 Put」的标的（纯函数，便于直接测试边界）。
+ *
+ * 规则：只取在池（active）的港股/美股股票与 ETF；只取对应市场**有可用现金**的；
+ * 已有持股的标的（用 coveredCodes 排除）走覆盖式卖 Call，不在这里重复分析；
+ * 按优质分（再按预期收益）降序，每市场最多 `perMarket` 个。
+ */
+export function selectOptionPutUnderlyings(input: {
+  watchlist: Array<{ market: string; code: string; name: string; type: string; qualityScore?: number; expectedReturn?: number; price?: number }>;
+  cash: { HK: number; US: number };
+  excludeCodes?: string[];
+  perMarket?: number;
+}): Array<{ market: OptionMarket; code: string; name: string; price: number }> {
+  const perMarket = input.perMarket ?? MAX_OPTION_PUT_UNDERLYINGS;
+  const excluded = new Set(input.excludeCodes ?? []);
+  const out: Array<{ market: OptionMarket; code: string; name: string; price: number }> = [];
+  for (const market of ['HK', 'US'] as OptionMarket[]) {
+    if (!(finiteNumber(input.cash[market]) > 0)) continue;
+    const picked = input.watchlist
+      .filter((item) => item.market === market)
+      .filter((item) => item.type === 'stock' || item.type === 'etf')
+      .filter((item) => item.code && !excluded.has(item.code))
+      .sort((a, b) => (finiteNumber(b.qualityScore) - finiteNumber(a.qualityScore)) || (finiteNumber(b.expectedReturn) - finiteNumber(a.expectedReturn)))
+      .slice(0, Math.max(0, perMarket));
+    for (const item of picked) out.push({ market, code: item.code, name: item.name ?? '', price: finiteNumber(item.price) });
+  }
+  return out;
+}
+
+/** 判定本次阶段到底有没有可分析的担保物（持股 or 现金）。 */
+export function optionAdviceScope(input: {
+  holdings: Array<{ market: string; code: string; type: string }>;
+  watchlist: Array<{ market: string; code: string; name: string; type: string; qualityScore?: number; expectedReturn?: number; price?: number }>;
+  cash: { HK: number; US: number };
+  perMarket?: number;
+}): OptionAdviceScope {
+  const coveredCodes = input.holdings
+    .filter((asset) => (asset.market === 'HK' || asset.market === 'US') && (asset.type === 'stock' || asset.type === 'etf'))
+    .map((asset) => asset.code);
+  const putUnderlyings = selectOptionPutUnderlyings({
+    watchlist: input.watchlist,
+    cash: input.cash,
+    excludeCodes: coveredCodes,
+    perMarket: input.perMarket,
+  });
+  return { coveredCodes, putUnderlyings, hasCollateral: coveredCodes.length > 0 || putUnderlyings.length > 0 };
+}
+
+/**
+ * 期权卖权阶段的任务描述（纯函数，便于用测试锁住「不许拿买股的估值门槛否决卖 Put」这类要求）。
+ */
+export function optionAdviceGoal(input: {
+  personaLabel: string;
+  personaGuidance: string;
+  cash: { HK: number; US: number };
+  coveredCount: number;
+  putCount: number;
+  payloadJson: string;
+  macroJson: string;
+}): string {
+  const { personaLabel, personaGuidance, cash, coveredCount, putCount, payloadJson, macroJson } = input;
+  const lines = [
+    '请基于用户的实际持仓、可用现金与下面的期权链预取数据，生成「卖出期权收权利金」的建议。',
+    `投资性格：${personaLabel} — ${personaGuidance}`,
+    `期权可用现金（只能用于现金担保卖 Put 的担保，不能超过）：HK ${cash.HK} / US ${cash.US}（0 = 未填写，需提示用户去设置页填写，不要假设数字）。`,
+    coveredCount === 0
+      ? '本次账户没有港股/美股持股 → 覆盖式卖 Call 无担保物，不要做；下面的标的是观察池标的，**只做现金担保卖 Put**（担保物是现金，与是否持股无关）。'
+      : `本次有 ${coveredCount} 个港股/美股持股标的（可做覆盖式卖 Call）与 ${putCount} 个观察池标的（只可做现金担保卖 Put）。`,
+    '要求：',
+    '1) 下面的期权链预取只是**候选**：写建议前用 list_option_chain 核对你选中的合约（报价、乘数、到期日、delta、未平仓），或用 screen_option_candidates 重新筛选；不要引用预取里没有的合约。',
+    '2) 优先级：① 先用「我的持股」做覆盖式卖 Call 安全收权利金（被行权即按行权价交股）；② 用「期权可用现金」做现金担保卖 Put 收权利金，只在标的确实划算时才接受被行权（按行权价收股）。',
+    '3) **服务端 screen_option_candidates 的门槛（剩余期限、|delta|、未平仓、价差、最低年化、最低权利金）就是「安全收权利金」的执行标准**：通过门槛的候选即满足安全要求。',
+    '   投资性格里的估值门槛（例如价值型的「安全边际 > 20%」）是**买正股**的判断标准，**不得用来否决卖 Put**；卖 Put 的「划算」只决定**选哪一档行权价**：愿意按该价接股就选安全垫较小、年化更高的档位；不愿意接股就选行权价更低（安全垫更大）的档位。',
+    '4) **只要有候选通过服务端门槛，就必须至少写入 1 条建议**（把接股成本、最坏情形、失效条件写进 reason）。只有下列情形才允许不写并逐一说明：全部候选被硬规则拒绝（担保不足 / 无可用到期日 / 价差过宽 / IV 过低）、期权链取不到（数据缺失）、或该市场的可用现金为 0。',
+    '   「每张权利金绝对金额小」**不构成**不写的理由：张数可以按下面第 5 条放大，收入与张数成正比；放弃时必须在总结里给出你放弃的具体门槛与数字。',
+    '5) **张数按担保物给足，不要默认只卖 1 张**：工具会返回每个候选的 `maxContracts`（服务端已按合约乘数算好：卖 Put = 可用现金 ÷ (行权价 × 乘数)，卖 Call = 持股数 ÷ 乘数），直接引用这个数字并据此决定张数，不要自己算、也不要超过它。',
+    '6) 覆盖式卖 Call 的 乘数 × 张数 不得超过该标的持股数；现金担保卖 Put 的 行权价 × 乘数 × 张数 不得超过该市场可用现金。系统会机械校验并直接拒绝，报错请按返回的最大张数改正。',
+    '7) 每条建议必须调用 create_option_advice 写入（code / market / strategy / optionType / optionCode / strike / expiry / contracts / premium / reason / acceptAssignment / collateralNote）。一条一条写，不要攒到最后（轮次有限）。',
+    '8) reason 必须覆盖：趋势与波动率、财报与估值、事件风险（财报日/分红除权/拆股）、流动性与价差、被行权概率与安全垫、最坏情形（被行权后的持仓/现金变化，以及相对于直接持股的少赚/多亏）。所有数字引用工具返回；缺数据写「数据缺失：<指标>——<原因>」。',
+    '9) 数据口径（source / asOf / delayed / warnings）必须写进建议：延迟行情、港股每日收市口径、上游缺少 IV/delta 都要说明，不得把「没有数据」当成「没有风险」。',
+    '10) 数据缺失时不要编合约：没有可用候选就说明「本次没有符合安全收权利金条件的合约」及原因（IV 太低、价差太宽、担保不足、没有可用到期日）。',
+    '11) 最后给一段总结：本次写入的建议清单（标的/策略/合约/张数/权利金/年化收益）、未做的标的原因、每条结论的失效条件。',
+    '以下是期权链预取数据 JSON（数据源见每个标的的「数据口径」，延迟/口径必须原样引用）：',
+    payloadJson,
+    `宏观数据（已预取，直接引用，不必再调 get_macro）：${macroJson}`,
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * Runs the 期权卖权分析 pipeline（ARCHITECTURE.md §4.3-4），产出待确认的卖权建议。
+ *
+ * 为什么是独立阶段：卖权建议的约束（持股覆盖 / 现金担保）与股票建议的预算约束
+ * 完全不同，混在一个 run 里会让模型把两套额度算错；且期权链抓取很重（港股每日
+ * 报告 6.7MB），必须能单独开关（`settings.option.runWithPipeline`）。
+ *
+ * 预取只放「标的 + 现价 + 可用到期日 + 预筛后的 top N 候选指标 + 持股 + 可用现金」，
+ * 明细（任意行权价/到期日）交给 `list_option_chain` 现取——提示词只负责让模型知道
+ * 有哪些值得看的合约，最终写回前必须自己核对工具返回。
+ */
+export async function runOptionAdvice(context: PipelineContext): Promise<AgentRun> {
+  const { repo, agent, logger, sink } = context;
+  const settings = safeSettings(repo);
+  const transactions = repo.listTransactions();
+
+  // 1) 可用于担保的标的：港股/美股的股票与 ETF 持仓（卖 Call 要股数，卖 Put 要现金）。
+  const candidates = repo
+    .listAssets()
+    .filter((asset) => (asset.market === 'HK' || asset.market === 'US') && (asset.type === 'stock' || asset.type === 'etf'))
+    .map((asset) => ({ asset, holding: compactHolding(asset, transactions.filter((tx) => tx.assetId === asset.id)) }))
+    .filter((entry) => !entry.holding.closed && entry.holding.shares > 0)
+    .sort((a, b) => b.holding.marketValue - a.holding.marketValue)
+    .slice(0, MAX_OPTION_UNDERLYINGS);
+
+  const cash = settings.option.cash;
+
+  /**
+   * 卖 Put 的担保物是**现金**，不是持股。
+   *
+   * 这里曾经只看持股，结果是：用户按提示把「期权可用现金」填成 50000 HKD 之后，
+   * 阶段仍然告诉模型「没有可用于担保的港股/美股持仓，因此本次没有可分析的标的」——
+   * 与同一段话里打印的 HK 50000 自相矛盾，模型于是只写「请先去建仓」的总结，
+   * 一条建议都不写。担保物判定必须把现金一起算进来。
+   */
+  const scope = optionAdviceScope({
+    holdings: candidates.map(({ asset }) => ({ market: asset.market, code: asset.code, type: asset.type })),
+    watchlist: repo.listWatchlist('active'),
+    cash,
+  });
+
+  const dataWarnings: string[] = [];
+
+  if (!scope.hasCollateral) {
+    // 空集不是错误：既没有持股也没有现金，就没有任何担保物，落一条 run 说明原因，用户能在历史里看到。
+    const run = await agent.run({
+      kind: 'option-advice',
+      title: 'AI 期权卖权建议',
+      goal: [
+        '当前没有可用于卖权的担保物：账户里没有港股/美股持股（覆盖式卖 Call 需要持股），设置里的「期权可用现金」也没有填写（现金担保卖 Put 需要现金）。',
+        `设置里的期权可用现金：HK ${cash.HK} / US ${cash.US}。`,
+        '请在总结中说明：卖权建议需要先有港股/美股持仓（覆盖式卖 Call）或先到设置页填写「期权可用现金」（现金担保卖 Put）。不要编造任何合约信息。',
+      ].join('\n'),
+      target: 'option:0',
+      sink,
+      allowWrites: ['advice'],
+    });
+    logger.info(`option advice run ${run.id} finished (${run.status}) after ${run.turns} turns (no collateral)`);
+    return run;
+  }
+
+  const macro = await collectMacro().catch(() => ({ items: [], indices: [], warnings: ['宏观数据不可用'] }));
+
+  const briefs: Array<Record<string, unknown>> = [];
+
+  /**
+   * 预取期权链：并发 2 条。
+   *
+   * 期权链抓取很重（港股每日报告 6.7MB ≈ 7.5s，CBOE 单请求 13–194s），而 `POST /api/options/analyze`
+   * 是**等预取完才返回 runId** 的 —— 串行 4 个标的会把请求拖到几分钟，用户只看到按钮一直在转。
+   * 每个标的的 warning 单独收集后再按顺序合并，保证提示词里的警告顺序稳定。
+   */
+  const prefetch = async (items: Array<{ base: Record<string, unknown>; market: OptionMarket; code: string; name?: string; price: number; heldShares: number; availableCash: number }>) =>
+    mapLimit(items, 2, async (item) => {
+      const warnings: string[] = [];
+      const brief = await buildOptionBrief({ ...item, dataWarnings: warnings, logger });
+      return { brief, warnings };
+    });
+
+  /** 持仓标的：覆盖式卖 Call（有股）+ 现金担保卖 Put（有钱）两种都能做。 */
+  const holdingsPrefetch = await prefetch(
+    candidates.map(({ asset, holding }) => ({
+      base: {
+        标的: asset.name,
+        code: asset.code,
+        market: asset.market as OptionMarket,
+        现价: holding.price,
+        币种: asset.currency || MARKET_CURRENCY[asset.market as OptionMarket],
+        我的持股: holding.shares,
+        持仓成本: holding.avgCost,
+        我的可用期权现金: cash[asset.market as OptionMarket],
+        策略范围: 'covered_call + cash_secured_put',
+      },
+      market: asset.market as OptionMarket,
+      code: asset.code,
+      name: asset.name,
+      price: holding.price,
+      heldShares: holding.shares,
+      availableCash: cash[asset.market as OptionMarket],
+    })),
+  );
+
+  /** 池内标的（本次没有持股）：只能做现金担保卖 Put。 */
+  const putPrefetch = await prefetch(
+    scope.putUnderlyings.map((item) => ({
+      base: {
+        标的: item.name || item.code,
+        code: item.code,
+        market: item.market,
+        现价: item.price,
+        币种: MARKET_CURRENCY[item.market],
+        我的持股: 0,
+        持仓成本: 0,
+        我的可用期权现金: cash[item.market],
+        标的来源: '观察池（账户没有该标的持股，只能做现金担保卖 Put）',
+        策略范围: 'cash_secured_put',
+      },
+      market: item.market,
+      code: item.code,
+      name: item.name,
+      price: item.price,
+      heldShares: 0,
+      availableCash: cash[item.market],
+    })),
+  );
+
+  for (const entry of [...holdingsPrefetch, ...putPrefetch]) {
+    briefs.push(entry.brief);
+    dataWarnings.push(...entry.warnings);
+  }
+
+  const { json, dropped } = fitPayload({ 标的数量: briefs.length, 数据警告: dataWarnings.slice(0, 10), 标的明细: briefs }, '标的明细', '标的数量');
+  if (dropped > 0) {
+    dataWarnings.push(`提示词预算不足，已省略 ${dropped} 个标的的预取数据（请用 list_option_chain 现取）。`);
+  }
+
+  const goal = optionAdviceGoal({
+    personaLabel: PERSONA_MAP[settings.persona].label,
+    personaGuidance: PERSONA_MAP[settings.persona].guidance,
+    cash,
+    coveredCount: candidates.length,
+    putCount: scope.putUnderlyings.length,
+    payloadJson: json,
+    macroJson: JSON.stringify(macro),
+  });
+
+  const run = await agent.run({
+    kind: 'option-advice',
+    title: 'AI 期权卖权建议',
+    goal,
+    target: `option:${briefs.length}`,
+    sink,
+    allowWrites: ['advice'],
+  });
+  logger.info(`option advice run ${run.id} finished (${run.status}) after ${run.turns} turns`);
+  return run;
+}
+
+/** 取一个标的的期权链并预筛两种策略，失败只记 warning（单个标的失败不能拖垮整条阶段）。 */
+async function buildOptionBrief(input: {
+  base: Record<string, unknown>;
+  market: OptionMarket;
+  code: string;
+  name?: string;
+  price: number;
+  heldShares: number;
+  availableCash: number;
+  dataWarnings: string[];
+  logger: PipelineContext['logger'];
+}): Promise<Record<string, unknown>> {
+  const { base, market, code, name, price, heldShares, availableCash, dataWarnings, logger } = input;
+  try {
+    const snapshot: OptionChainSnapshot = await loadOptionChain({
+      market,
+      code,
+      name,
+      underlyingPrice: price > 0 ? price : undefined,
+    });
+    const covered = screenOptionCandidates({ snapshot, strategy: 'covered_call', contracts: 1, heldShares });
+    const secured = screenOptionCandidates({ snapshot, strategy: 'cash_secured_put', contracts: 1, availableCash });
+    dataWarnings.push(...snapshot.warnings.map((warning) => `${code}: ${warning}`));
+    return {
+      ...base,
+      数据口径: {
+        source: snapshot.source,
+        asOf: snapshot.asOf,
+        delayed: snapshot.delayed,
+        warnings: snapshot.warnings.slice(0, 6),
+      },
+      可用到期日: snapshot.expiries.slice(0, 8).map((group) => ({
+        到期日: group.expiry,
+        剩余天数: group.daysToExpiry,
+        合约数: group.contracts,
+        平值IV: group.atmIv,
+      })),
+      覆盖式卖Call候选: covered.candidates.slice(0, MAX_OPTION_CANDIDATES).map(compactOptionCandidate),
+      现金担保卖Put候选: secured.candidates.slice(0, MAX_OPTION_CANDIDATES).map(compactOptionCandidate),
+      筛选说明: [...new Set([...covered.warnings, ...secured.warnings])].slice(0, 8),
+    };
+  } catch (error) {
+    // 单个标的失败不能拖垮整条阶段：写清数据缺失，其余标的照常分析。
+    const message = error instanceof Error ? error.message : String(error);
+    dataWarnings.push(`${code} 期权链获取失败：${message}`);
+    logger.warn(`option chain failed for ${code}: ${message}`);
+    return { ...base, 数据缺失: `期权链获取失败：${message}` };
+  }
 }
 
 export interface RetireSweepResult {

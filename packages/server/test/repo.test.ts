@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { DEFAULT_DATA_SOURCES, DEFAULT_LLM, DEFAULT_PERSONA, type ScheduleTask } from '@aia/shared';
+import { DEFAULT_DATA_SOURCES, DEFAULT_LLM, DEFAULT_PERSONA, type OptionAdvicePlan, type ScheduleTask } from '@aia/shared';
 
 import { createRepo } from '../src/db/repo.js';
 import { settingsPatch } from '../src/db/util.js';
@@ -26,7 +26,7 @@ import {
   writeBackupSnapshot,
 } from '../src/services/backup.js';
 import type { Repo } from '../src/types/repo.js';
-import type { NewAdvice, NewAsset, NewTx, NewWatch } from '../src/types/models.js';
+import type { NewAdvice, NewAsset, NewOptionContract, NewOptionSettlement, NewTx, NewWatch } from '../src/types/models.js';
 
 function tempRepo(): { repo: Repo; dir: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aia-repo-'));
@@ -121,6 +121,8 @@ function newAdvice(over: Partial<NewAdvice> = {}): NewAdvice {
     code: over.code ?? 'AAPL',
     market: over.market ?? 'US',
     type: over.type ?? 'stock',
+    // 默认股票建议（不传即老行为）；卖权建议显式带 instrument + optionPlan。
+    instrument: over.instrument ?? 'stock',
     action: over.action ?? 'buy',
     targetShares: over.targetShares ?? 10,
     targetPrice: over.targetPrice ?? 100,
@@ -129,6 +131,95 @@ function newAdvice(over: Partial<NewAdvice> = {}): NewAdvice {
     confidence: over.confidence ?? 0.7,
     status: over.status ?? 'pending',
     createdAt: over.createdAt ?? '2026-10-01T10:00:00.000+08:00',
+    optionPlan: over.optionPlan ?? null,
+  };
+}
+
+/** 卖权方案夹具（`AdviceItem.option` / `AdviceRow.option`）。 */
+function samplePlan(over: Partial<OptionAdvicePlan> = {}): OptionAdvicePlan {
+  return {
+    strategy: over.strategy ?? 'covered_call',
+    optionType: over.optionType ?? 'call',
+    optionCode: over.optionCode ?? 'AAPL261120C00250000',
+    strike: over.strike ?? 250,
+    expiry: over.expiry ?? '2026-11-20',
+    contracts: over.contracts ?? 1,
+    multiplier: over.multiplier ?? 100,
+    currency: over.currency ?? 'USD',
+    premium: over.premium ?? 3.5,
+    metrics: over.metrics ?? {
+      premiumIncome: 349,
+      staticYieldPct: 1.4,
+      annualizedYieldPct: 12,
+      downsideProtectionPct: 2.1,
+      collateral: 24_500,
+      collateralKind: 'shares',
+      maxProfit: 349,
+      breakeven: 253.5,
+      assignmentProbability: 0.28,
+      liquidityScore: 82,
+      requiredShares: 100,
+    },
+    underlyingPrice: over.underlyingPrice ?? 245,
+    acceptAssignment: over.acceptAssignment ?? true,
+    collateralNote: over.collateralNote ?? 'AAPL 100 股',
+    dataSource: over.dataSource ?? 'CBOE 延迟行情',
+    dataAsOf: over.dataAsOf ?? '2026-10-01T04:00:00.000+08:00',
+    delayed: over.delayed ?? true,
+    warnings: over.warnings ?? [],
+  };
+}
+
+function newOptionContract(over: Partial<NewOptionContract> = {}): NewOptionContract {
+  const id = over.id ?? uid();
+  return {
+    id,
+    adviceId: over.adviceId ?? null,
+    strategy: over.strategy ?? 'covered_call',
+    market: over.market ?? 'US',
+    underlyingCode: over.underlyingCode ?? 'AAPL',
+    underlyingName: over.underlyingName ?? '苹果',
+    underlyingAssetId: over.underlyingAssetId ?? null,
+    optionCode: over.optionCode ?? 'AAPL261120C00250000',
+    optionType: over.optionType ?? 'call',
+    strike: over.strike ?? 250,
+    expiry: over.expiry ?? '2026-11-20',
+    contracts: over.contracts ?? 1,
+    multiplier: over.multiplier ?? 100,
+    currency: over.currency ?? 'USD',
+    premium: over.premium ?? 3.5,
+    fee: over.fee ?? 1,
+    premiumIncome: over.premiumIncome ?? 349,
+    collateralKind: over.collateralKind ?? 'shares',
+    collateral: over.collateral ?? 0,
+    underlyingPriceAtOpen: over.underlyingPriceAtOpen ?? 245,
+    status: over.status ?? 'open',
+    openedAt: over.openedAt ?? '2026-10-01T10:00:00.000+08:00',
+    note: over.note ?? '',
+    createdAt: over.createdAt ?? '2026-10-01T10:00:00.000+08:00',
+    updatedAt: over.updatedAt ?? '2026-10-01T10:00:00.000+08:00',
+  };
+}
+
+function newOptionSettlement(contractId: string, over: Partial<NewOptionSettlement> = {}): NewOptionSettlement {
+  const id = over.id ?? uid();
+  return {
+    id,
+    contractId,
+    expiry: over.expiry ?? '2026-11-20',
+    evaluatedAt: over.evaluatedAt ?? '2026-11-21T06:00:00.000+08:00',
+    referencePrice: over.referencePrice ?? 240,
+    priceSource: over.priceSource ?? 'cboe-close',
+    verdict: over.verdict ?? 'otm_no_assignment',
+    itmAmount: over.itmAmount ?? 0,
+    itmPct: over.itmPct ?? 0,
+    status: over.status ?? 'auto_settled',
+    action: over.action ?? 'none',
+    transactionId: over.transactionId ?? null,
+    assetId: over.assetId ?? null,
+    realizedPnl: over.realizedPnl ?? 349,
+    note: over.note ?? '',
+    createdAt: over.createdAt ?? '2026-11-21T06:00:00.000+08:00',
   };
 }
 
@@ -580,21 +671,48 @@ test('repo: export → import 往返一致（merge 去重 / replace 覆盖）', 
     source.repo.addTransaction(newTx(asset.id, { kind: 'sell', shares: 50, price: 40, tradeDate: '2026-10-08' }));
     source.repo.createWatchItem(newWatch({ code: '09988', market: 'HK' }));
     source.repo.createAdvice(newAdvice({ batchId: 'batch-x' }));
+    // 卖权建议 + 卖出的合约 + 到期结算：三者的持久字段都必须往返。
+    const optionAdvice = source.repo.createAdvice(
+      newAdvice({
+        batchId: 'batch-x',
+        action: 'sell',
+        instrument: 'option',
+        code: 'AAPL',
+        optionPlan: samplePlan(),
+        // 与上一条建议错开秒级时间戳：`created_at` 相同时列表排序不稳定（既有行为）。
+        createdAt: '2026-10-01T10:05:00.000+08:00',
+      }),
+    );
+    const contract = source.repo.createOptionContract(
+      newOptionContract({ adviceId: optionAdvice.id, status: 'assigned', underlyingAssetId: asset.id }),
+    );
+    source.repo.updateOptionContract(contract.id, {
+      closedAt: '2026-11-21T06:00:00.000+08:00',
+      closePrice: 250,
+      realizedPnl: 349,
+    });
+    source.repo.upsertOptionSettlement(newOptionSettlement(contract.id, { verdict: 'assigned', status: 'confirmed' }));
 
     const bundle = source.repo.exportAll();
     assert.equal(bundle.assets.length, 1);
     assert.equal(bundle.transactions.length, 2);
     assert.equal(bundle.watchlist.length, 1);
-    assert.equal(bundle.advice.length, 1);
+    assert.equal(bundle.advice.length, 2);
+    assert.equal(bundle.optionContracts.length, 1);
+    assert.equal(bundle.optionSettlements.length, 1);
+    // instrument 与卖权方案是持久字段：导出必须带上，否则恢复时会静默退化成股票建议。
+    assert.equal(bundle.advice.find((row) => row.instrument === 'option')?.option?.optionCode, 'AAPL261120C00250000');
 
     const merged = target.repo.importAll(bundle, 'merge');
     assert.deepEqual(merged, {
       assets: 1,
       transactions: 2,
       watchlist: 1,
-      advice: 1,
+      advice: 2,
       ipoOffers: 0,
       ipoSubscriptions: 0,
+      optionContracts: 1,
+      optionSettlements: 1,
       skipped: 0,
       mode: 'merge',
     });
@@ -606,7 +724,10 @@ test('repo: export → import 往返一致（merge 去重 / replace 覆盖）', 
     const again = target.repo.importAll(bundle, 'merge');
     assert.equal(again.assets, 0);
     assert.equal(again.transactions, 0);
-    assert.equal(again.skipped, 5);
+    assert.equal(again.optionContracts, 0);
+    assert.equal(again.optionSettlements, 0);
+    // 1 asset + 2 tx + 1 watch + 2 advice + 1 contract + 1 settlement。
+    assert.equal(again.skipped, 8);
 
     // Invalid rows are skipped, valid ones still land.
     const dirty = target.repo.importAll(
@@ -617,22 +738,31 @@ test('repo: export → import 往返一致（merge 去重 / replace 覆盖）', 
         advice: [],
         ipoOffers: [],
         ipoSubscriptions: [],
+        // 张数不是正整数、结算指向不存在的合约 → 都该被丢弃。
+        optionContracts: [{ ...bundle.optionContracts[0]!, id: 'bad-lots', contracts: 1.5 } as never],
+        optionSettlements: [{ ...bundle.optionSettlements[0]!, id: 'orphan-settle', contractId: 'nope' } as never],
       },
       'merge',
     );
     assert.equal(dirty.assets, 0);
     assert.equal(dirty.transactions, 0);
-    assert.equal(dirty.skipped, 2);
+    assert.equal(dirty.optionContracts, 0);
+    assert.equal(dirty.optionSettlements, 0);
+    assert.equal(dirty.skipped, 4);
 
     // `replace` wipes whatever is there first.
     replaced.repo.createAsset(newAsset({ code: 'JUNK' }));
     replaced.repo.createWatchItem(newWatch({ code: 'JUNKW' }));
+    replaced.repo.createOptionContract(newOptionContract({ id: 'junk-contract', underlyingCode: 'JUNK' }));
     const result = replaced.repo.importAll(bundle, 'replace');
     assert.equal(result.mode, 'replace');
     assert.equal(result.assets, 1);
+    assert.equal(result.optionContracts, 1);
+    assert.equal(result.optionSettlements, 1);
     assert.equal(replaced.repo.listAssets().length, 1);
     assert.equal(replaced.repo.findAsset('JUNK', 'CN', 'stock'), undefined);
     assert.equal(replaced.repo.listWatchlist().length, 1);
+    assert.equal(replaced.repo.getOptionContract('junk-contract'), undefined, 'replace 先清空期权表');
     assert.deepEqual(replaced.repo.exportAll(), bundle);
   } finally {
     source.repo.close();
@@ -775,6 +905,10 @@ test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重�
     );
     repo.saveSettings(settingsPatch({ lastRunAt: '2026-10-01T10:00:00.000+08:00' }));
 
+    // 期权也是用户数据：一笔在手合约 + 一条结算记录，清除时必须一起清（含计数）。
+    repo.createOptionContract(newOptionContract({ id: 'option-1' }));
+    repo.upsertOptionSettlement(newOptionSettlement('option-1', { id: 'optsettle-1' }));
+
     const result = repo.clearAllData();
     assert.deepEqual(result, {
       assets: 1,
@@ -792,8 +926,10 @@ test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重�
       kvEntries: 1,
       ipoOffers: 1,
       ipoSubscriptions: 1,
+      optionContracts: 1,
+      optionSettlements: 1,
       settingsReset: false,
-      deleted: 15,
+      deleted: 17,
     });
 
     // 每张表都真的空了。
@@ -804,7 +940,11 @@ test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重�
       advice: [],
       ipoOffers: [],
       ipoSubscriptions: [],
+      optionContracts: [],
+      optionSettlements: [],
     });
+    assert.equal(repo.listOptionContracts({ status: 'all' }).length, 0, '期权合约不得悬挂');
+    assert.equal(repo.listOptionSettlements({ status: 'all' }).length, 0);
     assert.equal(repo.listAdviceOutcomes().length, 0);
     assert.equal(repo.listRuns().length, 0);
     assert.equal(repo.listRunMessages('run-1').length, 0);
@@ -833,5 +973,343 @@ test('repo: clearAllData 逐表清空并计数，默认保留设置 / 可选重�
   } finally {
     repo.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ───────────────────────────── 期权卖权：持久化 ───────────────────────────── */
+
+test('repo: 期权合约 CRUD、筛选与张数校验', () => {
+  const { repo, dir } = tempRepo();
+  try {
+    const asset = repo.createAsset(newAsset({ code: 'AAPL', market: 'US', type: 'stock', currency: 'USD' }));
+    const us = repo.createOptionContract(
+      newOptionContract({
+        id: 'oc-us',
+        underlyingAssetId: asset.id,
+        expiry: '2026-11-20',
+        openedAt: '2026-10-03T10:00:00.000+08:00',
+      }),
+    );
+    repo.createOptionContract(
+      newOptionContract({
+        id: 'oc-hk',
+        market: 'HK',
+        underlyingCode: '00700',
+        underlyingName: '腾讯',
+        currency: 'HKD',
+        optionCode: 'TCH-20261230-660-C',
+        expiry: '2026-12-30',
+        openedAt: '2026-10-01T10:00:00.000+08:00',
+      }),
+    );
+    repo.createOptionContract(
+      newOptionContract({ id: 'oc-old', status: 'expired_otm', expiry: '2026-10-01', openedAt: '2026-09-01T10:00:00.000+08:00' }),
+    );
+
+    // 写入的行原样读回（snake_case ↔ camelCase 映射无误）
+    assert.equal(us.contracts, 1);
+    assert.equal(us.multiplier, 100);
+    assert.equal(us.premiumIncome, 349);
+    assert.equal(us.collateralKind, 'shares');
+    assert.equal(us.status, 'open');
+    assert.equal(us.closedAt, null);
+    assert.equal(us.closePrice, null);
+    assert.equal(us.realizedPnl, null);
+
+    // 默认按 opened_at DESC；`all` 与不传等价（含已到期/已平仓的历史）
+    assert.deepEqual(
+      repo.listOptionContracts().map((row) => row.id),
+      ['oc-us', 'oc-hk', 'oc-old'],
+    );
+    assert.equal(repo.listOptionContracts({ status: 'all' }).length, 3);
+    assert.deepEqual(
+      repo.listOptionContracts({ status: 'open' }).map((row) => row.id),
+      ['oc-us', 'oc-hk'],
+    );
+    assert.deepEqual(
+      repo.listOptionContracts({ market: 'HK' }).map((row) => row.id),
+      ['oc-hk'],
+    );
+    assert.deepEqual(
+      repo.listOptionContracts({ underlyingAssetId: asset.id }).map((row) => row.id),
+      ['oc-us'],
+    );
+    // 到期扫描器：只取 status='open' 且到期日已过的；显式传 status 时以调用方为准。
+    assert.deepEqual(
+      repo.listOptionContracts({ expiringOnOrBefore: '2026-11-30' }).map((row) => row.id),
+      ['oc-us'],
+    );
+    assert.deepEqual(
+      repo.listOptionContracts({ status: 'all', expiringOnOrBefore: '2026-11-30' }).map((row) => row.id),
+      ['oc-us', 'oc-old'],
+    );
+
+    // 平仓：三列可写，updated_at 自动前移
+    const closed = repo.updateOptionContract('oc-us', {
+      status: 'closed',
+      closedAt: '2026-10-20T10:00:00.000+08:00',
+      closePrice: 1.2,
+      realizedPnl: 229,
+      note: '提前买平',
+    });
+    assert.equal(closed?.status, 'closed');
+    assert.equal(closed?.closedAt, '2026-10-20T10:00:00.000+08:00');
+    assert.equal(closed?.closePrice, 1.2);
+    assert.equal(closed?.realizedPnl, 229);
+    assert.equal(closed?.note, '提前买平');
+    assert.notEqual(closed?.updatedAt, us.updatedAt);
+    assert.equal(repo.updateOptionContract('nope', { status: 'closed' }), undefined);
+    assert.equal(repo.getOptionContract('nope'), undefined);
+
+    // 张数必须是正整数：小数会被 SQLite 静默截断，导致权利金与担保额对不上 → 拒绝。
+    for (const bad of [1.5, 0, -2, Number.NaN]) {
+      assert.throws(
+        () => repo.createOptionContract(newOptionContract({ contracts: bad })),
+        (error: unknown) => error instanceof AppError && error.statusCode === 400,
+        `contracts=${String(bad)} 必须被拒绝`,
+      );
+    }
+    assert.equal(repo.createOptionContract(newOptionContract({ contracts: 3 })).contracts, 3);
+
+    // 删合约连带删结算，不留悬挂记录
+    repo.upsertOptionSettlement(newOptionSettlement('oc-hk'));
+    assert.equal(repo.listOptionSettlements({ status: 'all' }).length, 1);
+    assert.equal(repo.deleteOptionContract('oc-hk'), true);
+    assert.equal(repo.listOptionSettlements({ status: 'all' }).length, 0);
+    assert.equal(repo.deleteOptionContract('oc-hk'), false);
+    assert.equal(repo.getOptionContract('oc-hk'), undefined);
+  } finally {
+    repo.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('repo: 删除标的资产保留期权合约，只解绑 underlyingAssetId', () => {
+  const { repo, dir } = tempRepo();
+  try {
+    const asset = repo.createAsset(newAsset({ code: 'AAPL', market: 'US', type: 'stock', currency: 'USD' }));
+    const bound = repo.createOptionContract(
+      newOptionContract({ id: 'oc-bound', underlyingAssetId: asset.id, underlyingCode: 'AAPL' }),
+    );
+    repo.upsertOptionSettlement(newOptionSettlement('oc-bound', { id: 'st-bound', assetId: asset.id }));
+    assert.equal(bound.underlyingAssetId, asset.id);
+    assert.equal(repo.findOptionSettlementByContract('oc-bound')?.assetId, asset.id, '结算行先绑定到该资产');
+
+    assert.equal(repo.deleteAsset(asset.id), true);
+    assert.equal(repo.findAsset('AAPL', 'US', 'stock'), undefined, '资产本身已删除');
+
+    // 卖出的期权是真实义务：合约与结算记录都必须活着，只是解绑资产引用。
+    const after = repo.getOptionContract('oc-bound');
+    assert.ok(after, '期权合约不得随资产级联删除');
+    assert.equal(after?.underlyingAssetId, null, 'underlying_asset_id 必须置空');
+    assert.equal(after?.status, 'open');
+    assert.equal(after?.contracts, 1);
+    // 冗余字段仍在：解绑后标的代码/名称不丢。
+    assert.equal(after?.underlyingCode, 'AAPL');
+    assert.equal(after?.underlyingName, '苹果');
+    // 交割结算行同样保留，只解绑 asset_id（与合约对称）。
+    const settlement = repo.findOptionSettlementByContract('oc-bound');
+    assert.equal(settlement?.id, 'st-bound', '结算记录不受影响');
+    assert.equal(settlement?.assetId, null, 'settlement.asset_id 必须置空');
+    assert.equal(settlement?.realizedPnl, 349, '结算结论本身不动');
+
+    // 不相关的合约不动。
+    const other = repo.createOptionContract(newOptionContract({ id: 'oc-other', underlyingCode: 'MSFT' }));
+    assert.equal(repo.getOptionContract(other.id)?.underlyingAssetId, null);
+  } finally {
+    repo.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('repo: upsertOptionSettlement 按 contract_id 幂等；advice 的 instrument / option_plan 往返', () => {
+  const { repo, dir } = tempRepo();
+  try {
+    repo.createOptionContract(newOptionContract({ id: 'oc-1' }));
+    const first = repo.upsertOptionSettlement(newOptionSettlement('oc-1', { id: 'st-1', note: '首次扫描' }));
+    const second = repo.upsertOptionSettlement(
+      newOptionSettlement('oc-1', { id: 'st-2', status: 'pending_review', verdict: 'uncertain', note: '重扫' }),
+    );
+    assert.equal(repo.listOptionSettlements({ status: 'all' }).length, 1, '同一合约只能有一条结算');
+    assert.equal(first.id, 'st-1');
+    assert.equal(second.id, 'st-1', '重扫复用首条 id，不产生第二条');
+    assert.equal(second.note, '重扫');
+    assert.equal(second.status, 'pending_review');
+    assert.equal(second.verdict, 'uncertain');
+    assert.equal(second.createdAt, first.createdAt, '重扫不改首条 created_at');
+    assert.equal(repo.findOptionSettlementByContract('oc-1')?.id, 'st-1');
+    assert.equal(repo.findOptionSettlementByContract('nope'), undefined);
+
+    // 筛选：status / contractId / expiry
+    repo.createOptionContract(newOptionContract({ id: 'oc-2', expiry: '2026-12-30' }));
+    repo.upsertOptionSettlement(
+      newOptionSettlement('oc-2', { id: 'st-2', expiry: '2026-12-30', status: 'dismissed', action: 'pending' }),
+    );
+    assert.deepEqual(
+      repo.listOptionSettlements({ status: 'all' }).map((row) => row.id).sort(),
+      ['st-1', 'st-2'],
+    );
+    assert.deepEqual(
+      repo.listOptionSettlements({ status: 'pending_review' }).map((row) => row.id),
+      ['st-1'],
+    );
+    assert.deepEqual(
+      repo.listOptionSettlements({ contractId: 'oc-2' }).map((row) => row.id),
+      ['st-2'],
+    );
+    assert.deepEqual(
+      repo.listOptionSettlements({ expiry: '2026-12-30' }).map((row) => row.id),
+      ['st-2'],
+    );
+
+    const patched = repo.updateOptionSettlement('st-2', {
+      status: 'confirmed',
+      action: 'shares_delivered',
+      transactionId: 'tx-9',
+      assetId: 'asset-9',
+      realizedPnl: -1200,
+    });
+    assert.equal(patched?.status, 'confirmed');
+    assert.equal(patched?.action, 'shares_delivered');
+    assert.equal(patched?.transactionId, 'tx-9');
+    assert.equal(patched?.assetId, 'asset-9');
+    assert.equal(patched?.realizedPnl, -1200);
+    assert.equal(repo.updateOptionSettlement('nope', { status: 'confirmed' }), undefined);
+
+    // advice：instrument 默认 stock；卖权建议带 optionPlan，读回是解析后的对象
+    const plain = repo.createAdvice(newAdvice({ id: 'adv-stock' }));
+    assert.equal(plain.instrument, 'stock');
+    assert.equal(plain.option, null);
+    const opt = repo.createAdvice(
+      newAdvice({ id: 'adv-opt', action: 'sell', instrument: 'option', code: 'AAPL', optionPlan: samplePlan() }),
+    );
+    assert.equal(opt.instrument, 'option');
+    assert.equal(opt.action, 'sell');
+    assert.equal(opt.option?.optionCode, 'AAPL261120C00250000');
+    assert.equal(opt.option?.metrics.premiumIncome, 349);
+    assert.deepEqual(repo.getAdvice('adv-opt')?.option, samplePlan());
+
+    // 清空/改写方案：null → 空串落库 → 读回 null（`option_plan` 是 NOT NULL 列）
+    assert.equal(repo.updateAdvice('adv-opt', { option: null })?.option, null);
+    assert.equal(repo.getAdvice('adv-opt')?.option, null);
+    assert.equal(repo.updateAdvice('adv-opt', { instrument: 'stock' })?.instrument, 'stock');
+    assert.equal(repo.updateAdvice('adv-opt', { option: samplePlan({ strike: 260 }) })?.option?.strike, 260);
+    assert.equal(repo.updateAdvice('nope', { instrument: 'option' }), undefined);
+  } finally {
+    repo.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('repo: advice.option_plan 空串读回 null，坏 JSON 不抛也不会拖垮列表', () => {
+  const { repo, dir } = tempRepo();
+  const dbPath = path.join(dir, 'advisor.db');
+  const adviceId = 'adv-raw';
+  try {
+    repo.createAdvice(newAdvice({ id: adviceId }));
+    assert.equal(repo.getAdvice(adviceId)?.option, null, '空串必须映射成 null（不能 JSON.parse 空串）');
+  } finally {
+    repo.close();
+  }
+  // 直接改库，模拟半截写入 / 手工改坏的数据。
+  const raw = new DatabaseSync(dbPath);
+  raw.prepare('UPDATE advice SET option_plan = ? WHERE id = ?').run('{"strategy":', adviceId);
+  raw.close();
+  const reopened = createRepo(dbPath);
+  reopened.migrate();
+  try {
+    assert.equal(reopened.getAdvice(adviceId)?.option, null, '坏 JSON 降级成 null 而不是抛错');
+    assert.equal(reopened.listAdvice().length, 1, '一条脏数据不得影响列表读取');
+  } finally {
+    reopened.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('backup service: 期权合约/结算与 option 设置往返，source=option 不被降级', () => {
+  const { repo, dir } = tempRepo();
+  const target = tempRepo();
+  try {
+    const asset = repo.createAsset(newAsset({ code: 'AAPL', market: 'US', type: 'stock', currency: 'USD' }));
+    repo.createAdvice(newAdvice({ id: 'adv-opt', action: 'sell', instrument: 'option', code: 'AAPL', optionPlan: samplePlan() }));
+    repo.createOptionContract(newOptionContract({ id: 'oc-1', underlyingAssetId: asset.id, adviceId: 'adv-opt' }));
+    repo.upsertOptionSettlement(
+      newOptionSettlement('oc-1', {
+        id: 'st-1',
+        status: 'confirmed',
+        verdict: 'assigned',
+        action: 'shares_delivered',
+        transactionId: 'tx-opt',
+      }),
+    );
+    // 到期交割流水：source='option' 必须原样往返，否则恢复后被静默降级成 manual。
+    repo.addTransaction(newTx(asset.id, { id: 'tx-opt', kind: 'sell', shares: 100, price: 250, source: 'option' }));
+    repo.saveSettings(
+      settingsPatch({ option: { cash: { HK: 12000, US: 5000 }, settlementMode: 'manual', runWithPipeline: false } }),
+    );
+
+    const payload = buildBackupPayload(repo);
+    assert.equal(payload.optionContracts?.length, 1);
+    assert.equal(payload.optionSettlements?.length, 1);
+    assert.equal(payload.optionContracts?.[0]?.premiumIncome, 349);
+    assert.equal(payload.optionContracts?.[0]?.settlement?.status, 'confirmed', '合约自带结算结论');
+    assert.equal(payload.optionSettlements?.[0]?.priceSource, 'cboe-close');
+    assert.equal(payload.settings?.option.cash.HK, 12000);
+    assert.equal(payload.settings?.option.settlementMode, 'manual');
+    assert.equal(payload.settings?.option.runWithPipeline, false);
+    assert.equal(payload.transactions.find((tx) => tx.id === 'tx-opt')?.source, 'option');
+
+    const result = importBackupPayload(target.repo, payload, 'merge');
+    assert.equal(result.optionContracts, 1);
+    assert.equal(result.optionSettlements, 1);
+    const restored = target.repo.getOptionContract('oc-1');
+    assert.equal(restored?.premiumIncome, 349);
+    assert.equal(restored?.adviceId, 'adv-opt');
+    assert.equal(restored?.underlyingAssetId, asset.id);
+    assert.equal(restored?.status, 'open');
+    const restoredSettlement = target.repo.findOptionSettlementByContract('oc-1');
+    assert.equal(restoredSettlement?.verdict, 'assigned');
+    assert.equal(restoredSettlement?.transactionId, 'tx-opt');
+    assert.equal(target.repo.getAdvice('adv-opt')?.instrument, 'option', '导入不得把卖权建议退化成股票建议');
+    assert.equal(target.repo.getAdvice('adv-opt')?.option?.optionCode, 'AAPL261120C00250000');
+    assert.equal(target.repo.listTransactions().find((tx) => tx.id === 'tx-opt')?.source, 'option');
+    assert.deepEqual(target.repo.getSettings().option, {
+      cash: { HK: 12000, US: 5000 },
+      settlementMode: 'manual',
+      runWithPipeline: false,
+    });
+
+    // 幂等：同一 payload 再导入一次不产生第二份
+    const again = importBackupPayload(target.repo, payload, 'merge');
+    assert.equal(again.optionContracts, 0);
+    assert.equal(again.optionSettlements, 0);
+    assert.equal(target.repo.listOptionContracts({ status: 'all' }).length, 1);
+    assert.equal(target.repo.listOptionSettlements({ status: 'all' }).length, 1);
+
+    // 老备份（完全没有期权字段）：按空数组处理，不报错、不清空已有期权数据。
+    const legacy = { ...payload, optionContracts: undefined, optionSettlements: undefined };
+    const validated = validateBackupPayload(legacy);
+    assert.equal(validated.optionContracts, undefined);
+    const legacyResult = importBackupPayload(target.repo, legacy, 'merge');
+    assert.equal(legacyResult.optionContracts, 0);
+    assert.equal(legacyResult.optionSettlements, 0);
+    assert.equal(target.repo.listOptionContracts({ status: 'all' }).length, 1, '缺字段的老备份不得清掉期权持仓');
+
+    // 半截 option 设置：缺的字段保持现值，只覆盖给出的市场现金。
+    const partial = {
+      ...payload,
+      settings: { ...payload.settings!, option: { cash: { US: 777 } } },
+    };
+    importBackupPayload(target.repo, partial, 'merge');
+    assert.deepEqual(target.repo.getSettings().option, {
+      cash: { HK: 12000, US: 777 },
+      settlementMode: 'manual',
+      runWithPipeline: false,
+    });
+  } finally {
+    repo.close();
+    target.repo.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(target.dir, { recursive: true, force: true });
   }
 });

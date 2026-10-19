@@ -12,12 +12,13 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { AgentRunKind, AgentRunSummary } from '@aia/shared';
 import { randomUUID } from 'node:crypto';
 import { notFound, notConfigured } from '../errors.js';
-import { getAgent, getRepo } from '../registry.js';
+import { getAgent, getRepo, getScheduler } from '../registry.js';
 import { openSse } from './sse.js';
 import { NOT_CONFIGURED_MESSAGE } from '../agent/llm.js';
 import type { AgentRunRequest, AgentRuntime, LoggerLike } from '../types/agent.js';
 import { runAssetAnalysis, runIpoAnalysis, runWatchlistAnalysis, type PipelineContext } from '../services/analytics.js';
 import { latestRunSummary, runFullPipeline } from '../services/advice.js';
+import { AUTO_RETRY_MAX_ATTEMPTS } from '../services/auto-retry.js';
 import { runExclusive } from '../services/pipeline-lock.js';
 
 function loggerOf(app: FastifyInstance): LoggerLike {
@@ -125,6 +126,8 @@ function parseKind(raw: unknown): AgentRunKind | undefined {
     'asset-analysis',
     'watchlist-analysis',
     'ipo-analysis',
+    // 期权卖权阶段：独立 run kind，活动页可按它筛选（漏加会静默忽略 ?kind= 过滤）。
+    'option-advice',
     'advice',
     'chat',
     'scheduled',
@@ -157,6 +160,19 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
   });
 
   /* ── run history ───────────────────────────────────────────────────────── */
+
+  /**
+   * 定时流水线的自动续跑状态（前端「未完成」提示条据此避免重复手动续跑）。
+   *
+   * `pending=null` 表示当前没有排期的续跑；`maxAttempts` 是固定的重试上限。
+   * 没有调度器（例如只装配了 app 的测试）时也返回合法结构，绝不 500。
+   */
+  app.get('/api/agent/retry', async () => {
+    return {
+      pending: getScheduler()?.retryState() ?? null,
+      maxAttempts: AUTO_RETRY_MAX_ATTEMPTS,
+    };
+  });
 
   app.get('/api/agent/runs', async (request) => {
     const query = (request.query ?? {}) as Record<string, string>;

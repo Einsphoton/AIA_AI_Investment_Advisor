@@ -45,13 +45,16 @@ export type TxKind = 'buy' | 'sell';
  * `ipo` = 打新中签缴款自动入账（`POST /api/ipo/:id/allot`）：金额与份额由中签结果决定，
  * 与人工录入、AI 建议、建议确认区分开，便于在交易记录里追溯来源。
  */
-export type TxSource = 'manual' | 'ai' | 'advice' | 'ipo';
+/** `option` = 期权到期行权/被行权自动写入的股票交割流水（见 OptionSettlement）。 */
+export type TxSource = 'manual' | 'ai' | 'advice' | 'ipo' | 'option';
 
 /** Kind of autonomous agent run. */
 export type AgentRunKind =
   | 'asset-analysis'
   | 'watchlist-analysis'
   | 'ipo-analysis'
+  /** 期权卖权：结合持仓与期权链筛选「安全收权利金」的合约并给出建议。 */
+  | 'option-advice'
   | 'advice'
   | 'chat'
   | 'scheduled'
@@ -81,6 +84,10 @@ export type SourceId =
   | 'aastocks'
   /** 纳斯达克官方 IPO 日历（零 Key）。 */
   | 'nasdaq'
+  /** CBOE 延迟期权链（零 Key，美股期权报价 + 希腊字母 + 未平仓）。 */
+  | 'cboe'
+  /** 港交所每日收市报告（零 Key，港股期权结算价 / 未平仓 / IV 与标的收市价）。 */
+  | 'hkex'
   | 'bing'
   | 'duckduckgo'
   | 'tavily'
@@ -128,6 +135,33 @@ export interface BudgetConfig {
   CN: number;
   HK: number;
   US: number;
+}
+
+/* ──────────────────────────────── options ─────────────────────────────────── */
+
+/**
+ * 期权卖权的到期结算模式。
+ *
+ * - `auto`  ：结论明确（实值/虚值离行权价有明显距离）且行情数据足够新时，
+ *             结算器直接把股票交割流水写进「我的资产」；贴行权价、跨假期、
+ *             上游取不到价等模糊情况一律转 `pending_review`（待用户确认）。
+ * - `manual`：任何情况都只生成待确认记录，必须由用户点确认才入账。
+ */
+export type OptionSettlementMode = 'auto' | 'manual';
+
+/** 期权卖权相关设置（settings.option）。 */
+export interface OptionSettings {
+  /**
+   * 各市场可用现金（本币：HKD / USD）。
+   *
+   * 现金担保卖 Put 需要足额占用行权价 × 乘数 × 张数，而这个应用不跟踪证券账户
+   * 现金余额，所以必须由用户填写；0 表示未填写，此时建议不会给出无法覆盖的
+   * 卖 Put（并在 warnings 里说明缺口）。
+   */
+  cash: { HK: number; US: number };
+  settlementMode: OptionSettlementMode;
+  /** 是否把期权阶段挂在「AI 投资建议」流水线里一起跑。 */
+  runWithPipeline: boolean;
 }
 
 /**
@@ -236,6 +270,8 @@ export interface Settings {
   toolPolicy: ToolPolicy;
   /** Configured MCP servers (may be empty). */
   mcpServers: McpServerConfig[];
+  /** 期权卖权设置（可用现金 / 到期结算模式）。 */
+  option: OptionSettings;
   updatedAt: string;
 }
 
@@ -253,6 +289,8 @@ export interface SettingsInput {
   watchlistRetireDeleteRuns?: number;
   toolPolicy?: Partial<ToolPolicy>;
   mcpServers?: McpServerConfig[];
+  /** 期权卖权设置：可用现金（分市场）+ 到期结算模式。 */
+  option?: Partial<OptionSettings> & { cash?: Partial<OptionSettings['cash']> };
   /** Send an empty string to keep the stored key; send null to clear it. */
   apiKey?: string | null;
 }
@@ -516,6 +554,13 @@ export interface AdviceItem {
   code: string;
   market: Market;
   type: InstrumentType;
+  /**
+   * 标的是股票/ETF/基金，还是期权合约。
+   *
+   * `stock` 时下面所有股票字段照旧；`option` 时 `shares/targetPrice` 仍然给出
+   * 等价的股数与每股权利金（便于列表统一渲染），完整合约条件见 `option`。
+   */
+  instrument: AdviceInstrument;
   action: AdviceAction;
   /**
    * 建议依据的池子。池外建议意味着它跳过了「AI 标的分析」的质量分门槛，
@@ -536,6 +581,8 @@ export interface AdviceItem {
   /** Filled when the advice was confirmed into the portfolio. */
   executedShares: number | null;
   executedPrice: number | null;
+  /** 期权卖权方案（instrument='option' 时非空）。 */
+  option: OptionAdvicePlan | null;
 }
 
 export interface ConfirmAdviceInput {
@@ -543,6 +590,358 @@ export interface ConfirmAdviceInput {
   price: number;
   tradeDate?: string;
   fee?: number;
+}
+
+/* ─────────────────────── 期权卖权：建议 / 持仓 / 结算 ─────────────────────── */
+
+/**
+ * 建议标的的种类。
+ *
+ * `stock` = 买入/卖出股票（原有行为，未改动）；`option` = 卖出期权收权利金。
+ * 两者共用 `advice` 表与同一套 确认 / 驳回 流程，靠这一列分流入账路径：
+ * `stock` 写股票交易流水，`option` 写 `option_contracts`。
+ */
+export type AdviceInstrument = 'stock' | 'option';
+
+/** 期权合约方向。 */
+export type OptionType = 'call' | 'put';
+
+/**
+ * 卖权策略。
+ *
+ * - `covered_call`     覆盖式卖 Call：用「我的资产」的持股做担保收权利金；
+ *                      首要目标是把权利金落袋，被行权即按行权价交股。
+ * - `cash_secured_put` 现金担保卖 Put：标的足够划算时才做，被行权即按行权价
+ *                      收股（这才是「收股」的正解——收股权金归你）。
+ */
+export type OptionStrategy = 'covered_call' | 'cash_secured_put';
+
+/** 只做港股与美股期权（A 股无个股期权，不做）。 */
+export type OptionMarket = 'HK' | 'US';
+
+/** 卖出合约的生命周期。 */
+export type OptionPositionStatus =
+  /** 持有中（卖出开仓后未到期、未平仓）。 */
+  | 'open'
+  /** 提前买平（buy to close）。 */
+  | 'closed'
+  /** 到期被行权（call 交股 / put 收股）。 */
+  | 'assigned'
+  /** 到期虚值，权利金全部落袋。 */
+  | 'expired_otm';
+
+/** 担保物种类：持股（覆盖式卖 Call）或现金（现金担保卖 Put）。 */
+export type OptionCollateralKind = 'shares' | 'cash';
+
+/** 期权链上的一条归一化报价（买卖价差的单位是「每股价」）。 */
+export interface OptionQuote {
+  /** 标准合约标识，例如 `AAPL261120C00250000` 或 `TCH-20251127-660-C`。 */
+  code: string;
+  type: OptionType;
+  strike: number;
+  /** YYYY-MM-DD。 */
+  expiry: string;
+  /** 每股价：买价 / 卖价 / 最新成交价（上游缺失时 0）。 */
+  bid: number;
+  ask: number;
+  last: number;
+  /** 结算价（港股为 HKEX 每日结算价；美股为 CBOE 理论价 theo）。 */
+  settlement: number;
+  /** 隐含波动率（小数，0.31 = 31%）；0 = 上游未给出（港股仅平值系列有值）。 */
+  iv: number;
+  delta: number;
+  openInterest: number;
+  volume: number;
+  /** 每张合约对应的标的股数（美股 100；港股按 HKEX 合约乘数）。 */
+  multiplier: number;
+  /** 中间价；买卖价缺失时为 0。 */
+  mid: number;
+  /** 买卖价差占中间价的百分比；缺报价时为 0。 */
+  spreadPct: number;
+}
+
+/** 期权链上的一个到期日。 */
+export interface OptionExpiryGroup {
+  /** YYYY-MM-DD。 */
+  expiry: string;
+  /** 距到期的自然日（数据抓取日 → 到期日）。 */
+  daysToExpiry: number;
+  /** 该到期的合约条数。 */
+  contracts: number;
+  /** 平值隐含波动率；上游未提供时为 0。 */
+  atmIv: number;
+}
+
+/**
+ * 一次期权链抓取的完整快照。
+ *
+ * `delayed` / `source` / `warnings` 必须原样展示给用户：卖权的定价完全依赖这些
+ * 数字，用户有权知道它们是不是延迟行情、来自哪个上游。
+ */
+export interface OptionChainSnapshot {
+  market: OptionMarket;
+  /** 标的代码（港股为 5 位数字如 00700，美股为 AAPL）。 */
+  code: string;
+  name: string;
+  /** 标的现价（判断实值/虚值与安全垫的基准）。 */
+  underlyingPrice: number;
+  currency: string;
+  /** 抓取时间（ISO 8601）。 */
+  asOf: string;
+  /** 是否为延迟/收盘口径行情。 */
+  delayed: boolean;
+  /** 上游口径说明，例如「CBOE 延迟行情」「HKEX 每日收市报告」。 */
+  source: string;
+  expiries: OptionExpiryGroup[];
+  quotes: OptionQuote[];
+  warnings: string[];
+}
+
+/**
+ * 一个候选合约的**确定性**指标。
+ *
+ * 全部由服务端按快照机械算出（可复算、幂等），AI 只能引用不能改写 —— 与
+ * 股票建议里「预算上限由系统校验」同一思路：钱相关的数字不能靠模型自觉。
+ */
+export interface OptionCandidateMetrics {
+  /** 权利金收入合计 = 每股价 × 乘数 × 张数 − 费用。 */
+  premiumIncome: number;
+  /** 静态收益率（%）= 权利金 / 占用资金。 */
+  staticYieldPct: number;
+  /** 年化收益率（%）= 静态收益率 × 365 / 剩余自然日。 */
+  annualizedYieldPct: number;
+  /** 安全垫（%）：虚值幅度，卖 Call 与卖 Put 都取正数（越小越容易被行权）。 */
+  downsideProtectionPct: number;
+  /** 占用资金/担保额（覆盖式卖 Call = 对应股数市值；卖 Put = 行权价 × 乘数 × 张数）。 */
+  collateral: number;
+  collateralKind: OptionCollateralKind;
+  /** 最大收益 = 权利金收入（不含股票端盈亏）。 */
+  maxProfit: number;
+  /** 盈亏平衡价：卖 Call = 行权价 + 权利金；卖 Put = 行权价 − 权利金。 */
+  breakeven: number;
+  /** 被行权概率代理 = |delta|（0-1）。 */
+  assignmentProbability: number;
+  /** 流动性评分 0-100（价差 + 未平仓 + 成交量）。 */
+  liquidityScore: number;
+  /** 覆盖式卖 Call 需要的最小持股数 = 乘数 × 张数。 */
+  requiredShares: number;
+}
+
+/** AI 写在建议里的卖权方案（`AdviceItem.option`）。 */
+export interface OptionAdvicePlan {
+  strategy: OptionStrategy;
+  optionType: OptionType;
+  /** 标准合约标识（用户最终确认时可以改价与到期日，但不能改标的/方向）。 */
+  optionCode: string;
+  strike: number;
+  /** YYYY-MM-DD。 */
+  expiry: string;
+  /** 建议张数。 */
+  contracts: number;
+  multiplier: number;
+  currency: string;
+  /** 建议的每股价（权利金）；确认弹窗里用户可改。 */
+  premium: number;
+  /** 确定性指标（服务端算好，AI 引用）。 */
+  metrics: OptionCandidateMetrics;
+  /** 决策时的标的现价。 */
+  underlyingPrice: number;
+  /** 是否接受被行权（卖 Call = 交股；卖 Put = 收股）。 */
+  acceptAssignment: boolean;
+  /** 担保物说明（哪只持仓的多少股 / 哪个市场的多少现金）。 */
+  collateralNote: string;
+  /** 数据口径：上游名称、抓取时间、是否延迟。 */
+  dataSource: string;
+  dataAsOf: string;
+  delayed: boolean;
+  /** 数据缺失与降级提示，必须原样展示。 */
+  warnings: string[];
+}
+
+/** 确认一条期权建议时的输入（确认弹窗里填的最终合约条件）。 */
+export interface ConfirmOptionAdviceInput {
+  contracts: number;
+  /** 最终确认的合约价格（每股价）。 */
+  premium: number;
+  /** 最终确认的到期日（用户可调整，例如港股到期日是按合约月推算的）。 */
+  expiry: string;
+  /** 行权价（默认沿用建议值，用户可微调）。 */
+  strike?: number;
+  fee?: number;
+  tradeDate?: string;
+  note?: string;
+}
+
+/** 到期结算的判定结论。 */
+export type OptionSettlementVerdict =
+  /** 虚值到期：不会被行权，权利金全额落袋。 */
+  | 'otm_no_assignment'
+  /** 实值到期：按行权价交割股票（覆盖式卖 Call 交股 / 卖 Put 收股）。 */
+  | 'assigned'
+  /** 判定不了（价格贴行权价 / 取不到结算价 / 跨假期等），必须人工确认。 */
+  | 'uncertain';
+
+export type OptionSettlementStatus =
+  /** 结论明确，已自动入账。 */
+  | 'auto_settled'
+  /** 等待用户确认后才入账。 */
+  | 'pending_review'
+  /** 用户已确认（可能改了行权结果）。 */
+  | 'confirmed'
+  /** 用户已忽略（例如交易所有临时调整，或用户已在券商端处理）。 */
+  | 'dismissed';
+
+/** 一条到期结算记录（`option_settlements`，每个合约一条，幂等）。 */
+export interface OptionSettlement {
+  id: string;
+  contractId: string;
+  expiry: string;
+  evaluatedAt: string;
+  /** 结算参考价：到期日收盘价（美股）或 HKEX 结算价/收市价（港股）。 */
+  referencePrice: number;
+  /** 参考价口径与来源，必须展示。 */
+  priceSource: string;
+  verdict: OptionSettlementVerdict;
+  /** 实值金额（每股）：实值时为正。 */
+  itmAmount: number;
+  /** 实值占行权价的百分比。 */
+  itmPct: number;
+  status: OptionSettlementStatus;
+  /** 实际写入账本的动作。 */
+  action: 'none' | 'shares_delivered' | 'shares_received' | 'pending';
+  /** 生成的股票交易流水 id（交股/收股时非空）。 */
+  transactionId: string | null;
+  /** 关联/新建的资产 id。 */
+  assetId: string | null;
+  /** 该合约的最终已实现盈亏（权利金 + 股票端交割盈亏；未结算时为 0）。 */
+  realizedPnl: number;
+  /** 结论说明（含为什么转人工确认）。 */
+  note: string;
+  createdAt: string;
+}
+
+/** 一笔在手的卖出合约（`option_contracts`）及其实时派生字段。 */
+export interface OptionPosition {
+  id: string;
+  /** 来源建议（手工登记时为空）。 */
+  adviceId: string | null;
+  strategy: OptionStrategy;
+  market: OptionMarket;
+  underlyingCode: string;
+  underlyingName: string;
+  /** 关联的「我的资产」持仓 id（覆盖式卖 Call 必有）。 */
+  underlyingAssetId: string | null;
+  optionCode: string;
+  optionType: OptionType;
+  strike: number;
+  expiry: string;
+  contracts: number;
+  multiplier: number;
+  currency: string;
+  /** 卖出时的每股价权利金。 */
+  premium: number;
+  fee: number;
+  /** 权利金总收入 = premium × multiplier × contracts − fee。 */
+  premiumIncome: number;
+  collateralKind: OptionCollateralKind;
+  /** 担保额/占用资金。 */
+  collateral: number;
+  /** 卖出时的标的现价。 */
+  underlyingPriceAtOpen: number;
+  status: OptionPositionStatus;
+  openedAt: string;
+  closedAt: string | null;
+  /** 提前买平的每股价。 */
+  closePrice: number | null;
+  /** 已实现盈亏（平仓或结算后才有值，否则为 null）。 */
+  realizedPnl: number | null;
+  /** 权利金浮盈（按当前价与卖出价的差 × 乘数 × 张数）。 */
+  unrealizedPnl: number;
+  /** 距到期自然日（已过期为负数）。 */
+  daysToExpiry: number;
+  /** 最新标的价（取不到时沿用卖出时价格并置 warnings）。 */
+  underlyingPrice: number;
+  moneyness: 'itm' | 'otm' | 'atm' | 'unknown';
+  /** 到期结算记录（若已评估）。 */
+  settlement: OptionSettlement | null;
+  note: string;
+}
+
+/** 期权卖权页面的汇总（顶部 KPI）。 */
+export interface OptionPortfolioSummary {
+  openContracts: number;
+  /** 在手合约的权利金总收入。 */
+  premiumIncome: number;
+  /** 已实现权利金（含到期落袋与提前平仓）。 */
+  realizedPremium: number;
+  /** 到期被行权次数。 */
+  assignedCount: number;
+  /** 待人工确认的结算记录数。 */
+  pendingSettlements: number;
+  /** 按市场分组的担保占用。 */
+  collateralByMarket: { market: OptionMarket; currency: string; amount: number }[];
+}
+
+export interface OptionPositionsResponse {
+  items: OptionPosition[];
+  summary: OptionPortfolioSummary;
+  /** 取数失败等非致命问题，必须原样展示。 */
+  warnings: string[];
+}
+
+export interface OptionSettlementsResponse {
+  items: OptionSettlement[];
+  warnings: string[];
+}
+
+/** 触发一次到期结算扫描的结果。 */
+export interface OptionSettlementRunResult {
+  /** 本次扫描过的到期合约数。 */
+  scanned: number;
+  autoSettled: number;
+  pendingReview: number;
+  /** 结算记录（含新建与已存在的）。 */
+  settlements: OptionSettlement[];
+  warnings: string[];
+}
+
+/** 一个卖权候选：期权链报价 + 服务端算好的确定性指标。 */
+export interface OptionCandidate {
+  strategy: OptionStrategy;
+  quote: OptionQuote;
+  metrics: OptionCandidateMetrics;
+}
+
+/** `GET /api/options/candidates` 的响应（确定性筛选，不经过 LLM）。 */
+export interface OptionCandidatesResponse {
+  market: OptionMarket;
+  code: string;
+  currency: string;
+  underlyingPrice: number;
+  asOf: string;
+  delayed: boolean;
+  source: string;
+  candidates: OptionCandidate[];
+  /** 被筛选规则挡掉的合约与机器可读原因（界面可展开说明「为什么没推荐」）。 */
+  rejected: { code: string; reason: string }[];
+  warnings: string[];
+}
+
+/** `POST /api/options/analyze` 的回执。 */
+export interface OptionAnalyzeResponse {
+  runId: string;
+}
+
+/**
+ * `POST /api/advice/:id/confirm-option` 的回执。
+ *
+ * 与股票确认（返回 `{ advice, asset }`）分开：期权确认创建的是合约而不是持仓，
+ * 不能复用那条写账本路径。
+ */
+export interface ConfirmOptionAdviceResult {
+  advice: AdviceItem;
+  position: OptionPosition;
+  warnings: string[];
 }
 
 /* ── 建议结果追踪（确定性，不经过 LLM） ─────────────────────────────────────── */
@@ -1460,6 +1859,9 @@ export interface BackupPayload {
   /** 新股打新：打新标的与我的申购记录（老备份没有这两项，读取时按空数组处理）。 */
   ipoOffers?: IpoOffer[];
   ipoSubscriptions?: IpoSubscription[];
+  /** 期权卖权：卖出的合约与到期结算记录（老备份没有，读取时按空数组处理）。 */
+  optionContracts?: OptionPosition[];
+  optionSettlements?: OptionSettlement[];
   runs?: AgentRunSummary[];
   settings?: Omit<Settings, 'llm'> & { llm: Omit<LlmConfig, 'apiKey'> };
 }
@@ -1471,6 +1873,9 @@ export interface ImportResult {
   advice: number;
   ipoOffers: number;
   ipoSubscriptions: number;
+  /** 期权卖权：导入的卖出合约数与结算记录数。 */
+  optionContracts: number;
+  optionSettlements: number;
   skipped: number;
   mode: ImportMode;
 }
@@ -1495,6 +1900,10 @@ export interface ClearDataResult {
   ipoOffers: number;
   /** 新股打新：我的申购 / 中签记录。 */
   ipoSubscriptions: number;
+  /** 期权卖权：卖出的合约（含已到期/已平仓的历史）。 */
+  optionContracts: number;
+  /** 期权卖权：到期结算记录。 */
+  optionSettlements: number;
   runs: number;
   steps: number;
   runMessages: number;

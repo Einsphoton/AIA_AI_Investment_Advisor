@@ -21,6 +21,7 @@ import type { AgentTrace } from '@aia/shared';
 import { conflict, notFound } from '../errors.js';
 import { getAgent, getRepo } from '../registry.js';
 import { openSse } from './sse.js';
+import { hasAutoResumedMark } from '../services/auto-retry.js';
 import { runExclusive } from '../services/pipeline-lock.js';
 import type { LoggerLike } from '../types/agent.js';
 
@@ -56,6 +57,8 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
     // Both checks must happen before the stream opens to keep a real status code.
     if (!row) throw notFound(`运行记录 ${id} 不存在`);
     if (row.status === 'done') throw conflict(`运行记录 ${id} 已完成，无需续跑`);
+    // 定时流水线已自动续跑成功：同一份轨迹再跑一遍只会重复烧 token（见 auto-retry.ts）。
+    if (hasAutoResumedMark(row.error)) throw conflict(`运行记录 ${id} 已由系统自动续跑成功，无需再次续跑`);
     await streamResume(app, reply, id);
   });
 }

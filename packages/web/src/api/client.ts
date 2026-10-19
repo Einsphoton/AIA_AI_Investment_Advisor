@@ -21,6 +21,8 @@ import type {
   ChatSession,
   ClearDataResult,
   ConfirmAdviceInput,
+  ConfirmOptionAdviceInput,
+  ConfirmOptionAdviceResult,
   CreateAssetInput,
   CreateTransactionInput,
   CreateWatchItemInput,
@@ -39,6 +41,19 @@ import type {
   IpoUpsertInput,
   MacroSnapshot,
   NewsItem,
+  OptionAnalyzeResponse,
+  OptionCandidatesResponse,
+  OptionChainSnapshot,
+  OptionMarket,
+  OptionPosition,
+  OptionPositionsResponse,
+  OptionSettlement,
+  OptionSettlementRunResult,
+  OptionSettlementStatus,
+  OptionSettlementsResponse,
+  OptionSettlementVerdict,
+  OptionStrategy,
+  OptionType,
   PendingWrite,
   ProfileResponse,
   Quote,
@@ -140,6 +155,77 @@ export interface WatchlistQuery extends AssetListQuery {
   status?: 'active' | 'retired' | 'all';
 }
 
+/** `GET /api/options/settlements` 的筛选值：`all` + 四种结算状态。 */
+export type OptionSettlementQueryStatus = 'all' | OptionSettlementStatus;
+
+/**
+ * `POST /api/options/positions` 的请求体（手工补录一笔卖出合约）。
+ *
+ * 契约里没有单独的 shared 类型：它是「登记」而不是派生计算，字段与
+ * `OptionPosition` 的可写部分一一对应。`optionCode` 是合约标识、`code` 是标的代码。
+ */
+export interface CreateOptionPositionInput {
+  market: OptionMarket;
+  /** 标的代码（港股 5 位数字 / 美股 ticker）。 */
+  code: string;
+  underlyingName?: string;
+  strategy: OptionStrategy;
+  optionType: OptionType;
+  optionCode: string;
+  strike: number;
+  expiry: string;
+  contracts: number;
+  premium: number;
+  fee?: number;
+  multiplier?: number;
+  tradeDate?: string;
+  note?: string;
+}
+
+/* ─────────────── 定时流水线的自动续跑（GET /api/agent/retry） ─────────────── */
+
+/**
+ * 一条**已排队**的自动续跑。
+ *
+ * 背景：定时流水线跑在 API 进程内，因可重试错误（上游超时、连接被掐）失败后，
+ * 服务端会自己排队在约 2 / 10 / 30 分钟后从落库的消息轨迹接着跑，最多 3 次，
+ * 且跨进程重启保留。前端拿到它只有两个用途：告诉用户「系统会自己重试」，
+ * 以及**别再给这条失败 run 显示「一键续跑」**（手动点一下会和服务端的自动重试
+ * 并发跑同一条流水线，token 烧两份）。
+ *
+ * 为什么类型定义在前端而不是 `@aia/shared`：目前只有 `InterruptedRunsAlert` 一个
+ * 消费方，放进 shared 只会多一个两边同步的公共面；出现第二个消费方时再上提。
+ * 字段与 `docs/API.md` 的 `GET /api/agent/retry` 一一对应。
+ */
+export interface AgentRetryPending {
+  /** `resume`：从断点续跑已有 run；`pipeline`：整条定时流水线重新执行。 */
+  kind: 'resume' | 'pipeline';
+  /** 即将执行的那一次，1 起算。 */
+  attempt: number;
+  /** 该流水线的最大尝试次数（服务端固定 3）。 */
+  maxAttempts: number;
+  /** ISO 时间戳：下一次自动执行的时间。 */
+  nextRunAt: string;
+  /** 本次会被接续的失败 run id；`kind === 'pipeline'` 时为空数组。 */
+  failedRunIds: string[];
+  /** 涉及的定时任务名，用于说明「是谁在重试」。 */
+  taskNames: string[];
+  /** 最近一次失败的原因（服务端截断后的文本）。 */
+  lastError: string;
+}
+
+/**
+ * `GET /api/agent/retry` 的响应。
+ *
+ * `pending === null` 表示当前没有排队的自动续跑；老版本服务端没有这个端点时
+ * 请求会失败，调用方必须按「没有排队」降级处理（见 `InterruptedRunsAlert`）。
+ */
+export interface AgentRetryState {
+  pending: AgentRetryPending | null;
+  /** 服务端配置的最大尝试次数（前端兜底显示用）。 */
+  maxAttempts: number;
+}
+
 export const api = {
   health: () =>
     request<{ ok: boolean; version: string; commit: string; builtAt: string; webBuilt: boolean }>('/health'),
@@ -216,6 +302,14 @@ export const api = {
     reject: (id: string) => request<AdviceItem>(`/advice/${encodeURIComponent(id)}/reject`, json({})),
     confirm: (id: string, input: ConfirmAdviceInput) =>
       request<{ advice: AdviceItem; asset: AssetDetail }>(`/advice/${encodeURIComponent(id)}/confirm`, json(input)),
+    /**
+     * 确认一条**期权**建议：写入的是卖出合约（`option_contracts`），不是股票持仓。
+     *
+     * 与股票确认分开是契约级的设计：入账路径不同（合约 vs 交易流水），
+     * 返回体也不同（`{ advice, position }` vs `{ advice, asset }`）。
+     */
+    confirmOption: (id: string, input: ConfirmOptionAdviceInput) =>
+      request<ConfirmOptionAdviceResult>(`/advice/${encodeURIComponent(id)}/confirm-option`, json(input)),
     last: () => request<AgentRunSummary | null>('/advice/last'),
     budget: () => request<BudgetStatus>('/budget'),
     /** 建议结果追踪（确定性、不调用 LLM）：逐条实际表现 + 胜率统计。 */
@@ -246,6 +340,39 @@ export const api = {
     lastAnalysis: () => request<AgentRunSummary | null>('/ipo/analyze/last'),
   },
 
+  /* ── options 期权卖权（港股 / 美股） ────────────────────────────────────── */
+  options: {
+    /** 期权链快照：`delayed` / `source` / `asOf` 必须原样展示（卖权定价全靠它）。 */
+    chain: (args: { market: OptionMarket; code: string; maxExpiries?: number; refresh?: boolean }) =>
+      request<OptionChainSnapshot>(
+        `/options/chain${qs({ market: args.market, code: args.code, maxExpiries: args.maxExpiries, refresh: args.refresh ? 1 : undefined })}`,
+      ),
+    /** 确定性筛选出的卖权候选（不经过 LLM）。 */
+    candidates: (args: { market: OptionMarket; code: string; limit?: number }) =>
+      request<OptionCandidatesResponse>(`/options/candidates${qs(args)}`),
+    /** 专门跑一次「AI 期权卖权建议」（SSE 走全局推理面板）。 */
+    analyze: (input: { markets?: OptionMarket[]; codes?: string[] } = {}) =>
+      request<OptionAnalyzeResponse>('/options/analyze', json(input)),
+    positions: () => request<OptionPositionsResponse>('/options/positions'),
+    position: (id: string) => request<OptionPosition>(`/options/positions/${encodeURIComponent(id)}`),
+    /** 手工补录一笔卖出合约（计划外成交）。 */
+    createPosition: (input: CreateOptionPositionInput) => request<OptionPosition>('/options/positions', json(input)),
+    /** 买平（buy to close）。 */
+    closePosition: (id: string, input: { price: number; fee?: number; tradeDate?: string; note?: string }) =>
+      request<OptionPosition>(`/options/positions/${encodeURIComponent(id)}/close`, json(input)),
+    /** 对单个合约立即跑一次到期结算。 */
+    settlePosition: (id: string) =>
+      request<OptionSettlementRunResult>(`/options/positions/${encodeURIComponent(id)}/settle`, json({})),
+    settlements: (status: OptionSettlementQueryStatus = 'all') =>
+      request<OptionSettlementsResponse>(`/options/settlements${qs({ status })}`),
+    /** 扫描所有已到期合约（到期自动跟踪行权并更新「我的资产」）。 */
+    scanSettlements: () => request<OptionSettlementRunResult>('/options/settlements/scan', json({})),
+    confirmSettlement: (id: string, input: { verdict: OptionSettlementVerdict; referencePrice?: number; note?: string }) =>
+      request<OptionSettlementRunResult>(`/options/settlements/${encodeURIComponent(id)}/confirm`, json(input)),
+    dismissSettlement: (id: string, input: { note?: string } = {}) =>
+      request<OptionSettlement>(`/options/settlements/${encodeURIComponent(id)}/dismiss`, json(input)),
+  },
+
   /* ── market ───────────────────────────────────────────────────────────── */
   market: {
     search: (q: string, market?: string) => request<InstrumentSearchResult[]>(`/market/search${qs({ q, market })}`),
@@ -267,6 +394,12 @@ export const api = {
   agent: {
     runs: (limit = 20, kind?: string) => request<AgentRunSummary[]>(`/agent/runs${qs({ limit, kind })}`),
     run: (id: string) => request<AgentRun>(`/agent/runs/${encodeURIComponent(id)}`),
+    /**
+     * 定时流水线的自动续跑状态（`pending` 非空 = 服务端已排队一次自动重试）。
+     * 调用方要容忍它失败（旧服务端 404 / 网络抖动），按「没有排队」渲染即可，
+     * 绝不能让它连累基于 `runs` 的失败提示条。
+     */
+    retryState: () => request<AgentRetryState>('/agent/retry'),
     tools: () =>
       request<{ name: string; description: string; parameters: Record<string, unknown>; risk?: ToolRisk; source?: string }[]>(
         '/agent/tools',

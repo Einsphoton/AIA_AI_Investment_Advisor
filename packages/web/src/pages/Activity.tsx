@@ -31,6 +31,8 @@ const KIND_OPTIONS: { value: string; label: string }[] = [
   { value: '', label: '全部类型' },
   { value: 'asset-analysis', label: 'asset-analysis（资产分析）' },
   { value: 'watchlist-analysis', label: 'watchlist-analysis（标的分析）' },
+  { value: 'ipo-analysis', label: 'ipo-analysis（打新分析）' },
+  { value: 'option-advice', label: 'option-advice（期权卖权）' },
   { value: 'advice', label: 'advice（投资建议）' },
   { value: 'chat', label: 'chat（对话）' },
   { value: 'scheduled', label: 'scheduled（定时）' },

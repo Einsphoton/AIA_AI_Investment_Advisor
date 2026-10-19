@@ -10,9 +10,14 @@
  */
 import {
   DEFAULT_WATCHLIST_RETIRE_DELETE_RUNS,
+  HK_OPTION_MULTIPLIER_FALLBACK,
   MARKET_CURRENCY,
+  OPTION_SCREEN_RULES,
+  OPTION_STRATEGY_LABELS,
+  OPTION_TYPE_LABELS,
   PERSONA_MAP,
   REPORT_STYLE_MAP,
+  US_OPTION_MULTIPLIER,
   type AdviceAction,
   type AgentEvent,
   type AgentRunKind,
@@ -21,6 +26,11 @@ import {
   type IpoAdviceVerdict,
   type IpoMarketStatus,
   type Market,
+  type OptionChainSnapshot,
+  type OptionMarket,
+  type OptionQuote,
+  type OptionStrategy,
+  type OptionType,
   type ToolRisk,
 } from '@aia/shared';
 import type { EventSink, LoggerLike, ToolDescriptor } from '../types/agent.js';
@@ -38,9 +48,11 @@ import {
   groundingWarning,
 } from './validation.js';
 import * as ds from '../datasources/registry.js';
+import { optionMultiplier } from '../datasources/options.js';
 import { compactFinancials } from '../datasources/financials.js';
 import { fundInfo } from '../datasources/fund.js';
 import { fetchUrl } from '../datasources/websearch.js';
+import { buildOptionAdvicePlan, loadOptionChain, screenOptionCandidates } from '../services/options.js';
 import {
   ipoOfferDetail,
   ipoUid,
@@ -1180,6 +1192,666 @@ const createAdvice: RegisteredTool = {
   },
 };
 
+/* ───────────────────────────── 期权卖权 tools ─────────────────────────────── */
+
+/** 单条建议的张数上限：防止模型写「1000 张」把担保额算爆（也防止浮点溢出式荒谬输入）。 */
+const OPTION_CONTRACT_LIMIT = 50;
+/** `list_option_chain` 返回的合约条数上限（`MAX_RESULT_CHARS` 会把超长 JSON 从中间截断，必须自己限条）。 */
+const OPTION_CHAIN_QUOTE_LIMIT = 24;
+const OPTION_CHAIN_QUOTE_DEFAULT = 16;
+
+/** 期权链上一条报价 → 紧凑表示（只留决策需要的字段，控制单次返回体积）。 */
+function compactOptionQuote(quote: OptionQuote): Record<string, unknown> {
+  return {
+    code: quote.code,
+    type: quote.type,
+    strike: quote.strike,
+    expiry: quote.expiry,
+    bid: quote.bid,
+    ask: quote.ask,
+    mid: quote.mid,
+    ...(quote.iv > 0 ? { iv: quote.iv } : {}),
+    delta: quote.delta,
+    openInterest: quote.openInterest,
+    multiplier: quote.multiplier,
+    spreadPct: quote.spreadPct,
+    ...(quote.last > 0 ? { last: quote.last } : {}),
+    ...(quote.volume > 0 ? { volume: quote.volume } : {}),
+  };
+}
+
+/**
+ * 卖出期权建议的**零歧义算术**校验（持股覆盖 / 现金担保）。
+ *
+ * 抽成纯函数的好处：`create_option_advice` 用它硬拦，测试也能直接覆盖边界而不用联网。
+ * 口径（与 shared 的 OptionCandidateMetrics 注释一致）：
+ *   · covered_call     需要 乘数 × 张数 ≤ 实际持股（担保物是股票，股数不足就是裸卖 Call）；
+ *   · cash_secured_put 需要 行权价 × 乘数 × 张数 ≤ 该市场「期权可用现金」（现金担保）；
+ *     可用现金为 0 视为**未填写**（不是「没有风险」），必须提示用户去设置页填写。
+ */
+export interface OptionCoverageResult {
+  ok: boolean;
+  code?: 'insufficient_shares' | 'insufficient_cash' | 'no_cash';
+  message?: string;
+  details?: Record<string, unknown>;
+}
+
+export function checkOptionCoverage(input: {
+  strategy: OptionStrategy;
+  market: OptionMarket;
+  currency: string;
+  multiplier: number;
+  strike: number;
+  contracts: number;
+  heldShares: number;
+  availableCash: number;
+}): OptionCoverageResult {
+  const { strategy, market, currency, multiplier, strike, contracts, heldShares, availableCash } = input;
+  const requiredShares = multiplier * contracts;
+  if (strategy === 'covered_call') {
+    if (heldShares + 1e-6 < requiredShares) {
+      const maxContracts = Math.floor(heldShares / multiplier + 1e-9);
+      return {
+        ok: false,
+        code: 'insufficient_shares',
+        message:
+          `覆盖式卖 Call 需要 ${requiredShares} 股（${multiplier} 股/张 × ${contracts} 张），当前实际持股仅 ${heldShares} 股。` +
+          (maxContracts >= 1
+            ? `最多只能卖 ${maxContracts} 张，请按这个张数重写建议。`
+            : '持股不足 1 张的覆盖量，请改为不写这条建议（或先买入正股）。'),
+        details: { requiredShares, heldShares, maxContracts: Math.max(0, maxContracts), multiplier },
+      };
+    }
+    return { ok: true };
+  }
+  const collateral = strike * multiplier * contracts;
+  if (!(availableCash > 0)) {
+    return {
+      ok: false,
+      code: 'no_cash',
+      message:
+        `设置里「期权可用现金」${market} 为 0（未填写），无法校验现金担保卖 Put 的担保额 ${round(collateral)} ${currency}。` +
+        '请提示用户到设置页填写该市场的期权可用现金，或改做覆盖式卖 Call。',
+      details: { collateral, availableCash: 0, currency },
+    };
+  }
+  if (collateral > availableCash + 1e-6) {
+    const maxContracts = Math.floor(availableCash / (strike * multiplier) + 1e-9);
+    return {
+      ok: false,
+      code: 'insufficient_cash',
+      message:
+        `本笔担保额 ${round(collateral)} ${currency}（行权价 ${strike} × ${multiplier} 股/张 × ${contracts} 张）超过可用现金 ${round(availableCash)} ${currency}。` +
+        (maxContracts >= 1
+          ? `按该行权价最多只能卖 ${maxContracts} 张，请按这个张数重写建议。`
+          : '可用现金不足以按该行权价卖 1 张，请换更虚值的行权价，或提示用户增加现金。'),
+      details: { collateral, availableCash, maxContracts: Math.max(0, maxContracts), currency },
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * 某个候选**最多能卖几张**（服务端担保物口径，零歧义算术）。
+ *
+ *   · covered_call     = 持股数 ÷ 乘数
+ *   · cash_secured_put = 该市场可用现金 ÷ (行权价 × 乘数)
+ *
+ * 与 `checkOptionCoverage` 同一公式，并同样受 `OPTION_CONTRACT_LIMIT` 约束。
+ * 把它算给模型的原因是：模型默认只卖 1 张，然后把「1 张只有几十港元权利金」当成
+ * 「绝对收入太小」而放弃整个策略 —— 收入与张数成正比，可卖张数必须由服务端算准。
+ */
+export function optionMaxContracts(input: {
+  strategy: OptionStrategy;
+  multiplier: number;
+  strike: number;
+  heldShares: number;
+  availableCash: number;
+}): number {
+  const { strategy, multiplier, strike, heldShares, availableCash } = input;
+  if (!(multiplier > 0)) return 0;
+  const raw = strategy === 'covered_call' ? heldShares / multiplier : availableCash / (strike * multiplier);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(Math.floor(raw + 1e-9), OPTION_CONTRACT_LIMIT);
+}
+
+const listOptionChain: RegisteredTool = {
+  descriptor: {
+    name: 'list_option_chain',
+    description:
+      '读取港股/美股个股期权链（真实报价）。返回该标的的到期日概览 + **最接近现价**的一批合约（买价/卖价/中间价/IV/delta/未平仓/乘数/价差）。' +
+      '数据口径（source / asOf / delayed / warnings）必须原样引用；返回里的数字才是可用证据，不要自己拼合约代码或编行权价。' +
+      '结果默认按「行权价离现价最近」排序并截断，用 expiry / optionType / minStrike / maxStrike / limit 收窄。',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: '标的代码（港股 5 位如 00700，美股如 AAPL）' },
+        market: { type: 'string', enum: ['HK', 'US'], description: '只支持港股/美股（A 股无个股期权）' },
+        expiry: { type: 'string', description: '只看某个到期日（YYYY-MM-DD），省略则返回全部到期日概览 + 各到期最近的合约' },
+        optionType: { type: 'string', enum: ['call', 'put'], description: '只看 Call 或 Put' },
+        minStrike: { type: 'number', description: '行权价下限（可选）' },
+        maxStrike: { type: 'number', description: '行权价上限（可选）' },
+        maxExpiries: { type: 'number', description: '最多返回几个到期日（默认 6，上限 12）' },
+        limit: { type: 'number', description: `返回多少条合约（默认 ${OPTION_CHAIN_QUOTE_DEFAULT}，上限 ${OPTION_CHAIN_QUOTE_LIMIT}）` },
+        refresh: { type: 'boolean', description: '忽略缓存强制刷新（默认 false；同一天重复抓取很贵）' },
+      },
+      required: ['code', 'market'],
+    },
+  },
+  async handler(args) {
+    const code = str(args, 'code');
+    if (!code) return fail('缺少代码', 'bad_request', 'code 必填（港股 5 位如 00700，美股如 AAPL）。');
+    const market = marketArg(args);
+    if (market !== 'HK' && market !== 'US') {
+      return fail('不支持该市场的期权', 'unsupported_market', `期权链只支持港股/美股（当前 market=${market}）；A 股没有个股期权。`);
+    }
+    const rawExpiries = optNum(args, 'maxExpiries');
+    const maxExpiries = Math.min(Math.max(1, Math.round(rawExpiries ?? 6)), 12);
+    const rawLimit = optNum(args, 'limit');
+    const limit = Math.min(Math.max(1, Math.round(rawLimit ?? OPTION_CHAIN_QUOTE_DEFAULT)), OPTION_CHAIN_QUOTE_LIMIT);
+    const typeFilter = str(args, 'optionType').toLowerCase();
+    const expiryFilter = str(args, 'expiry');
+    const minStrike = optNum(args, 'minStrike');
+    const maxStrike = optNum(args, 'maxStrike');
+
+    let snapshot: OptionChainSnapshot;
+    try {
+      snapshot = await loadOptionChain({ market, code, maxExpiries, forceRefresh: args.refresh === true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return fail('期权链获取失败', 'upstream_failed', `${code}（${market}）期权链取不到：${message}。结论里请写「数据缺失：期权链——${message}」，不要编造合约。`);
+    }
+
+    const underlying = snapshot.underlyingPrice;
+    const filtered = snapshot.quotes.filter(
+      (quote) =>
+        (!expiryFilter || quote.expiry === expiryFilter) &&
+        (!typeFilter || quote.type === typeFilter) &&
+        (minStrike === undefined || quote.strike >= minStrike) &&
+        (maxStrike === undefined || quote.strike <= maxStrike),
+    );
+    // 卖权只关心离现价近的行权价：按 |strike − 现价| 排序，同距时先 call 后 put 保持稳定。
+    const sorted = [...filtered].sort(
+      (a, b) =>
+        Math.abs(a.strike - underlying) - Math.abs(b.strike - underlying) ||
+        a.strike - b.strike ||
+        (a.type === b.type ? 0 : a.type === 'call' ? -1 : 1),
+    );
+    const selected = sorted.slice(0, limit);
+    const truncated = filtered.length > selected.length;
+    const warnings = [...snapshot.warnings];
+    if (snapshot.quotes.length === 0) {
+      warnings.push('上游返回了空的期权链（可能非交易日、该标的无期权或上游口径变化）；不要编造任何合约。');
+    }
+    if (expiryFilter && snapshot.expiries.every((group) => group.expiry !== expiryFilter)) {
+      warnings.push(`请求的到期日 ${expiryFilter} 不在可用到期日里：${snapshot.expiries.map((group) => group.expiry).join('、')}。`);
+    }
+    return ok(
+      `期权链 ${snapshot.name || code}：${snapshot.expiries.length} 个到期日，筛选后 ${filtered.length} 条，返回最接近现价（${underlying}）的 ${selected.length} 条`,
+      {
+        market,
+        code,
+        name: snapshot.name,
+        underlyingPrice: underlying,
+        currency: snapshot.currency,
+        asOf: snapshot.asOf,
+        delayed: snapshot.delayed,
+        source: snapshot.source,
+        warnings,
+        expiries: snapshot.expiries,
+        quotes: selected.map(compactOptionQuote),
+        total: filtered.length,
+        truncated,
+        ...(truncated
+          ? { hint: '结果已截断：用 expiry / optionType / minStrike / maxStrike / limit 收窄后重新查询。' }
+          : {}),
+      },
+    );
+  },
+};
+
+const screenOptionCandidatesTool: RegisteredTool = {
+  descriptor: {
+    name: 'screen_option_candidates',
+    description:
+      '按「安全收权利金」规则**确定性筛选**某只港股/美股标的的卖权候选（服务端算好权利金收入、静态/年化收益率、安全垫、被行权概率、流动性分、担保额）。' +
+      '担保物由服务端从「我的资产」与设置里的期权可用现金读取，不采信你声明的持股/现金：' +
+      'covered_call 自动按实际持股过滤（乘数 × 张数 ≤ 持股），cash_secured_put 自动按该市场可用现金过滤（行权价 × 乘数 × 张数 ≤ 现金）。' +
+      '被挡掉的合约会进 rejected 并给出原因。候选数字可直接引用，但写建议前仍应 list_option_chain 核对选中合约的报价。' +
+      `每个候选都返回 maxContracts（按担保物算好的最大张数，上限 ${OPTION_CONTRACT_LIMIT}）：决定张数时用它，` +
+      '不要默认只卖 1 张 —— 权利金收入与张数成正比。',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: '标的代码（港股 5 位如 00700，美股如 AAPL）' },
+        market: { type: 'string', enum: ['HK', 'US'] },
+        strategy: {
+          type: 'string',
+          enum: ['covered_call', 'cash_secured_put'],
+          description: '只看某一种策略；省略则两种都筛（覆盖式卖 Call / 现金担保卖 Put）',
+        },
+        contracts: { type: 'number', description: `按多少张计算担保与权利金（正整数，默认 1，上限 ${OPTION_CONTRACT_LIMIT}）` },
+        limit: { type: 'number', description: '最多返回几个候选（默认按 OPTION_SCREEN_RULES.maxCandidatesPerUnderlying，上限 12）' },
+      },
+      required: ['code', 'market'],
+    },
+  },
+  async handler(args, ctx) {
+    const code = str(args, 'code');
+    if (!code) return fail('缺少代码', 'bad_request', 'code 必填。');
+    const market = marketArg(args);
+    if (market !== 'HK' && market !== 'US') {
+      return fail('不支持该市场的期权', 'unsupported_market', `卖权筛选只支持港股/美股（当前 market=${market}）。`);
+    }
+    const contracts = Math.round(num(args, 'contracts', 1));
+    if (!Number.isInteger(contracts) || contracts <= 0 || contracts > OPTION_CONTRACT_LIMIT) {
+      return fail('张数非法', 'bad_request', `contracts 必须是 1–${OPTION_CONTRACT_LIMIT} 的整数（收到 ${num(args, 'contracts')}）。`);
+    }
+    const strategyArg = str(args, 'strategy').toLowerCase();
+    const strategies: OptionStrategy[] =
+      strategyArg === 'covered_call' || strategyArg === 'cash_secured_put'
+        ? [strategyArg]
+        : ['covered_call', 'cash_secured_put'];
+    const rawLimit = optNum(args, 'limit');
+    const limit = Math.min(
+      Math.max(1, Math.round(rawLimit ?? OPTION_SCREEN_RULES.maxCandidatesPerUnderlying)),
+      12,
+    );
+
+    // 担保数据一律服务端读，不信模型声明（与 create_advice 的预算校验同一思路）。
+    const heldAsset = ctx.repo.findAsset(code, market, 'stock') ?? ctx.repo.findAsset(code, market, 'etf');
+    const heldShares = heldAsset ? computePosition(ctx.repo.listTransactions(heldAsset.id)).shares : 0;
+    let availableCash = 0;
+    const warnings: string[] = [];
+    try {
+      availableCash = ctx.repo.getSettings().option.cash[market];
+    } catch {
+      warnings.push('读取设置失败，无法确认「期权可用现金」；现金担保卖 Put 本次不会给出候选。');
+      availableCash = 0;
+    }
+
+    let snapshot: OptionChainSnapshot;
+    try {
+      snapshot = await loadOptionChain({
+        market,
+        code,
+        name: heldAsset?.name,
+        underlyingPrice: heldAsset && heldAsset.price > 0 ? heldAsset.price : undefined,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return fail('期权链获取失败', 'upstream_failed', `${code}（${market}）期权链取不到：${message}。结论里请写「数据缺失：期权链——${message}」。`);
+    }
+
+    const screened = strategies.map((strategy) => ({
+      strategy,
+      result: screenOptionCandidates({ snapshot, strategy, contracts, heldShares, availableCash }),
+    }));
+    const candidates = screened
+      .flatMap((entry) => entry.result.candidates)
+      .sort((a, b) => b.metrics.annualizedYieldPct - a.metrics.annualizedYieldPct)
+      .slice(0, limit);
+    const rejected = screened.flatMap((entry) => entry.result.rejected).slice(0, 10);
+    for (const entry of screened) warnings.push(...entry.result.warnings);
+    warnings.unshift(...snapshot.warnings);
+    if (heldShares > 0 && strategies.includes('covered_call')) {
+      // 提示可用覆盖量，模型据此决定张数，减少 create_option_advice 被拒的次数。
+      warnings.push(`当前持股 ${heldShares} 股（覆盖率按合约乘数计算，具体每张股数见候选的 multiplier）。`);
+    }
+    const currency = snapshot.currency;
+    return ok(
+      `卖权候选 ${snapshot.name || code}（${market}）：${candidates.length} 个通过筛选` +
+        (candidates.length > 0 ? `，年化收益率最高 ${candidates[0]!.metrics.annualizedYieldPct}%` : '') +
+        `；担保数据：持股 ${heldShares} 股 / 可用现金 ${availableCash} ${currency}`,
+      {
+        market,
+        code,
+        name: snapshot.name,
+        underlyingPrice: snapshot.underlyingPrice,
+        currency,
+        asOf: snapshot.asOf,
+        delayed: snapshot.delayed,
+        source: snapshot.source,
+        contracts,
+        heldShares,
+        availableCash,
+        rules: OPTION_SCREEN_RULES,
+        candidates: candidates.map((candidate) => ({
+          strategy: candidate.strategy,
+          strategyLabel: OPTION_STRATEGY_LABELS[candidate.strategy],
+          ...compactOptionQuote(candidate.quote),
+          metrics: candidate.metrics,
+          /**
+           * 该候选按担保物最多能卖几张（服务端算好，模型直接引用）。
+           * metrics.premiumIncome 是**按本次 contracts 张数**算的，模型必须用这个数字放大到实际张数。
+           */
+          maxContracts: optionMaxContracts({
+            strategy: candidate.strategy,
+            multiplier: candidate.quote.multiplier,
+            strike: candidate.quote.strike,
+            heldShares,
+            availableCash,
+          }),
+        })),
+        rejected,
+        warnings: [...new Set(warnings)],
+        ...(candidates.length === 0
+          ? {
+              hint:
+                '没有候选通过筛选规则：复核 availableCash / 持股是否足够、IV 是否过低、价差是否过宽；' +
+                '若确实没有安全收权利金的合约，如实说明，不要写建议。',
+            }
+          : {}),
+      },
+    );
+  },
+};
+
+const createOptionAdvice: RegisteredTool = {
+  // 复用 advice 写域：卖权建议落在 advice 表（instrument='option' + option_plan），
+  // 确认成交走 /api/advice/:id/confirm-option，不新开写域（AllowWrite 四处硬编码都不用动）。
+  requiresWrite: 'advice',
+  descriptor: {
+    name: 'create_option_advice',
+    kinds: ['option-advice'],
+    description:
+      '写入一条待确认的**卖出期权**建议（covered_call 覆盖式卖 Call / cash_secured_put 现金担保卖 Put）。' +
+      '合约条件必须来自 list_option_chain / screen_option_candidates 的真实返回（optionCode / strike / expiry / premium / 乘数），严禁自己拼接或编造。' +
+      '系统会机械校验（服务端读实际持股与设置里的可用现金，不信你声明的数字）：市场仅限港股/美股；strategy 与 optionType 必须自洽；' +
+      '覆盖式卖 Call 的 乘数 × 张数 不得超过实际持股；现金担保卖 Put 的 行权价 × 乘数 × 张数 不得超过该市场可用现金；到期日必须是未来日期。' +
+      '被拒绝时会返回 maxContracts / requiredShares 等可改正的数字，请按提示重写。' +
+      '建议只是「待确认」：真实卖出由用户在期权确认弹窗里填写最终条件后确认，你不能声称已经卖出。',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: '标的代码（港股 5 位如 00700，美股如 AAPL）' },
+        market: { type: 'string', enum: ['HK', 'US'] },
+        strategy: { type: 'string', enum: ['covered_call', 'cash_secured_put'] },
+        optionType: { type: 'string', enum: ['call', 'put'], description: 'covered_call→call；cash_secured_put→put（系统会校验一致）' },
+        optionCode: { type: 'string', description: '标准合约标识，必须原样来自期权链返回' },
+        strike: { type: 'number', description: '行权价（来自期权链，必须与 optionCode 一致）' },
+        expiry: { type: 'string', description: '到期日 YYYY-MM-DD（来自期权链，必须是未来日期）' },
+        contracts: { type: 'number', description: `建议卖出张数（1–${OPTION_CONTRACT_LIMIT} 的整数）` },
+        premium: { type: 'number', description: '每股权利金（来自期权链的 bid/mid；不要用 last 或自己估）' },
+        reason: { type: 'string', description: 'Markdown 理由：必须引用工具返回的数字（年化收益、安全垫、delta、事件风险、最坏情形）' },
+        confidence: { type: 'number', description: '0-1' },
+        acceptAssignment: { type: 'boolean', description: '是否接受被行权（卖 Call 交股 / 卖 Put 收股），默认 true' },
+        collateralNote: { type: 'string', description: '担保物说明：哪只持仓的多少股 / 哪个市场的多少现金' },
+        assetId: { type: 'string', description: '覆盖式卖 Call 对应的持仓资产 id（可省略，按 code 反查）' },
+      },
+      required: ['code', 'market', 'strategy', 'optionType', 'optionCode', 'strike', 'expiry', 'contracts', 'premium', 'reason'],
+    },
+  },
+  async handler(args, ctx) {
+    const code = str(args, 'code');
+    if (!code) return fail('缺少代码', 'bad_request', 'code 必填（填标的代码，不是期权合约代码）。');
+    const market = marketArg(args);
+    if (market !== 'HK' && market !== 'US') {
+      return fail('不支持该市场的期权', 'unsupported_market', `只做港股/美股期权（当前 market=${market}）；A 股没有个股期权。`);
+    }
+    const strategy = str(args, 'strategy').toLowerCase() as OptionStrategy;
+    if (strategy !== 'covered_call' && strategy !== 'cash_secured_put') {
+      return fail('strategy 无效', 'bad_request', 'strategy 必须是 covered_call 或 cash_secured_put。');
+    }
+    const optionType = str(args, 'optionType').toLowerCase() as OptionType;
+    const wantType: OptionType = strategy === 'covered_call' ? 'call' : 'put';
+    if (optionType !== wantType) {
+      return fail(
+        '策略与期权方向矛盾',
+        'strategy_mismatch',
+        `${strategy} 只能卖 ${wantType}（收到 optionType=${optionType || '空'}）。覆盖式卖 Call = covered_call + call；现金担保卖 Put = cash_secured_put + put。`,
+      );
+    }
+    const optionCode = str(args, 'optionCode');
+    const strike = num(args, 'strike');
+    const expiry = str(args, 'expiry');
+    const contracts = num(args, 'contracts');
+    const premium = num(args, 'premium');
+    const reason = str(args, 'reason');
+    if (!optionCode) return fail('缺少合约代码', 'bad_request', 'optionCode 必填，必须来自 list_option_chain 的返回。');
+    if (!(strike > 0) || !(premium > 0) || !reason) {
+      return fail('参数不完整', 'bad_request', 'strike / premium 必须为正数，reason 必填（引用工具返回的具体数据）。');
+    }
+    if (!Number.isInteger(contracts) || contracts <= 0 || contracts > OPTION_CONTRACT_LIMIT) {
+      return fail('张数非法', 'bad_request', `contracts 必须是 1–${OPTION_CONTRACT_LIMIT} 的整数（收到 ${num(args, 'contracts')}）。`);
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(expiry)) {
+      return fail('到期日格式错误', 'bad_request', `expiry 必须是 YYYY-MM-DD（收到 ${expiry || '空'}），请用期权链返回的到期日。`);
+    }
+    const expiryAt = Date.parse(`${expiry}T00:00:00Z`);
+    const daysToExpiry = Math.floor((expiryAt - Date.now()) / 86_400_000);
+    if (!Number.isFinite(expiryAt) || daysToExpiry <= 0) {
+      return fail(
+        '合约已到期或今日到期',
+        'expiry_passed',
+        `${optionCode} 到期日 ${expiry} 不是未来日期，无法卖出开仓；请换一个到期日。`,
+      );
+    }
+
+    // ── 机械校验 ①：乘数（同步查合约规格表，不联网；未核对的标的回退并告警）──
+    const warnings: string[] = [];
+    const fallbackMultiplier = market === 'US' ? US_OPTION_MULTIPLIER : HK_OPTION_MULTIPLIER_FALLBACK;
+    const multiplierInfo = optionMultiplier(market, code);
+    const estimatedMultiplier = multiplierInfo.multiplier > 0 ? multiplierInfo.multiplier : fallbackMultiplier;
+    if (!multiplierInfo.verified) {
+      warnings.push(
+        market === 'US'
+          ? `合约乘数未能核对，按美股标准 ${fallbackMultiplier} 股/张估算；请用户以券商合约规格为准。`
+          : `港股合约乘数各标的不同（${code}），未能核对，先按 ${fallbackMultiplier} 股/张估算；取到期权链后按链上乘数复核，请用户以券商合约规格为准。`,
+      );
+    }
+    // ── 机械校验 ②：担保物由服务端从 repo 取，不信模型声明 ──
+    const requestedAssetId = str(args, 'assetId');
+    const requestedAsset = requestedAssetId ? ctx.repo.getAsset(requestedAssetId) : undefined;
+    // 只接受「与该标的同代码」的持仓：模型传错 assetId 时不能拿别的持仓来凑担保。
+    const matchedAsset =
+      requestedAsset && requestedAsset.code.toUpperCase() === code.toUpperCase() ? requestedAsset : undefined;
+    const heldAsset = matchedAsset ?? ctx.repo.findAsset(code, market, 'stock') ?? ctx.repo.findAsset(code, market, 'etf');
+    const heldShares = heldAsset ? computePosition(ctx.repo.listTransactions(heldAsset.id)).shares : 0;
+    let availableCash = 0;
+    if (strategy === 'cash_secured_put') {
+      try {
+        availableCash = ctx.repo.getSettings().option.cash[market];
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return fail('读取设置失败，无法校验现金担保', 'settings_unavailable', `读不到期权可用现金：${message}；请提示用户检查设置页。`);
+      }
+    }
+    const currency = MARKET_CURRENCY[market];
+    const coverage = checkOptionCoverage({
+      strategy,
+      market,
+      currency,
+      multiplier: estimatedMultiplier,
+      strike,
+      contracts,
+      heldShares,
+      availableCash,
+    });
+    if (!coverage.ok) {
+      return fail(
+        coverage.code === 'insufficient_shares'
+          ? '持股不足以覆盖卖 Call'
+          : coverage.code === 'no_cash'
+            ? '未填写期权可用现金'
+            : '现金不足以担保卖 Put',
+        coverage.code!,
+        coverage.message!,
+        coverage.details,
+      );
+    }
+
+    // ── 合约身份核对：optionCode 必须真的在期权链里，避免模型拼错代码/行权价 ──
+    let snapshot: OptionChainSnapshot;
+    try {
+      snapshot = await loadOptionChain({
+        market,
+        code,
+        name: heldAsset?.name,
+        underlyingPrice: heldAsset && heldAsset.price > 0 ? heldAsset.price : undefined,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return fail(
+        '期权链获取失败，无法核对合约',
+        'upstream_failed',
+        `${code}（${market}）期权链取不到：${message}。请先调用 list_option_chain 确认数据可用；仍不可用就说明「数据缺失：期权链」而不是写一条无法核对的建议。`,
+      );
+    }
+    const quote = snapshot.quotes.find((entry) => entry.code.toUpperCase() === optionCode.toUpperCase());
+    if (!quote) {
+      return fail(
+        '合约不在当前期权链中',
+        'contract_not_found',
+        `期权链里没有 ${optionCode}（共 ${snapshot.quotes.length} 条报价）。请先 list_option_chain 取准确的 optionCode / strike / expiry，不要自己拼合约代码。`,
+        { sampleCodes: snapshot.quotes.slice(0, 5).map((entry) => entry.code) },
+      );
+    }
+    if (Math.abs(quote.strike - strike) > 1e-6) {
+      return fail(
+        '行权价与合约不符',
+        'contract_mismatch',
+        `${optionCode} 的行权价是 ${quote.strike}，与传入的 ${strike} 不一致。请用期权链返回的 strike。`,
+        { optionCode, chainStrike: quote.strike, inputStrike: strike },
+      );
+    }
+    if (quote.expiry !== expiry) {
+      return fail(
+        '到期日与合约不符',
+        'contract_mismatch',
+        `${optionCode} 的到期日是 ${quote.expiry}，与传入的 ${expiry} 不一致。请用期权链返回的 expiry。`,
+        { optionCode, chainExpiry: quote.expiry, inputExpiry: expiry },
+      );
+    }
+    if (quote.type !== optionType) {
+      return fail('合约方向与策略不符', 'strategy_mismatch', `${optionCode} 是 ${quote.type}，与策略 ${strategy} 要求的 ${wantType} 不一致。`);
+    }
+    // 期权链给的乘数才是合约真实乘数：与估算不同时按链上值重新校验（以真实合约规格为准）。
+    const multiplier = quote.multiplier > 0 ? quote.multiplier : estimatedMultiplier;
+    if (multiplier !== estimatedMultiplier) {
+      const recheck = checkOptionCoverage({
+        strategy,
+        market,
+        currency,
+        multiplier,
+        strike,
+        contracts,
+        heldShares,
+        availableCash,
+      });
+      if (!recheck.ok) {
+        return fail('担保不足（按合约真实乘数重算）', recheck.code!, recheck.message!, recheck.details);
+      }
+    }
+
+    // ── 软提醒：筛选项越界只进 warnings（可能是策略偏好，不能误杀）──
+    if (daysToExpiry < OPTION_SCREEN_RULES.minDaysToExpiry || daysToExpiry > OPTION_SCREEN_RULES.maxDaysToExpiry) {
+      warnings.push(
+        `剩余 ${daysToExpiry} 天不在筛选区间 ${OPTION_SCREEN_RULES.minDaysToExpiry}–${OPTION_SCREEN_RULES.maxDaysToExpiry} 天内。`,
+      );
+    }
+    if (premium * multiplier < OPTION_SCREEN_RULES.minPremiumPerContract) {
+      warnings.push(`每张权利金 ${round(premium * multiplier)} ${currency} 低于下限 ${OPTION_SCREEN_RULES.minPremiumPerContract}，占用担保额度收益过低。`);
+    }
+    if (quote.ask > 0 && quote.spreadPct > OPTION_SCREEN_RULES.maxSpreadPct) {
+      warnings.push(`买卖价差 ${quote.spreadPct}% 超过 ${OPTION_SCREEN_RULES.maxSpreadPct}%，按中间价假设可能高估权利金收入。`);
+    }
+    if (quote.ask > 0 && premium > quote.ask + 1e-9) {
+      warnings.push(`建议权利金 ${premium} 高于当前卖价 ${quote.ask}，成交可能不成立（确认时用户可改价）。`);
+    }
+    if (quote.openInterest < OPTION_SCREEN_RULES.minOpenInterest) {
+      warnings.push(`未平仓 ${quote.openInterest} 低于 ${OPTION_SCREEN_RULES.minOpenInterest}，流动性不足、可能难以成交。`);
+    }
+    if (!(quote.iv > 0)) warnings.push('上游未给出 IV（隐含波动率），波动率高低无法评估。');
+    if (!(Math.abs(quote.delta) > 0)) warnings.push('上游未给出 delta，被行权概率无法评估（不是「没有风险」）。');
+
+    // ── 落库：指标由服务端算（buildOptionAdvicePlan 内部按同一口径计算），AI 只引用 ──
+    const underlyingPrice = snapshot.underlyingPrice > 0 ? snapshot.underlyingPrice : strike;
+    const requiredShares = multiplier * contracts;
+    const collateral = strategy === 'covered_call' ? underlyingPrice * requiredShares : strike * multiplier * contracts;
+    const collateralNote =
+      str(args, 'collateralNote') ||
+      (strategy === 'covered_call'
+        ? `${heldAsset?.name || code} 持仓 ${heldShares} 股中 ${requiredShares} 股用于覆盖（${multiplier} 股/张 × ${contracts} 张）`
+        : `${market} 可用期权现金 ${round(availableCash)} ${currency} 中的 ${round(collateral)} ${currency} 作为现金担保`);
+    // 软提醒必须随 plan 一起落库（界面要原样展示数据缺口与降级），因此合并到快照的 warnings 再交给 builder。
+    const snapshotForPlan: OptionChainSnapshot =
+      warnings.length > 0 ? { ...snapshot, warnings: [...snapshot.warnings, ...warnings] } : snapshot;
+    const planBase = buildOptionAdvicePlan({
+      strategy,
+      market,
+      code,
+      name: snapshot.name || heldAsset?.name,
+      quote,
+      underlyingPrice,
+      contracts,
+      collateral,
+      collateralNote,
+      snapshot: snapshotForPlan,
+      acceptAssignment: args.acceptAssignment !== false,
+    });
+    // 没有任何有效报价（bid/mid/last 全 0）时权利金收入为 0：这样的「卖权建议」没有意义，直接拒绝。
+    if (!(planBase.premium > 0)) {
+      return fail(
+        '合约没有有效报价',
+        'no_quote',
+        `${optionCode} 当前没有有效报价（bid/mid/last 均为 0），无法计算可成交的权利金收入，不能写卖权建议。请换一个流动性更好的合约。`,
+      );
+    }
+    // 金额一律服务端定义：写入按「可成交买价」（卖开仓以 bid 成交），模型传的 premium 只做一致性校验。
+    let plan = planBase;
+    if (Math.abs(premium - planBase.premium) > 0.005) {
+      plan = {
+        ...planBase,
+        warnings: [
+          ...planBase.warnings,
+          `传入权利金 ${premium} 与可成交买价 ${planBase.premium} 不一致；写入与指标按买价计算（用户确认时仍可改价）。`,
+        ],
+      };
+    }
+    const acceptedPremium = plan.premium;
+
+    const watchItemId = ctx.repo.findWatchItem(code, market, 'stock')?.id ?? null;
+    ctx.repo.expirePendingAdvice(ctx.batchId);
+    const row = ctx.repo.createAdvice({
+      id: randomUUID(),
+      batchId: ctx.batchId,
+      assetId: heldAsset?.id ?? null,
+      watchItemId,
+      assetName: snapshot.name || heldAsset?.name || code,
+      // 语义（Lead 裁定）：code/market/type 一律填**标的**，合约信息只放 option_plan。
+      // 这样 origin 推导与 findAsset 担保校验都基于标的，且 InstrumentType 不引入 'option'。
+      code,
+      market,
+      type: heldAsset?.type ?? 'stock',
+      instrument: 'option',
+      optionPlan: plan,
+      action: 'sell',
+      targetShares: requiredShares,
+      targetPrice: acceptedPremium,
+      currency,
+      reason,
+      confidence: Math.max(0, Math.min(num(args, 'confidence', 0.6), 1)),
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    });
+
+    const groundWarning = groundingWarning(reason, readToolEvidence(ctx.runId));
+    const label = `${OPTION_STRATEGY_LABELS[strategy]} ${plan.optionCode}`;
+    return ok(
+      `卖权建议已写入：${plan.optionCode}（${OPTION_TYPE_LABELS[plan.optionType]} 行权价 ${plan.strike} 到期 ${plan.expiry}）${contracts} 张，` +
+        `权利金 ${acceptedPremium} ${currency}/股 = ${round(plan.metrics.premiumIncome)} ${currency}，年化 ${plan.metrics.annualizedYieldPct}%，担保 ${round(plan.metrics.collateral)} ${currency}`,
+      {
+        advice: row,
+        plan,
+        warnings: plan.warnings,
+        ...(groundWarning ? { groundingWarning: groundWarning } : {}),
+      },
+      { entity: { action: 'created', entity: 'advice', id: row.id, label } },
+    );
+  },
+};
+
 const saveDashboardBriefing: RegisteredTool = {
   requiresWrite: 'briefing',
   descriptor: {
@@ -1781,6 +2453,8 @@ export const TOOLS: RegisteredTool[] = [
   listAssets,
   getAsset,
   listWatchlist,
+  listOptionChain,
+  screenOptionCandidatesTool,
   listIpoOffers,
   getIpoOffer,
   getIpoProspectus,
@@ -1793,6 +2467,7 @@ export const TOOLS: RegisteredTool[] = [
   // 系统工具：仅流水线调用（systemOnly，不进模型工具表）。
   deleteWatchItem,
   createAdvice,
+  createOptionAdvice,
   saveDashboardBriefing,
   getBudget,
   getSettingsProfile,

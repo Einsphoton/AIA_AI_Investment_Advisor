@@ -194,7 +194,7 @@ test('D7 + D3：tick 与手动流水线共享锁；运行期间 nextRunAt() 绝�
     gate.release?.();
     for (let i = 0; i < 8; i += 1) await flush();
     assert.equal(isPipelineRunning(), false, '流水线结束后锁必须释放');
-    assert.deepEqual(calls, ['asset-analysis', 'watchlist-analysis', 'advice']);
+    assert.deepEqual(calls, ['asset-analysis', 'watchlist-analysis', 'option-advice', 'advice']);
 
     // The lock is reusable afterwards.
     assert.deepEqual(await runExclusive('manual:run-now', async () => 'ok'), { ok: true, value: 'ok' });

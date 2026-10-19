@@ -88,6 +88,7 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 | 旧库 / 旧备份 | 旧库的 `schedule_*` 单任务列在读取时迁移成「一个任务」（`mode='off'` → 空数组）；旧备份里的 `settings.schedule` 对象同样兼容；写回时旧列会同步第一个启用任务，方便回滚到旧版本 |
 | 打新步骤默认开 | 旧任务/旧备份里没有 `runIpoAnalysis` 时按 **`true`** 补（多一步不破坏任何已有数据；只想省钱可在设置页关掉） |
 | 观察 | `GET /api/dashboard` 的 `signals.scheduleEnabled`（是否至少有一个启用任务）、`signals.nextRunAt`（最近一次）与 `signals.nextRuns[]`（`{id,name,nextRunAt}`，按时间升序）来自**实时调度器**；设置页据此逐个任务显示下次运行时间 |
+| **失败自动续跑** | 定时流水线失败后按错误类型决定是否续跑：可重试（429 / 5xx / 网络 / 超时 / 空回复 / 轮次上限 / 进程中断）自动从持久化轨迹续跑，第 1/2/3 次分别在 **约 2 / 10 / 30 分钟（±15% 抖动、下限 30 秒）**后，最多 **3 次**；不可重试（未配 Key、401/403/402、404、用户取消、无轨迹）不续跑。计划存 `kv`（`scheduler:autoRetry`），重启不丢，进程启动后 ~45 s 自愈被中断的定时流水线。因此 `signals.nextRunAt` / `nextRuns[]` 在有续跑待执行时**会包含合成项 `自动续跑 · 第 N/3 次`**（不是下个定时点）。查询接口 `GET /api/agent/retry`（§9.5）；**恒为开启、没有设置开关**。手动运行的失败语义不变 |
 
 ## 3. 仪表盘（/api/dashboard）
 
@@ -214,7 +215,8 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 | GET | `/api/advice` | `{ items: AdviceItem[], budget: BudgetStatus }`；`?status=pending\|confirmed\|rejected` |
 | POST | `/api/advice/generate` | **AI 投资建议**（SSE）：先跑资产分析 → 标的分析 → **打新分析** → 汇总生成建议（受预算约束） |
 | POST | `/api/advice/:id/reject` | 驳回（本次不采纳）→ `AdviceItem`（`status=rejected`） |
-| POST | `/api/advice/:id/confirm` | 入参 `ConfirmAdviceInput`（实际份额/单价/日期）→ `{ advice: AdviceItem, asset: AssetDetail }`，写入交易并更新持仓。**与 `/api/assets/:id/transactions` 同源校验**：卖出份额超过持仓、或卖出日期早于可用持仓形成时间 → **409 CONFLICT** |
+| POST | `/api/advice/:id/confirm` | 入参 `ConfirmAdviceInput`（实际份额/单价/日期）→ `{ advice: AdviceItem, asset: AssetDetail }`，写入交易并更新持仓。**与 `/api/assets/:id/transactions` 同源校验**：卖出份额超过持仓、或卖出日期早于可用持仓形成时间 → **409 CONFLICT**。仅用于股票建议：`instrument='option'` 的建议一律 **400** 并指向下面的期权端点 |
+| POST | `/api/advice/:id/confirm-option` | **期权建议专用**：入参 `ConfirmOptionAdviceInput`（张数/每股价权利金/到期日/行权价/费用/日期）→ `ConfirmOptionAdviceResult`，创建 `option_contracts` 合约。**不写股票流水**（权利金与交割体现见 §13） |
 | GET | `/api/advice/last` | 最近一次建议生成运行 `AgentRunSummary \| null` |
 | GET | `/api/advice/outcomes` | **建议结果追踪**（只读）：`{ items: AdviceOutcome[], stats: AdviceOutcomeStats }` |
 | POST | `/api/advice/outcomes/track` | 重算一次追踪 → `{ items, stats, tracked: AdviceOutcomeTrackResult }` |
@@ -276,6 +278,7 @@ run-started  → ( step | progress | text | metrics | tool-call | tool-result | 
 | GET | `/api/agent/runs/:id` | `AgentRun`（含步骤时间线） |
 | GET | `/api/agent/tools` | 已注册工具清单 `{ name, description, parameters }[]` |
 | POST | `/api/agent/run-now` | 手动触发一次完整流水线（SSE，等价于 advice/generate） |
+| GET | `/api/agent/retry` | **定时流水线自动续跑**的待执行状态：`{ pending: { kind, attempt, maxAttempts, nextRunAt, failedRunIds, taskNames, lastError } \| null, maxAttempts: 3 }`；无待执行续跑（或进程里没有调度器）时 `pending: null`。语义与失败分类见 §9.5 |
 
 ### 9.1 AI 流水线互斥
 
@@ -326,11 +329,56 @@ MCP 工具以 **`mcp__<serverId>__<toolName>`** 命名并自动出现在 LLM 工
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/agent/runs/:id/trace` | `AgentTrace`：`{ run, messages, steps, audit, pendingWrites }` |
-| POST | `/api/agent/runs/:id/resume` | **SSE**：从该 run 的持久化消息轨迹继续推理；`status==='done'` → 409 |
+| POST | `/api/agent/runs/:id/resume` | **SSE**：从该 run 的持久化消息轨迹继续推理；`status==='done'` → 409；**已由系统自动续跑成功**的 run（`error` 带 `已自动续跑` 标记）同样 **409**，避免拿同一份轨迹重复烧 token |
 
 每个 run 的完整消息序列（system/user/assistant/tool，含 tool_calls 与 tool_call_id）都持久化在
 `agent_run_messages`，因此轨迹可回放、被中断或被轮次上限截断的 run 可以续跑（续跑会新开一条 run 行，
 标题标注「（续跑 <原 runId 前 8 位>）」）。续跑同样受流水线互斥锁保护。
+
+续跑默认拿到**与全新运行相同的轮次预算**（`AGENT_RESUME_TURNS` = `AGENT_MAX_TURNS`）。预算/步数真的用尽、
+模型又一句话正文都没写出来时，循环会**追加一次不带任何工具的「收尾作答」调用**（步骤时间线里出现「收尾作答」）：
+要求它基于已经拿到的工具结果直接输出结论。成功时 `status='done'`，`summary` 末尾标注
+「本次运行已用尽推理预算（N/N 轮），结论由收尾作答给出，可能未完全收敛」；收尾仍拿不到正文时按失败收场，
+错误文案区分「达到最大推理轮次」「达到步数上限」「模型返回了空结论」三种情况（不再把空结论误报成轮次上限）。
+
+### 9.5 定时流水线自动续跑（失败自愈）
+
+调度器触发的流水线（`POST /api/agent/run-now` 等**手动**入口不在此列）失败后不再只记一条日志、等下个定时点
+（每日任务等于要等到第二天）：`services/auto-retry.ts` 会把可重试的失败转成一次续跑计划，持久化在 `kv`
+（`scheduler:autoRetry`），并与手动「一键续跑」走**同一条 resume 路径** —— 从 `agent_run_messages` 的持久化
+消息轨迹继续，**不重跑已完成的阶段**。
+
+| 规则 | 说明 |
+| --- | --- |
+| 可重试 | LLM 429 / 5xx / 网络 / 超时 / 客户端内重试后仍空回复、轮次上限（`达到最大推理轮次`）、进程中断（`运行被中断…`）、未知瞬时错误 |
+| 不重试 | 未配置 API Key（`未配置 API Key`）、401 / 403、402（余额与订阅）、模型或端点 404、用户取消（`已取消`）、没有持久化轨迹；**例外**：若整个续跑任务是 `resume` 且所有阶段都报无轨迹，调度器会改判为 `kind='pipeline'` 整条重跑一次，而不是就此停止 |
+| 重试节奏 | 第 1 / 2 / 3 次分别在失败后 **约 2 / 10 / 30 分钟（±15% 抖动、下限 30 秒）**，最多 **3 次**；3 次用完即静默停止（只写日志），失败 run 仍显示在「活动与审计」页，手动续跑照旧可用 |
+| 重启自愈 | 启动时 `failStaleRuns` 仍先把被进程退出打断的 run 标成 `error`（保留已花 token）；启动前标记在 `kv:scheduler:inFlight` 的定时流水线会在启动后 ~45 s 自愈 —— 有轨迹的 stale `error` run 直接续跑，并补跑这一轮未执行的阶段（已完成的阶段与续跑成功的阶段都会跳过），没有轨迹则整条流水线重跑一次（同样跳过已完成的阶段） |
+| 计划可见 | `Scheduler.nextRunAt()` / `plan()` 在有续跑待执行时插入合成项 `自动续跑 · 第 N/3 次`，因此界面「下次运行」显示的是续跑时间而不是下个定时点（`/api/dashboard` 的 `signals.nextRunAt` / `nextRuns[]`、设置页列表一并生效） |
+| 并发 | 续跑与手动流水线共用同一把非阻塞锁：到期时锁被占用则顺延 ~2 分钟，**不消耗重试次数** |
+| 手动语义 | 手动入口失败**不会**自动续跑，仍旧 SSE `error` + `run-finished(status='error')` 直接报给用户，「一键续跑」仍要人工点；但自动续跑成功后，原失败 run 的 `error` 会被追加 `（已自动续跑：第 N/3 次，新运行 <8 位 id>）`（`status` 保持 `error`、已花 token 不回滚），此时 `POST /api/agent/runs/:id/resume` 对该 run 返回 **409**（`已由系统自动续跑成功，无需再次续跑`），前端「未完成」提示条也会过滤掉它、不再劝你重复续跑 |
+
+`GET /api/agent/retry`（只读）：
+
+```json
+{
+  "pending": {
+    "kind": "resume",
+    "attempt": 1,
+    "maxAttempts": 3,
+    "nextRunAt": "2026-10-19T02:32:00.000Z",
+    "failedRunIds": ["...uuid..."],
+    "taskNames": ["工作日盘前"],
+    "lastError": "..."
+  },
+  "maxAttempts": 3
+}
+```
+
+- `pending` 为 **`null`** 表示当前没有排队的续跑；进程里没有调度器时同样返回 `{ "pending": null, "maxAttempts": 3 }`；
+- `kind`：`resume`（从轨迹续跑失败的 run）或 `pipeline`（没有轨迹、整条流水线重跑）；
+- `attempt` 是**即将执行**的那次（1-based，`1` 表示第 1/3 次）；`nextRunAt` 为 ISO 8601 字符串；
+- `failedRunIds` 是被续跑/重跑的失败 run；`taskNames` 是触发它的定时任务名；`lastError` 是原始失败文案（可能为空）。
 
 ## 10. 备份与恢复（/api/backup）
 
@@ -468,7 +516,99 @@ audit_log / pending_writes / kv`，返回逐表删除行数（`ClearDataResult`�
 5. 未定价（`issuePrice = 0` 且只有区间）时必须显式传 `price`，否则 **400** —— 绝不用 0 成本入账。
 6. `subscription.assetId` 指向账本资产；`subscribeIpo` 拒绝已上市标的与超过申购上限的股数（**409**）。
 
-## 13. 前端路由
+## 13. 期权卖权（/api/options）
+
+港股/美股**卖出期权收取权利金**的完整闭环（界面：`/options`）。数据来源与字段口径见 `docs/SOURCES.md §9`。
+
+产品口径（顺序即优先级，写进了 `option-advice` 的系统提示词）：
+
+1. **首要目标是安全地赚取权利金**：优先覆盖式卖 Call（用已持有的股票收租，不额外赌方向）；
+2. **标的价格足够划算时才用现金担保卖 Put 收股**：被行权就是按行权价买入，必须真的是「愿意买的价格」；
+3. 卖 Call 必须结合「我的资产」的实际持股与成本；
+4. 到期后自动跟踪行权结果并更新「我的资产」——**结论明确才自动入账，存疑转「待确认」**。
+
+架构定位：期权建议**复用 `advice` 表**（`instrument='option'`，方案细节存 `option_plan` JSON），
+合约与到期结算另立 `option_contracts` / `option_settlements` 两张表。因此 `AdviceItem` 新增
+`instrument` 与 `option` 两个必填字段，确认弹窗与入账路径按 `instrument` 分流。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/options/chain?market=&code=&maxExpiries=&refresh=` | `OptionChainSnapshot`：原始期权链（未经筛选），`asOf`/`delayed`/`source`/`warnings` 如实返回 |
+| GET | `/api/options/candidates?market=&code=&limit=` | `OptionCandidatesResponse`：**确定性筛选**（不经过 LLM），含被挡掉的 `rejected` 与机器可读原因 |
+| POST | `/api/options/analyze` | `202 {runId}`：跑 `option-advice` 阶段（AI 期权卖权建议）。**返回前会同步预取期权链**（港股每日报告 ≈ 6.7MB 约 30–60s；CBOE 单请求可达数分钟），期间请用「活动」页/`/api/agent/runs` 看进度；未配置 LLM 时 **400 `NOT_CONFIGURED`**。可分析范围 = 港股/美股持股（覆盖式卖 Call）∪ 任一市场有现金时的观察池标的（现金担保卖 Put，每市场最多 2 个）；请求体里的 `markets`/`codes` 只做校验与日志，**不改变范围** |
+| GET | `/api/options/positions` | `OptionPositionsResponse`：在手合约 + 权利金/担保汇总 |
+| GET | `/api/options/positions/:id` | `OptionPosition` |
+| POST | `/api/options/positions` | 手工登记已成交的卖出合约（没有券商对接，计划外成交必须能补录） |
+| POST | `/api/options/positions/:id/close` | 买平（平仓价/费用/日期/备注） |
+| POST | `/api/options/positions/:id/settle` | 只评估该合约的到期结算 → `OptionSettlementRunResult` |
+| GET | `/api/options/settlements?status=` | `OptionSettlementsResponse`（`pending_review` / `auto_settled` / `confirmed` / `dismissed`） |
+| POST | `/api/options/settlements/scan` | 扫描全部已到期合约 → `OptionSettlementRunResult`；拿不到流水线锁时 **409** |
+| POST | `/api/options/settlements/:id/confirm` | 人工确认判定（可改判 `assigned`/`otm_no_assignment` 并覆盖参考价）后入账 |
+| POST | `/api/options/settlements/:id/dismiss` | 忽略该结算记录（不动账本） |
+| POST | `/api/advice/:id/confirm-option` | 入参 `ConfirmOptionAdviceInput` → `ConfirmOptionAdviceResult`：创建合约，**不写股票流水** |
+
+`POST /api/advice/:id/confirm`（股票路径）遇到 `instrument='option'` 的建议会返回 **400** 并指向
+`/api/advice/:id/confirm-option`，绝不会把一张期权建议当股票买卖写进账本。
+
+### 13.1 两个策略与担保口径
+
+| 策略 | 含义 | 需要的担保 | 被行权后果 | 最坏情形 |
+| --- | --- | --- | --- | --- |
+| `covered_call` | 对已持有股票卖出 Call，收租 | 持仓股数 ≥ `乘数 × 张数`（美股 100/张；港股按合约规格） | 按行权价交出 `乘数 × 张数` 股 | 股票大涨被「卖飞」——仍拿到权利金 + 行权价的现金 |
+| `cash_secured_put` | 用现金担保卖出 Put，愿意按行权价接货 | 可用现金 ≥ `行权价 × 乘数 × 张数`（原币） | 按行权价买入 `乘数 × 张数` 股 | 股价跌破行权价后浮亏，但成本已被权利金垫低 |
+
+担保校验是**服务端硬拦**（`insufficient_shares` / `insufficient_cash` / `no_cash`），并且数字由服务端
+自己从账本与设置里取，不采信模型或请求体里的声明。各市场可用现金由用户在设置页填写
+（`settings.option.cash.HK/US`，填 0 时不会产出无法担保的卖 Put 建议，并明确提示去填写）。
+
+### 13.2 确定性指标（服务端算，AI 只能引用不能改写）
+
+| 指标 | 口径 |
+| --- | --- |
+| `premiumIncome` | `每股价权利金 × 乘数 × 张数 − 费用`（原币） |
+| `staticYieldPct` | `premiumIncome / collateral × 100`（collateral = 被占用的现金或持股市值） |
+| `annualizedYieldPct` | `staticYieldPct × 365 / max(1, 剩余自然日)`；已到期返回 0 并给 warning，**不做除零/负年化** |
+| 安全垫 | 卖 Call：`(行权价 − 现价)/现价 × 100`；卖 Put：`(现价 − 行权价)/现价 × 100`（正数=虚值=更安全） |
+| `assignmentProbability` | 美股用 `abs(delta)`；港股上游**没有** delta，用虚值幅度 + IV 做正态近似，并在 `warnings` 明确标注「估算」 |
+| `liquidityScore` | 0–100，由价差百分比、未平仓、成交量合成；bid/ask 缺失（上游为 0）时不给高分并给 warning |
+| `breakeven` / `maxProfit` / `requiredShares` | 见 `packages/shared/src/types.ts` 的字段注释 |
+
+筛选规则集中在 `OPTION_SCREEN_RULES`（剩余天数 7–75、`|delta|` 0.08–0.35、未平仓 ≥ 50、
+价差 ≤ 20%、年化 ≥ 6%、每张权利金 ≥ 20、每个标的最多 6 个候选）。**筛选规则只用于候选推荐**；
+写建议工具对「持股/现金不足、到期日已过」这类零歧义算术硬拦，对期限/权利金越界只给 `warnings`
+（避免误杀「故意选近月高权利金」的合法建议）。
+
+### 13.3 到期结算与自动入账
+
+| 环节 | 规则 |
+| --- | --- |
+| 扫描范围 | `status='open'` 且 `到期日 ≤ 今天` 的合约；定时器（启动后 ~30s，之后每 6h）与手工 `scan` 共用同一实现 |
+| 参考价 | 美股：到期日（或之后第一个交易日）收盘价，取自既有行情源；港股：优先 HKEX 当日报告的官方**收市价**，取不到回退日线并给 warning。取不到任何价 → `uncertain` |
+| 判定 | 实值额 `call = 参考价 − 行权价` / `put = 行权价 − 参考价`；`< minItmAmount`（0.01）→ `otm_no_assignment`；否则 `assigned`；`|参考价 − 行权价| / 行权价 × 100 < 0.5%` → `uncertain` + `pending_review` |
+| 结算模式 | `settings.option.settlementMode`。`auto`=结论明确才自动入账；`manual`=全部转待确认（界面逐条确认） |
+| 自动入账 | `covered_call` 被行权 → 写 `kind='sell'`、`source='option'`、价=行权价、股数=`乘数 × 张数` 的股票流水；`cash_secured_put` 被行权 → 写 `kind='buy'`、`source='option'`（真实现金支出，**不受当月预算闸门拦截**，与打新中签入账同理）。持股不足以交割时**不写流水**，转 `pending_review` 并写明缺口 |
+| 幂等 | `option_settlements.contract_id` 唯一；重复扫描/重复确认不会重复写流水。判定与写入在同一 `repo.transaction` 内完成（中间无 `await`），定时扫描整体持流水线锁 |
+| 记录可核对 | 每条结算记录都带 `referencePrice` + `priceSource` + 可读 `note`（判定依据），界面原样展示 |
+
+**权利金与股票账本是两条线**（本应用没有现金账户，必须说清，否则用户会以为「收了权利金但资产没变」是 bug）：
+
+| 事件 | 落到哪里 |
+| --- | --- |
+| 卖出开仓收到权利金 | 只记在 `option_contracts.premium_income`，由「期权卖权」页统计「权利金总收入 / 已实现权利金」。**不写 `transactions`**（没有现金账户，凭空写一笔股票流水会污染持仓） |
+| 虚值到期（未被行权） | 权利金转为已实现（`realized_pnl = premium_income`），股票账本无变化 |
+| 实值被行权（覆盖式卖 Call） | 写一笔 `kind='sell'`、`source='option'`、`price=行权价`、`shares=乘数×张数` 的股票流水 →「我的资产」持仓减少，`realized_pnl = 权利金 + 股票交割盈亏` |
+| 实值被行权（现金担保卖 Put） | 写一笔 `kind='buy'`、`source='option'`、`price=行权价` 的股票流水（必要时自动建仓）→「我的资产」持仓增加，`realized_pnl = 权利金`（收股成本就是行权价） |
+| 合约乘数缺失/为 0 | **不判定、不入账**，转「待确认」——交割股数算不出来时绝不猜 |
+
+**「自动更新我的资产」的准确度边界**（必须让用户看到，不做过度承诺）：
+
+1. 行情是**延迟/收盘**口径（CBOE 延迟链、HKEX 每日报告），不是券商实时结算价；
+2. 没有券商接口，**系统不知道你是否真的被指派行权**——它按「实值 ≥ 0.01 即会被行权」的规则推算，
+   真实结果以券商对账单为准（所以存疑会转「待确认」，并且可以手工改判/覆盖参考价）；
+3. 美股期权是**美式**，存在到期前被提前行权的可能；港股实物交割，公司行动（拆股/合股）会改变合约规格；
+4. 港股合约乘数只有核对过官方合约规格的标的才写进 `HK_OPTION_MULTIPLIERS`，其余按 100 估算并**明确 warning**。
+
+## 14. 前端路由
 
 | 路径 | 页面 |
 | --- | --- |
@@ -477,6 +617,7 @@ audit_log / pending_writes / kv`，返回逐表删除行数（`ClearDataResult`�
 | `/watchlist` | 我的标的 |
 | `/compare` | 财报对比（2-4 个标的并排看关键财务指标 + 三表明细） |
 | `/advice` | AI 投资建议 |
+| `/options` | 期权卖权（在手合约 · 权利金 · 到期结算） |
 | `/ipo` | 新股打新（三地新股 · AI 申购建议 · 中签自动入账） |
 | `/chat` | AI Chat |
 | `/activity` | 活动与审计 |

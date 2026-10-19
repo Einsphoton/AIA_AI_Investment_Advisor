@@ -23,7 +23,13 @@
  *    ("已确认的信息不丢").
  *  - P1-3: every message handed to the model is persisted (`agent_run_messages`,
  *    idx from 0); `request.resumeRunId` restarts from such a stored transcript
- *    in a **new** run row.
+ *    in a **new** run row, with a full turn budget (`AGENT_RESUME_TURNS`).
+ *  - P1-4: a run that exhausts its turn (or step) budget without producing any
+ *    text gets **one** tool-free wrap-up call, so a tool loop ends with a
+ *    conclusion instead of「达到最大推理轮次」. The failure text distinguishes
+ *    turn cap / step cap / empty answer instead of blaming the turn cap for all
+ *    three (production: the scheduled-pipeline auto-retry reported the turn cap
+ *    for a run that had only made one turn).
  *
  * Owner: agent-engine.
  */
@@ -34,7 +40,7 @@ import {
   AGENT_MAX_TURNS,
   AGENT_MIN_RECENT_TURNS,
   AGENT_OUTPUT_RESERVE_TOKENS,
-  AGENT_RESUME_EXTRA_TURNS,
+  AGENT_RESUME_TURNS,
   DEFAULT_LLM,
   DEFAULT_PERSONA,
   DEFAULT_REPORT_STYLE,
@@ -57,6 +63,9 @@ const DEFAULT_WRITES: Record<string, AllowWrite[]> = {
   'watchlist-analysis': ['watchlist'],
   // 打新分析：写入新股记录（结论/建议股数）；申购与中签登记由用户在前端确认，默认不开放。
   'ipo-analysis': ['ipo'],
+  // 期权卖权：复用 advice 写域写「待确认卖权建议」（advice 表已加 instrument/option_plan），
+  // 不新开写域——确认成交走 /api/advice/:id/confirm-option，由用户在前端触发。
+  'option-advice': ['advice'],
   advice: ['advice', 'briefing'],
   chat: ['asset', 'watchlist', 'advice', 'briefing'],
   scheduled: ['asset', 'watchlist', 'advice', 'briefing', 'ipo'],
@@ -69,6 +78,19 @@ const CANCELLED_MESSAGE = '已取消（用户中断或连接断开）';
 /** Tool replies synthesised for calls that were never executed (pairing). */
 const CANCELLED_TOOL_RESULT = '[已取消] 该工具调用未执行（运行已取消）。';
 const STEP_CAP_TOOL_RESULT = '[未执行] 达到本次运行的步骤上限，该工具调用未执行。';
+/**
+ * P1-4: the one instruction that turns「预算用尽」into an answer.
+ *
+ * Sent as a final, **tool-free** request when the loop ran out of turns/steps
+ * without producing a single character of text. Tools are withheld so the model
+ * cannot start another data-gathering round; the instruction tells it to write
+ * the conclusion from what it already has and to surface gaps honestly.
+ */
+const WRAP_UP_INSTRUCTION = [
+  '【收尾作答】本次运行的推理预算已经用尽（不会再有工具调用）。',
+  '请立刻基于上文已经拿到的工具结果与已完成的分析，直接输出最终结论（Markdown）。',
+  '还有数据缺口就写「数据缺失：…」与原因，不要编造数字，也不要重复此前的分析过程或调用任何工具。',
+].join('\n');
 
 interface RunSettings {
   persona: typeof DEFAULT_PERSONA;
@@ -335,8 +357,10 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
     push({ role: 'user', content: request.goal });
   }
 
-  // P1-3: a resumed run gets a smaller default budget of new turns.
-  const defaultTurns = resumeRunId ? AGENT_RESUME_EXTRA_TURNS : AGENT_MAX_TURNS;
+  // P1-4: a resumed run continues an unfinished job, so it gets the same budget
+  // as a fresh run. The old 8-turn top-up (`AGENT_RESUME_EXTRA_TURNS`) could not
+  // finish a pipeline stage and made every auto-retry fail the same way.
+  const defaultTurns = resumeRunId ? AGENT_RESUME_TURNS : AGENT_MAX_TURNS;
   const maxTurns = Math.max(1, Math.min(request.maxTurns ?? defaultTurns, AGENT_MAX_TURNS));
   const allTools = llmToolSchemas(request.kind, [...allowWrites]);
   const withdrawn = new Set<string>();
@@ -679,14 +703,81 @@ export async function runAgent(deps: AgentDeps, request: AgentRunRequest): Promi
     finalText = streamedText.trim() || latestText || lastAssistantText(messages);
   }
 
-  if (!runError && !finalText) {
-    // The model kept calling tools until the cap without ever concluding.
-    runError = `达到最大推理轮次（${maxTurns}）仍未给出最终结论，请重试或缩小分析范围。`;
-    deps.logger.warn(`run ${runId} hit the turn cap without a final answer (turns=${turns})`);
+  /**
+   * P1-4: 收尾作答 —— 预算/步数用尽且一句正文都没有时，**再问一次**模型，这次不带
+   * 任何工具，并明确要求它基于已有数据直接给结论。
+   *
+   * 为什么必须有：工具循环的「穷尽预算」过去等于「整条运行失败」。定时流水线的自动
+   * 续跑（`services/scheduler.ts`）因此反复报「达到最大推理轮次（8）仍未给出最终
+   * 结论」，把已经烧掉的 token 与已经拿到手的工具结果一起作废 —— 而模型其实只是
+   * 还想再多取一点数据。收尾调用只在「否则必然失败」时发生（整个 run 最多 1 次），
+   * 正常收敛的运行完全不受影响。
+   */
+  const wrapUp = async (): Promise<string> => {
+    const step = addStep(
+      '收尾作答',
+      `推理预算已用尽（第 ${turns}/${maxTurns} 轮）且没有正文：追加 1 次不带工具的总结调用`,
+    );
+    push({ role: 'user', content: WRAP_UP_INSTRUCTION });
+    try {
+      const result = await client.chat({
+        // No `tools` on purpose: this turn must produce prose, not more calls.
+        messages,
+        signal: request.signal,
+        onDelta: (delta) => {
+          streamedText += delta;
+          safeEmit(request.sink, { type: 'text', runId, delta });
+        },
+      });
+      promptTokens += result.promptTokens;
+      completionTokens += result.completionTokens;
+      const text = result.content.trim();
+      if (text) push({ role: 'assistant', content: text });
+      finishStep(
+        step,
+        text ? 'done' : 'error',
+        text
+          ? `收尾结论 ${result.content.length} 字（tokens: ${result.promptTokens}+${result.completionTokens}）`
+          : '收尾调用仍未返回正文',
+      );
+      return text;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 收尾调用也可能被取消（客户端在这一刻断开）：仍按取消语义收场。
+      if (isAborted()) {
+        cancelled = true;
+        runError = CANCELLED_ERROR;
+      }
+      finishStep(step, 'error', message);
+      return '';
+    }
+  };
+
+  if (!runError && !finalText && !cancelled && !isAborted()) {
+    finalText = await wrapUp();
   }
 
-  const hitTurnCap = !runError && !converged;
-  const summary = hitTurnCap && finalText ? `${finalText}\n\n（注：已达最大推理轮次 ${maxTurns}，结论可能未完全收敛。）` : finalText;
+  if (!runError && !finalText) {
+    // 如实说明「为什么没有结论」。这里过去一律写成轮次上限，把三种完全不同的
+    // 情况混为一谈（生产实测：只跑了 1 轮的空结论 run 也报「达到最大推理轮次」，
+    // 而 `services/auto-retry.ts` 又按这句话把它判成「可续跑」，于是继续白跑）。
+    if (converged) {
+      runError = `模型返回了空结论（第 ${turns} 轮既没有正文也没有工具调用），请重试。`;
+    } else if (turns >= maxTurns) {
+      runError = `达到最大推理轮次（${maxTurns}）仍未给出最终结论，请重试或缩小分析范围。`;
+    } else {
+      runError = `达到本次运行的步数上限（${AGENT_MAX_STEPS} 步）仍未给出最终结论，请重试或缩小分析范围。`;
+    }
+    deps.logger.warn(
+      `run ${runId} produced no final answer (turns=${turns}/${maxTurns}, steps=${stepIndex}, converged=${converged})`,
+    );
+  }
+
+  const hitBudgetCap = !runError && !converged;
+  const summary =
+    hitBudgetCap && finalText
+      ? `${finalText}\n\n（注：本次运行已用尽推理预算（${turns}/${maxTurns} 轮），结论由收尾作答给出，可能未完全收敛。）`
+      : finalText;
 
   if (runError && !errorEmitted) {
     safeEmit(request.sink, { type: 'error', message: runError });

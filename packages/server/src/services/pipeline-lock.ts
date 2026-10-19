@@ -18,8 +18,6 @@
  *
  * Owner: agent-engine.
  */
-import type { AgentRun } from '@aia/shared';
-
 export interface PipelineLockStatus {
   /** Human label of the holder, e.g. `scheduler:interval` / `manual:advice`. */
   label: string;
@@ -72,7 +70,7 @@ export async function runExclusive<T>(label: string, fn: () => Promise<T>): Prom
 }
 
 /** Convenience wrapper for the scheduler: throws instead of returning a flag. */
-export async function runExclusiveOrThrow(label: string, fn: () => Promise<AgentRun>): Promise<AgentRun> {
+export async function runExclusiveOrThrow<T>(label: string, fn: () => Promise<T>): Promise<T> {
   const outcome = await runExclusive(label, fn);
   if (!outcome.ok) throw new PipelineBusyError(outcome.reason);
   return outcome.value;

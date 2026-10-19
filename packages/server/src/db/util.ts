@@ -358,6 +358,8 @@ export type SettingsPatch = {
   schedules?: StoredSettings['schedules'];
   enforceBudget?: boolean;
   watchlistCandidateLimit?: number;
+  /** 期权卖权设置（可用现金 + 到期结算模式）。 */
+  option?: Partial<Omit<StoredSettings['option'], 'cash'>> & { cash?: Partial<StoredSettings['option']['cash']> };
   lastRunAt?: string | null;
   updatedAt?: string;
 };

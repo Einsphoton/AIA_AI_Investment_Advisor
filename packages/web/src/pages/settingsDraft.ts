@@ -4,11 +4,12 @@
  * 数值输入统一以字符串保存在草稿里（便于清空/编辑），保存时才解析校验；
  * `apiKey` 留空表示不下发该字段（保持服务端已存的 Key 不变）。
  */
-import { DEFAULT_BUDGET, DEFAULT_DATA_SOURCES, DEFAULT_LLM, DEFAULT_SCHEDULE_TASK } from '@aia/shared';
+import { DEFAULT_BUDGET, DEFAULT_DATA_SOURCES, DEFAULT_LLM, DEFAULT_OPTION_SETTINGS, DEFAULT_SCHEDULE_TASK } from '@aia/shared';
 import type {
   BudgetConfig,
   DataSourceConfig,
   LlmConfig,
+  OptionSettlementMode,
   Persona,
   ReportStyle,
   ScheduleMode,
@@ -54,8 +55,41 @@ export interface Draft {
   watchlistCandidateLimit: string;
   /** P3：连续确认退役多少次后自动移除标的；0 = 只标记不删除。 */
   watchlistRetireDeleteRuns: string;
+  /** 期权卖权设置（可用现金 / 到期结算模式 / 是否随建议流水线一起跑）。 */
+  option: OptionDraft;
   /** AI 定时任务（数组：可并存多个，各自选触发方式与步骤）。 */
   schedules: ScheduleTaskDraft[];
+}
+
+/**
+ * 期权卖权草稿。
+ *
+ * 现金按原币存字符串（便于清空/编辑），保存时才解析；`settlementMode` 与
+ * `runWithPipeline` 是枚举/布尔，直接存值。
+ */
+export interface OptionDraft {
+  /** 港股可用现金（HKD）。0 表示未填写：此时不会给出无法覆盖的卖 Put。 */
+  cashHK: string;
+  /** 美股可用现金（USD）。 */
+  cashUS: string;
+  settlementMode: OptionSettlementMode;
+  runWithPipeline: boolean;
+}
+
+/**
+ * 服务端设置 → 期权草稿。
+ *
+ * 服务端没返回 `option`（老版本 / 精简 payload）时回退共享默认值 —— 这是「避免保存时把
+ * 期权设置重置」的第一道保险：草稿里永远有一份完整的期权设置，差异比较才有基线。
+ */
+export function toOptionDraft(settings: Settings): OptionDraft {
+  const option = settings.option ?? DEFAULT_OPTION_SETTINGS;
+  return {
+    cashHK: String(option.cash?.HK ?? DEFAULT_OPTION_SETTINGS.cash.HK),
+    cashUS: String(option.cash?.US ?? DEFAULT_OPTION_SETTINGS.cash.US),
+    settlementMode: option.settlementMode === 'manual' ? 'manual' : 'auto',
+    runWithPipeline: option.runWithPipeline !== false,
+  };
 }
 
 /** 新建任务用的稳定 id（只含字母数字与下划线，服务端只接受这一组字符）。 */
@@ -114,6 +148,7 @@ export function toDraft(settings: Settings): Draft {
     enforceBudget: settings.enforceBudget,
     watchlistCandidateLimit: String(settings.watchlistCandidateLimit ?? 5),
     watchlistRetireDeleteRuns: String(settings.watchlistRetireDeleteRuns ?? 3),
+    option: toOptionDraft(settings),
     schedules: (settings.schedules ?? []).map(toScheduleDraft),
   };
 }
@@ -212,6 +247,22 @@ export function buildInput(draft: Draft, base: Draft): SettingsInput {
   if (JSON.stringify(draft.schedules) !== JSON.stringify(base.schedules)) {
     input.schedules = draft.schedules.map(toSchedulePayload);
   }
+
+  // 期权卖权：只下发**变化的那些字段**。
+  // 如果无脑整体提交 `{cash:{HK,US},settlementMode,runWithPipeline}`，一次保存就会把
+  // 服务端上另一处刚改过的值覆盖回草稿里的旧值（草稿是打开页面时的快照）。
+  const option: NonNullable<SettingsInput['option']> = {};
+  if (draft.option.cashHK !== base.option.cashHK || draft.option.cashUS !== base.option.cashUS) {
+    // 契约里的 cash 是两个市场的完整对象（Partial 与 cash 交叉后仍是必填两键），
+    // 所以只要有一个市场变了就两个一起发——值都来自草稿，不会丢用户的输入。
+    option.cash = {
+      HK: parseNumber('港股可用现金（HKD）', draft.option.cashHK),
+      US: parseNumber('美股可用现金（USD）', draft.option.cashUS),
+    };
+  }
+  if (draft.option.settlementMode !== base.option.settlementMode) option.settlementMode = draft.option.settlementMode;
+  if (draft.option.runWithPipeline !== base.option.runWithPipeline) option.runWithPipeline = draft.option.runWithPipeline;
+  if (Object.keys(option).length > 0) input.option = option;
 
   if (draft.apiKey.trim() !== '') input.apiKey = draft.apiKey.trim();
 

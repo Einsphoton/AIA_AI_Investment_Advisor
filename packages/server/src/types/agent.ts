@@ -102,6 +102,11 @@ export interface SchedulerDeps {
   timers?: SchedulerTimers;
   /** 当前时间（毫秒）。默认 `Date.now`，测试可注入假时钟。 */
   now?: () => number;
+  /**
+   * 自动续跑退避抖动的随机源（默认 `Math.random`）。测试传 `() => 0.5` 可消除抖动，
+   * 从而断言精确的等待时长。
+   */
+  random?: () => number;
 }
 
 /** 单个定时任务的下次运行时间（`Scheduler.plan()` 的元素）。 */
@@ -109,6 +114,27 @@ export interface SchedulerPlanEntry {
   id: string;
   name: string;
   nextRunAt: string;
+}
+
+/**
+ * 待执行的自动续跑（定时流水线失败后由调度器排期）。
+ *
+ * `GET /api/agent/retry` 直接返回它；前端据此把「正在等待自动续跑」的失败 run
+ * 从手动续跑提示里剔除，避免用户再点一次造成双跑。
+ */
+export interface SchedulerRetryState {
+  /** `resume` = 从失败 run 的轨迹继续；`pipeline` = 整条流水线重跑一次。 */
+  kind: 'resume' | 'pipeline';
+  /** 即将执行的那一次（1-based）。 */
+  attempt: number;
+  maxAttempts: number;
+  nextRunAt: string;
+  /** `resume` 会续跑的失败 run id。 */
+  failedRunIds: string[];
+  /** 触发这条续跑的定时任务名（展示用）。 */
+  taskNames: string[];
+  /** 最近一次失败原因。 */
+  lastError: string;
 }
 
 export interface Scheduler {
@@ -121,6 +147,13 @@ export interface Scheduler {
   nextRunAt(): string | null;
   /** 每个启用任务各自的下次运行时间（升序）；界面按任务展示。 */
   plan(): SchedulerPlanEntry[];
+  /**
+   * 待执行的自动续跑状态；没有排期时 null。
+   *
+   * 定时流水线里有阶段失败（可重试）后，调度器会按 2/10/30 分钟退避、最多 3 次
+   * 从持久化轨迹 `resume`；该状态同时落库（`kv`），进程重启后仍然有效。
+   */
+  retryState(): SchedulerRetryState | null;
   /** Runs the full pipeline now (asset → watchlist → advice) and resolves it. */
   runPipeline(): Promise<AgentRun>;
 }

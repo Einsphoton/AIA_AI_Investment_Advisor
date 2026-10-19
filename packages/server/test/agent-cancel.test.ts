@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { AGENT_RESUME_EXTRA_TURNS, type AgentEvent } from '@aia/shared';
+import { AGENT_RESUME_TURNS, type AgentEvent } from '@aia/shared';
 
 import { createRepo } from '../src/db/repo.js';
 import { runAgent } from '../src/agent/loop.js';
@@ -271,7 +271,8 @@ test('P1-3: resumeRunId 从已存轨迹续跑（新 run 行 + 标题标注），
     assert.equal(run.status, 'error');
     assert.match(run.error ?? '', /已取消/);
 
-    // Default turn budget of a resumed run is AGENT_RESUME_EXTRA_TURNS.
+    // P1-4: a resumed run gets the same budget as a fresh one (it used to get 8
+    // "extra" turns, which no pipeline stage could finish — see agent-turn-cap).
     const defaultTurns = new AbortController();
     const progress: AgentEvent[] = [];
     const resumed = await runAgent(deps, {
@@ -288,7 +289,7 @@ test('P1-3: resumeRunId 从已存轨迹续跑（新 run 行 + 标题标注），
     const firstProgress = progress.find((event) => event.type === 'progress');
     assert.ok(firstProgress && firstProgress.type === 'progress');
     if (firstProgress && firstProgress.type === 'progress') {
-      assert.equal(firstProgress.total, AGENT_RESUME_EXTRA_TURNS);
+      assert.equal(firstProgress.total, AGENT_RESUME_TURNS);
     }
     assert.equal(resumed.status, 'error');
 

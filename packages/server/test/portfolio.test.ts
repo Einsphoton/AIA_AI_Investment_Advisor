@@ -270,6 +270,8 @@ test('建议来源（origin）：持仓 / 我的标的 / 池外，由链接字�
     code: '600406',
     market: 'CN' as const,
     type: 'stock' as const,
+    // 建议行新增的两列：本文件一律按股票建议（无卖权方案）构造。
+    instrument: 'stock' as const,
     action: 'buy' as const,
     targetShares: 50,
     targetPrice: 25,
@@ -282,6 +284,7 @@ test('建议来源（origin）：持仓 / 我的标的 / 池外，由链接字�
     decidedAt: null,
     executedShares: null,
     executedPrice: null,
+    option: null,
   };
   assert.equal(toAdviceItem({ ...base, assetId: 'a1' }).origin, 'holding');
   assert.equal(toAdviceItem({ ...base, watchItemId: 'w1' }).origin, 'watchlist');

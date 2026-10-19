@@ -21,7 +21,7 @@ import { config } from '../src/config.js';
 import { setServices } from '../src/registry.js';
 import type { AgentRuntime } from '../src/types/agent.js';
 import type { Repo } from '../src/types/repo.js';
-import type { BackupPayload } from '@aia/shared';
+import { DEFAULT_OPTION_SETTINGS, type BackupPayload } from '@aia/shared';
 
 const RAW_API_KEY = 'sk-test1234abcd';
 
@@ -113,6 +113,23 @@ test('settings: 掩码返回，绝不泄漏明文；apiKey 省略/null/字符串
   assert.equal(readBack.hasApiKey, true);
   assert.equal(readBack.apiKeyMasked, 'sk-****abcd');
   assert.ok(!readBack.llm.apiKey);
+
+  // 期权卖权设置：DTO 必须带 option，PUT 只覆盖给出的字段（未传的保持不变）。
+  assert.deepEqual(readBack.option, DEFAULT_OPTION_SETTINGS);
+  const optionPatched = json(
+    await app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      payload: { option: { cash: { US: 3000 }, settlementMode: 'manual' } },
+    }),
+  );
+  assert.equal(optionPatched.option.cash.US, 3000);
+  assert.equal(optionPatched.option.cash.HK, DEFAULT_OPTION_SETTINGS.cash.HK, '未传的市场现金保持不变');
+  assert.equal(optionPatched.option.settlementMode, 'manual');
+  assert.equal(optionPatched.option.runWithPipeline, DEFAULT_OPTION_SETTINGS.runWithPipeline);
+  assert.equal(repo.getSettings().option.cash.US, 3000, '期权现金设置真的落库');
+  // 还原，避免影响后续用例对默认值的假设。
+  await app.inject({ method: 'PUT', url: '/api/settings', payload: { option: { cash: { US: 0 }, settlementMode: 'auto' } } });
 
   // Omitted → keep; empty string → keep; null → clear.
   const keep = json(await app.inject({ method: 'PUT', url: '/api/settings', payload: { llm: { model: 'deepseek-reasoner' } } }));
@@ -875,6 +892,11 @@ test('advice: 列表+预算、驳回、确认写入交易', async () => {
   assert.equal(list.budget.month, MONTH);
   assert.equal(list.budget.markets.length, 3);
   assert.equal(list.items[0].amount, 1000, 'amount = targetShares × targetPrice');
+  // 每条建议都带 instrument/option：界面与确认流程据此分流（股票写流水 / 期权写持仓）。
+  assert.ok(
+    list.items.every((item: { instrument?: string; option?: unknown }) => item.instrument === 'stock' && item.option === null),
+    '股票建议的 instrument=stock 且没有卖权方案',
+  );
 
   const rejected = await app.inject({ method: 'POST', url: `/api/advice/${rejectId}/reject` });
   assert.equal(rejected.statusCode, 200);
@@ -999,11 +1021,17 @@ test('backup: 导出剔除 apiKey，导入 merge/replace 往返一致', async ()
   assert.equal(payload.settings!.hasApiKey, true);
   assert.equal(payload.settings!.apiKeyMasked, 'sk-****abcd');
   assert.ok(!exported.body.includes(RAW_API_KEY), '导出内容不得包含明文 Key');
+  // 期权卖权：合约/结算进 payload，期权设置随 settings 一起导出（此处还没有期权数据）。
+  assert.deepEqual(payload.optionContracts, []);
+  assert.deepEqual(payload.optionSettlements, []);
+  assert.ok(payload.settings!.option, '期权设置必须出现在备份里');
 
   // merge into the same database → everything deduped.
   const merge = json(await app.inject({ method: 'POST', url: '/api/backup/import', payload: { data: payload, mode: 'merge' } }));
   assert.equal(merge.mode, 'merge');
   assert.equal(merge.assets, 0);
+  assert.equal(merge.optionContracts, 0);
+  assert.equal(merge.optionSettlements, 0);
   assert.ok(merge.skipped >= payload.assets.length);
 
   // Wipe, then restore with replace.
@@ -1019,6 +1047,8 @@ test('backup: 导出剔除 apiKey，导入 merge/replace 往返一致', async ()
   assert.equal(replaced.assets, payload.assets.length);
   assert.equal(replaced.transactions, payload.transactions.length);
   assert.equal(replaced.watchlist, payload.watchlist.length);
+  assert.equal(replaced.optionContracts, 0);
+  assert.equal(replaced.optionSettlements, 0);
 
   const restored = repo.listAssets();
   assert.equal(restored.length, payload.assets.length);
@@ -1406,6 +1436,45 @@ test('backup/clear: 一键清除所有数据（默认保留 AI 配置，可恢�
   repo.addStep({ id: crypto.randomUUID(), runId, index: 0, label: '步骤', status: 'done' });
   repo.setKv('clear.test', '1');
 
+  // 期权持仓与到期结算也是用户数据：一键清除必须连带清掉，否则合约悬挂。
+  const optionContract = repo.createOptionContract({
+    id: crypto.randomUUID(),
+    strategy: 'covered_call',
+    market: 'US',
+    underlyingCode: 'CLEARME',
+    underlyingName: '清除测试',
+    optionCode: 'CLEARME261218C00010000',
+    optionType: 'call',
+    strike: 10,
+    expiry: '2026-12-18',
+    contracts: 1,
+    multiplier: 100,
+    currency: 'USD',
+    premium: 1,
+    premiumIncome: 99,
+    collateralKind: 'shares',
+    collateral: 0,
+    status: 'open',
+    openedAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  repo.upsertOptionSettlement({
+    id: crypto.randomUUID(),
+    contractId: optionContract.id,
+    expiry: optionContract.expiry,
+    evaluatedAt: new Date().toISOString(),
+    referencePrice: 9,
+    priceSource: 'test',
+    verdict: 'otm_no_assignment',
+    itmAmount: 0,
+    itmPct: 0,
+    status: 'auto_settled',
+    action: 'none',
+    realizedPnl: 99,
+    createdAt: new Date().toISOString(),
+  });
+
   // 参数非布尔 → 400，且不得清掉任何东西。
   const bad = await app.inject({ method: 'POST', url: '/api/backup/clear', payload: { keepSettings: 'yes' } });
   assert.equal(bad.statusCode, 400);
@@ -1423,6 +1492,8 @@ test('backup/clear: 一键清除所有数据（默认保留 AI 配置，可恢�
   assert.ok(body.chatSessions >= 1);
   assert.ok(body.chatMessages >= 1);
   assert.ok(body.kvEntries >= 1);
+  assert.ok(body.optionContracts >= 1, '期权合约必须被清空并计数');
+  assert.ok(body.optionSettlements >= 1);
   assert.equal(body.settingsReset, false);
   assert.ok(body.deleted >= body.assets + body.transactions + body.watchlist + body.runs);
 
@@ -1433,6 +1504,8 @@ test('backup/clear: 一键清除所有数据（默认保留 AI 配置，可恢�
     advice: [],
     ipoOffers: [],
     ipoSubscriptions: [],
+    optionContracts: [],
+    optionSettlements: [],
   });
   assert.equal(repo.listRuns().length, 0);
   assert.equal(repo.listSessions().length, 0);
@@ -1923,4 +1996,37 @@ test('打新：分析端点存在，且未配置模型时明确报错（不静�
   const started = await app.inject({ method: 'POST', url: '/api/ipo/analyze' });
   assert.equal(started.statusCode, 400, 'agent stub 未配置 → 必须 400 而不是挂起');
   assert.equal(json(started).error.code, 'NOT_CONFIGURED');
+});
+
+/* ───────────── 自动续跑状态（/api/agent/retry）+ 拒绝重复续跑 ───────────── */
+
+/**
+ * 契约：本文件只装配 `buildApp`、从未创建 scheduler，因此 `/api/agent/retry` 必须
+ * 返回合法结构（`pending=null`）而不是 500；已被系统自动续跑成功的 run 不允许用户
+ * 再手动续跑（409）—— 同一份轨迹再跑一遍只会重复烧 token（见 services/auto-retry.ts）。
+ */
+test('agent/retry：无调度器时返回 pending=null；已自动续跑成功的 run 拒绝再次续跑', async () => {
+  const retry = await app.inject({ method: 'GET', url: '/api/agent/retry' });
+  assert.equal(retry.statusCode, 200);
+  assert.deepEqual(json(retry), { pending: null, maxAttempts: 3 }, '没有调度器时也必须返回固定上限');
+
+  const runId = crypto.randomUUID();
+  repo.createRun({
+    id: runId,
+    kind: 'asset-analysis',
+    status: 'error',
+    target: null,
+    title: '资产分析',
+    error: 'LLM 上游错误（HTTP 502）：Bad Gateway（已自动续跑：第 1/3 次，新运行 abcd1234）',
+    startedAt: new Date().toISOString(),
+  });
+
+  const resumed = await app.inject({ method: 'POST', url: `/api/agent/runs/${runId}/resume` });
+  assert.equal(resumed.statusCode, 409, '已自动续跑成功的 run 再次 resume 必须 409');
+  assert.equal(json(resumed).error.code, 'CONFLICT');
+  assert.match(json(resumed).error.message, /已由系统自动续跑成功/);
+
+  // 不存在的 run 仍是 404：两种拒绝可区分。
+  const missing = await app.inject({ method: 'POST', url: '/api/agent/runs/does-not-exist/resume' });
+  assert.equal(missing.statusCode, 404);
 });

@@ -326,6 +326,8 @@ function adviceRow(patch: Partial<AdviceRow> = {}): AdviceRow {
     code: '601899',
     market: 'CN',
     type: 'stock',
+    // 建议行新增的两列：本文件一律按股票建议（无卖权方案）构造。
+    instrument: 'stock',
     action: 'buy',
     targetShares: 50,
     targetPrice: 29.98,
@@ -337,6 +339,7 @@ function adviceRow(patch: Partial<AdviceRow> = {}): AdviceRow {
     executedPrice: null,
     createdAt: new Date().toISOString(),
     decidedAt: null,
+    option: null,
     ...patch,
   };
 }

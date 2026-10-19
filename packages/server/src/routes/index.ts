@@ -12,6 +12,7 @@ import { registerAssetRoutes } from './assets.js';
 import { registerWatchlistRoutes } from './watchlist.js';
 import { registerAdviceRoutes } from './advice.js';
 import { registerIpoRoutes } from './ipo.js';
+import { registerOptionRoutes } from './options.js';
 import { registerDashboardRoutes } from './dashboard.js';
 import { registerBackupRoutes } from './backup.js';
 import { registerMarketRoutes } from './market.js';
@@ -33,6 +34,8 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   await registerAdviceRoutes(app);
   // 新股打新：发行期数据（A股/港股/美股）+ 申购登记 + 中签入账。
   await registerIpoRoutes(app);
+  // 期权卖权：期权链/候选、卖权建议确认、在手合约、到期结算。
+  await registerOptionRoutes(app);
   await registerDashboardRoutes(app);
   await registerBackupRoutes(app);
   await registerMarketRoutes(app);

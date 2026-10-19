@@ -36,6 +36,10 @@ export const SCHEMA_STATEMENTS: string[] = [
      schedule_run_watchlist INTEGER NOT NULL DEFAULT 1,
      schedule_run_advice INTEGER NOT NULL DEFAULT 1,
      schedules TEXT NOT NULL DEFAULT '[]',
+     option_cash_hkd REAL NOT NULL DEFAULT 0,
+     option_cash_usd REAL NOT NULL DEFAULT 0,
+     option_settle_mode TEXT NOT NULL DEFAULT 'auto',
+     option_run_with_pipeline INTEGER NOT NULL DEFAULT 1,
      last_run_at TEXT,
      updated_at TEXT NOT NULL DEFAULT ''
    )`,
@@ -129,6 +133,10 @@ export const SCHEMA_STATEMENTS: string[] = [
      status TEXT NOT NULL DEFAULT 'pending',
      executed_shares REAL,
      executed_price REAL,
+     /* 期权卖权（2026-10 增）：'stock' | 'option' 决定确认时走哪条入账路径。 */
+     instrument TEXT NOT NULL DEFAULT 'stock',
+     /* 卖权方案 JSON（OptionAdvicePlan）；instrument='option' 时非空。 */
+     option_plan TEXT NOT NULL DEFAULT '',
      created_at TEXT NOT NULL,
      decided_at TEXT
    )`,
@@ -163,6 +171,74 @@ export const SCHEMA_STATEMENTS: string[] = [
      status TEXT NOT NULL DEFAULT 'tracking',
      warnings TEXT NOT NULL DEFAULT '[]',
      updated_at TEXT NOT NULL DEFAULT ''
+   )`,
+
+  /* ── 期权卖权：卖出的合约（一笔合约一条；到期/平仓后仍保留历史） ───────────── */
+  `CREATE TABLE IF NOT EXISTS option_contracts (
+     id TEXT PRIMARY KEY,
+     /* 来源建议 id（手工登记时为空）。 */
+     advice_id TEXT,
+     /* 'covered_call' | 'cash_secured_put' */
+     strategy TEXT NOT NULL DEFAULT 'covered_call',
+     market TEXT NOT NULL DEFAULT 'US',
+     underlying_code TEXT NOT NULL DEFAULT '',
+     underlying_name TEXT NOT NULL DEFAULT '',
+     /* 关联的「我的资产」持仓（覆盖式卖 Call 必有）。 */
+     underlying_asset_id TEXT,
+     option_code TEXT NOT NULL DEFAULT '',
+     option_type TEXT NOT NULL DEFAULT 'call',
+     strike REAL NOT NULL DEFAULT 0,
+     /* 到期日 YYYY-MM-DD。 */
+     expiry TEXT NOT NULL,
+     contracts INTEGER NOT NULL DEFAULT 0,
+     /* 每张对应的标的股数（美股 100；港股按 HKEX 合约乘数）。 */
+     multiplier REAL NOT NULL DEFAULT 100,
+     currency TEXT NOT NULL DEFAULT 'USD',
+     /* 卖出时的每股价权利金。 */
+     premium REAL NOT NULL DEFAULT 0,
+     fee REAL NOT NULL DEFAULT 0,
+     /* 权利金收入 = premium * multiplier * contracts - fee。 */
+     premium_income REAL NOT NULL DEFAULT 0,
+     /* 'shares' | 'cash' */
+     collateral_kind TEXT NOT NULL DEFAULT 'shares',
+     collateral REAL NOT NULL DEFAULT 0,
+     underlying_price_at_open REAL NOT NULL DEFAULT 0,
+     /* 'open' | 'closed' | 'assigned' | 'expired_otm' */
+     status TEXT NOT NULL DEFAULT 'open',
+     opened_at TEXT NOT NULL,
+     closed_at TEXT,
+     close_price REAL,
+     realized_pnl REAL,
+     note TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
+
+  /* ── 期权卖权：到期行权跟踪（一个合约一条，幂等；auto_settled 会写股票流水） ─ */
+  `CREATE TABLE IF NOT EXISTS option_settlements (
+     id TEXT PRIMARY KEY,
+     contract_id TEXT NOT NULL UNIQUE,
+     expiry TEXT NOT NULL DEFAULT '',
+     evaluated_at TEXT NOT NULL,
+     /* 结算参考价（美股到期日收盘价 / 港股 HKEX 结算价或收市价）。 */
+     reference_price REAL NOT NULL DEFAULT 0,
+     /* 参考价口径与来源，必须展示给用户。 */
+     price_source TEXT NOT NULL DEFAULT '',
+     /* 'otm_no_assignment' | 'assigned' | 'uncertain' */
+     verdict TEXT NOT NULL DEFAULT 'uncertain',
+     /* 实值金额（每股，本币）：实值时为正。 */
+     itm_amount REAL NOT NULL DEFAULT 0,
+     itm_pct REAL NOT NULL DEFAULT 0,
+     /* 'auto_settled' | 'pending_review' | 'confirmed' | 'dismissed' */
+     status TEXT NOT NULL DEFAULT 'pending_review',
+     /* 'none' | 'shares_delivered' | 'shares_received' | 'pending' */
+     action TEXT NOT NULL DEFAULT 'none',
+     /* 生成的股票交易流水 id（交股/收股时非空）。 */
+     transaction_id TEXT,
+     asset_id TEXT,
+     realized_pnl REAL NOT NULL DEFAULT 0,
+     note TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL
    )`,
 
   /* ── 新股打新：打新标的（按 uid 整体覆盖刷新） ────────────────────────────── */
@@ -352,6 +428,13 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS idx_ipo_offers_status ON ipo_offers(status)',
   'CREATE INDEX IF NOT EXISTS idx_ipo_offers_listing ON ipo_offers(listing_date)',
   'CREATE INDEX IF NOT EXISTS idx_ipo_subscriptions_status ON ipo_subscriptions(status)',
+  /* 期权卖权：列表按状态 + 到期日取（到期扫描只查 open 且已到期的）。 */
+  'CREATE INDEX IF NOT EXISTS idx_option_contracts_status ON option_contracts(status, expiry)',
+  'CREATE INDEX IF NOT EXISTS idx_option_contracts_expiry ON option_contracts(expiry)',
+  'CREATE INDEX IF NOT EXISTS idx_option_contracts_underlying ON option_contracts(underlying_asset_id)',
+  'CREATE INDEX IF NOT EXISTS idx_option_contracts_market ON option_contracts(market, opened_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_option_settlements_status ON option_settlements(status, expiry)',
+  'CREATE INDEX IF NOT EXISTS idx_option_settlements_expiry ON option_settlements(expiry)',
 ];
 
 /** Applies pragmas, creates missing tables/columns/indexes. Idempotent. */
@@ -387,6 +470,14 @@ export function migrateSchema(db: DatabaseSync): void {
   ensureColumn(db, 'ipo_offers', 'expected_return', 'REAL NOT NULL DEFAULT 0');
   // 一句话结论理由（2026-10-17 补）：高胜率却判「本期不参与」时必须能说明绑定约束（预算/一手金额）。
   ensureColumn(db, 'ipo_offers', 'verdict_reason', "TEXT NOT NULL DEFAULT ''");
+  // 期权卖权（2026-10 增）：建议行的标的种类 + 卖权方案 JSON。
+  ensureColumn(db, 'advice', 'instrument', "TEXT NOT NULL DEFAULT 'stock'");
+  ensureColumn(db, 'advice', 'option_plan', "TEXT NOT NULL DEFAULT ''");
+  // 期权卖权设置：各市场可用现金、到期结算模式、是否随流水线一起跑。
+  ensureColumn(db, 'settings', 'option_cash_hkd', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn(db, 'settings', 'option_cash_usd', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn(db, 'settings', 'option_settle_mode', "TEXT NOT NULL DEFAULT 'auto'");
+  ensureColumn(db, 'settings', 'option_run_with_pipeline', 'INTEGER NOT NULL DEFAULT 1');
 
   for (const statement of INDEX_STATEMENTS) db.exec(statement);
 }

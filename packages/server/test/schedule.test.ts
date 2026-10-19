@@ -93,21 +93,36 @@ test('步骤并集：多个任务同时到期时，某一步只要任一任务�
     skipAsset: false,
     skipWatchlist: true,
     skipIpo: true,
+    // 期权卖权没有独立的任务字段，跟随「投资建议」步骤（task-7 裁定）。
+    skipOption: false,
     skipAdvice: false,
   });
-  assert.deepEqual(mergeTaskFlags([assetOnly]), { skipAsset: false, skipWatchlist: true, skipIpo: true, skipAdvice: true });
+  assert.deepEqual(mergeTaskFlags([assetOnly]), {
+    skipAsset: false,
+    skipWatchlist: true,
+    skipIpo: true,
+    skipOption: true,
+    skipAdvice: true,
+  });
   // 打新分析是 2026-10 新增的独立步骤：只要有一个任务要它，这次流水线就跑它。
   assert.deepEqual(mergeTaskFlags([assetOnly, ipoOnly]), {
     skipAsset: false,
     skipWatchlist: true,
     skipIpo: false,
+    skipOption: true,
     skipAdvice: true,
   });
   // 空集合（理论上不会发生）保守地跑全流程。
-  assert.deepEqual(mergeTaskFlags([]), { skipAsset: false, skipWatchlist: false, skipIpo: false, skipAdvice: false });
+  assert.deepEqual(mergeTaskFlags([]), {
+    skipAsset: false,
+    skipWatchlist: false,
+    skipIpo: false,
+    skipOption: false,
+    skipAdvice: false,
+  });
   assert.deepEqual(taskStepLabels(assetOnly), ['资产分析']);
   assert.deepEqual(taskStepLabels(ipoOnly), ['打新分析']);
-  assert.deepEqual(taskStepLabels(task()), ['资产分析', '标的分析', '打新分析', '投资建议']);
+  assert.deepEqual(taskStepLabels(task()), ['资产分析', '标的分析', '打新分析', '期权卖权', '投资建议']);
   assert.equal(describeTask(task({ mode: 'interval', intervalMinutes: 30 })), '每 30 分钟');
   assert.equal(describeTask(task({ mode: 'daily', dailyTime: '08:45' })), '每天 08:45');
   assert.match(describeTask(task({ enabled: false })), /已停用/);
@@ -204,7 +219,11 @@ test('调度器：多个任务只武装一个定时器，到期的任务合并�
     clock += 30 * 60_000;
     await fire();
     assert.equal(isPipelineRunning(), false, '流水线跑完必须释放锁');
-    assert.deepEqual(calls, ['asset-analysis', 'advice'], '资产分析 + 投资建议都要跑，标的分析没人要 → 跳过');
+    assert.deepEqual(
+      calls,
+      ['asset-analysis', 'option-advice', 'advice'],
+      '资产分析 + 投资建议都要跑（期权卖权跟随投资建议），标的分析没人要 → 跳过',
+    );
 
     // 跑完各自重排：仍按 30 分钟间隔，且一定是未来时间（D7 回归护栏）。
     const after = scheduler.plan();

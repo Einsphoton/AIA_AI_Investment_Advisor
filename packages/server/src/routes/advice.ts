@@ -95,6 +95,18 @@ export async function registerAdviceRoutes(app: FastifyInstance): Promise<void> 
     const advice = requireAdvice(id);
     if (advice.status !== 'pending') throw conflict(`该建议当前状态为 ${advice.status}，无法执行`);
 
+    // 期权卖权建议必须走合约确认：这条路径会把 action='sell' 当股票卖出（校验持仓、
+    // 写 stock 交易流水），而期权要写的是 option_contracts（只有权利金流入）。
+    // 分流判断必须放在下面「卖出无持仓」之前——否则用户看到的是误导性的「没有对应持仓」。
+    if (advice.instrument === 'option') {
+      throw badRequest('该建议是期权卖权建议，请按合约条件确认', {
+        code: 'USE_CONFIRM_OPTION',
+        instrument: advice.instrument,
+        endpoint: `/api/advice/${advice.id}/confirm-option`,
+        hint: '期权确认需要填张数 / 权利金 / 到期日（可选行权价），参数见 ConfirmOptionAdviceInput。',
+      });
+    }
+
     const tradeDate = body.tradeDate ?? localDate();
     const now = nowIso();
 

@@ -76,6 +76,14 @@ export interface PipelineStepFlags {
   skipAsset: boolean;
   skipWatchlist: boolean;
   skipIpo: boolean;
+  /**
+   * 期权卖权阶段（独立 run kind `option-advice`）。
+   *
+   * 刻意**不**新增 `ScheduleTask` 字段：期权阶段跟随「投资建议」步骤一起跑，
+   * 避免「任务开了期权、设置关了流水线」两套开关互相打架。全局总开关是
+   * `settings.option.runWithPipeline`（见 services/advice.ts 的 planPipeline）。
+   */
+  skipOption: boolean;
   skipAdvice: boolean;
 }
 
@@ -94,6 +102,8 @@ export function mergeTaskFlags(tasks: ScheduleTask[]): PipelineStepFlags {
     skipAsset: !step((task) => task.runAssetAnalysis),
     skipWatchlist: !step((task) => task.runWatchlistAnalysis),
     skipIpo: !step((task) => task.runIpoAnalysis),
+    // 期权卖权没有独立的任务开关：跟着「投资建议」一起跑（Lead 裁定，见 PipelineStepFlags）。
+    skipOption: !step((task) => task.runAdvice),
     skipAdvice: !step((task) => task.runAdvice),
   };
 }
@@ -111,6 +121,8 @@ export function taskStepLabels(task: ScheduleTask): string[] {
   if (task.runAssetAnalysis) steps.push('资产分析');
   if (task.runWatchlistAnalysis) steps.push('标的分析');
   if (task.runIpoAnalysis) steps.push('打新分析');
+  // 期权卖权跟随投资建议步骤（无独立开关），日志里也要能看出来它会跑。
+  if (task.runAdvice) steps.push('期权卖权');
   if (task.runAdvice) steps.push('投资建议');
   return steps;
 }

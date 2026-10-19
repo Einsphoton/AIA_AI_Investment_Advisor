@@ -7,12 +7,20 @@
  *
  * Owner: agent-engine.
  */
-import { PERSONA_MAP, type AgentRun, type AgentRunKind, type AgentRunSummary } from '@aia/shared';
+import { PERSONA_MAP, type AgentRun, type AgentRunKind, type AgentRunSummary, type OptionSettings } from '@aia/shared';
 import { AppError } from '../errors.js';
 import type { Repo } from '../types/repo.js';
 import { budgetLine, computeBudgetStatus } from '../agent/budget.js';
 import { compactHolding, round } from '../agent/positions.js';
-import { runAssetAnalysis, runIpoAnalysis, runWatchlistAnalysis, safeSettings, trimForPrompt, type PipelineContext } from './analytics.js';
+import {
+  runAssetAnalysis,
+  runIpoAnalysis,
+  runOptionAdvice,
+  runWatchlistAnalysis,
+  safeSettings,
+  trimForPrompt,
+  type PipelineContext,
+} from './analytics.js';
 import { listIpoPayload } from './ipo.js';
 
 export interface FullPipelineOptions {
@@ -20,7 +28,67 @@ export interface FullPipelineOptions {
   skipWatchlist?: boolean;
   /** 打新分析（新股发行信息刷新 + 是否申购结论）。 */
   skipIpo?: boolean;
+  /** 期权卖权阶段（独立 run kind `option-advice`）；还受 `settings.option.runWithPipeline` 控制。 */
+  skipOption?: boolean;
   skipAdvice?: boolean;
+}
+
+/** 本次流水线实际要执行的阶段（纯函数，便于测试 skipOption × runWithPipeline 的组合）。 */
+export interface PipelinePlan {
+  asset: boolean;
+  watchlist: boolean;
+  ipo: boolean;
+  option: boolean;
+  advice: boolean;
+}
+
+/**
+ * 阶段开关的**唯一**判定点。
+ *
+ * 期权阶段有两道闸门，缺一不可：
+ *   · 调用方跳过（定时任务的 `runAdvice=false` 会通过 `mergeTaskFlags` 映射成 `skipOption=true`，
+ *     见 services/schedule.ts——刻意不给 ScheduleTask 加独立字段，避免两套开关打架）；
+ *   · 全局设置 `settings.option.runWithPipeline` 关掉时整段不跑（用户只想跑股票建议）。
+ */
+export function planPipeline(
+  options: FullPipelineOptions,
+  option: Pick<OptionSettings, 'runWithPipeline'>,
+): PipelinePlan {
+  return {
+    asset: !options.skipAsset,
+    watchlist: !options.skipWatchlist,
+    ipo: !options.skipIpo,
+    option: !options.skipOption && option.runWithPipeline !== false,
+    advice: !options.skipAdvice,
+  };
+}
+
+/**
+ * 流水线跑完但有阶段失败。
+ *
+ * `runFullPipeline` 过去只看「最后一条 run」：中间阶段失败也继续往下跑，最后返回
+ * 最后一条（可能成功、也可能失败），定时器无从知道前面已经失败。现在把本轮所有
+ * 阶段 run 收集起来，只要有一条 `status='error'` 就抛这个错误：
+ *
+ *   · `failedRuns` 交给 `services/scheduler.ts` 做「自动续跑」判定与 resume；
+ *   · 手工 SSE 入口由 `routes/agent.ts` 转成用户可见的 `error` 事件。
+ *
+ * 注意：**不**在第一个失败阶段立刻中断 —— 各阶段相互独立（标的/打新/期权），
+ * 让其它阶段照常跑完，失败的那一条单独续跑，避免已成功的工作白做。
+ */
+export class PipelineFailureError extends Error {
+  readonly failedRuns: AgentRun[];
+  readonly plan: PipelinePlan;
+
+  constructor(failedRuns: AgentRun[], plan: PipelinePlan) {
+    const detail = failedRuns
+      .map((run) => `${run.title || run.kind}：${run.error ?? '未知错误'}`)
+      .join('；');
+    super(`AI 分析未完成：${detail}`);
+    this.name = 'PipelineFailureError';
+    this.failedRuns = failedRuns;
+    this.plan = plan;
+  }
 }
 
 /** Runs the 建议生成 pipeline (assumes asset/watchlist analysis already done). */
@@ -113,25 +181,32 @@ export async function runAdvice(context: PipelineContext): Promise<AgentRun> {
   return run;
 }
 
-/** asset analysis → watchlist analysis → advice (used by `/api/agent/run-now`). */
+/** asset analysis → watchlist analysis → ipo → option → advice (used by `/api/agent/run-now`). */
 export async function runFullPipeline(context: PipelineContext, options: FullPipelineOptions = {}): Promise<AgentRun> {
-  const { skipAsset, skipWatchlist, skipIpo, skipAdvice } = options;
-  if (skipAsset && skipWatchlist && skipIpo && skipAdvice) {
+  const plan = planPipeline(options, safeSettings(context.repo).option);
+  if (!plan.asset && !plan.watchlist && !plan.ipo && !plan.option && !plan.advice) {
     throw new AppError(409, 'NOTHING_TO_RUN', '本次流水线未勾选任何步骤');
   }
-  let last: AgentRun | null = null;
-  if (!skipAsset) last = await runAssetAnalysis(context);
-  if (!skipWatchlist) last = await runWatchlistAnalysis(context);
+  // 收集本轮所有阶段的 run：失败的那几条要交给调度器自动续跑（见 PipelineFailureError）。
+  const runs: AgentRun[] = [];
+  if (plan.asset) runs.push(await runAssetAnalysis(context));
+  if (plan.watchlist) runs.push(await runWatchlistAnalysis(context));
   // 打新分析排在建议之前：新股的「是否申购」结论会影响当月的资金安排。
-  if (!skipIpo) last = await runIpoAnalysis(context);
-  if (!skipAdvice) last = await runAdvice(context);
+  if (plan.ipo) runs.push(await runIpoAnalysis(context));
+  // 期权卖权插在股票建议之前：卖 Put 的现金担保与卖 Call 的持股都占用当月资源，
+  // 股票建议必须看到这些占用，否则同一笔钱会被两条建议重复使用。
+  if (plan.option) runs.push(await runOptionAdvice(context));
+  if (plan.advice) runs.push(await runAdvice(context));
+  const last = runs[runs.length - 1];
   if (!last) throw new AppError(500, 'NO_RUN', '流水线未产生任何运行记录');
+  const failed = runs.filter((run) => run.status === 'error');
+  if (failed.length > 0) throw new PipelineFailureError(failed, plan);
   return last;
 }
 
 /**
  * 流水线步骤开关由调用方给出：定时入口（`services/scheduler.ts`）按**到期任务的并集**
- * 计算（`mergeTaskFlags`），手工入口不传 = 四步全跑。
+ * 计算（`mergeTaskFlags`），手工入口不传 = 五步全跑（期权阶段仍受设置里的总开关约束）。
  */
 
 /** Latest run summary of a kind, for `GET /api/.../last` endpoints. */

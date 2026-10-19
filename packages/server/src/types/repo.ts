@@ -17,6 +17,9 @@ import type {
   ImportResult,
   IpoMarketStatus,
   Market,
+  OptionMarket,
+  OptionPositionStatus,
+  OptionSettlementStatus,
   PendingWriteStatus,
   ToolRisk,
   WatchItemStatus,
@@ -36,9 +39,15 @@ import type {
   NewAsset,
   NewIpoOffer,
   NewIpoSubscription,
+  NewOptionContract,
+  NewOptionSettlement,
   NewStep,
   NewTx,
   NewWatch,
+  OptionContractPatch,
+  OptionContractRow,
+  OptionSettlementPatch,
+  OptionSettlementRow,
   PendingWriteRow,
   RunMessageRow,
   RunRow,
@@ -57,6 +66,9 @@ export interface ExportBundle {
   /** 新股打新：标的 + 我的申购记录（老备份缺失时按空数组处理）。 */
   ipoOffers: IpoOfferRow[];
   ipoSubscriptions: IpoSubscriptionRow[];
+  /** 期权卖权：卖出的合约 + 到期结算记录（老备份缺失时按空数组处理）。 */
+  optionContracts: OptionContractRow[];
+  optionSettlements: OptionSettlementRow[];
 }
 
 /** 自选池筛选：`all` 用于 prompt / 备份 / 计数，其余用于列表展示。 */
@@ -85,6 +97,8 @@ export interface SettingsPatch {
   toolPolicy?: Partial<StoredSettings['toolPolicy']>;
   /** P1-2: MCP servers (replaced wholesale when provided). */
   mcpServers?: StoredSettings['mcpServers'];
+  /** 期权卖权设置：可用现金（分市场）+ 到期结算模式 + 是否随流水线跑。 */
+  option?: Partial<Omit<StoredSettings['option'], 'cash'>> & { cash?: Partial<StoredSettings['option']['cash']> };
   lastRunAt?: string | null;
 }
 
@@ -161,6 +175,35 @@ export interface Repo {
   /** 插入或按 `offerUid` 更新（登记申购、录入中签都用它，重复调用收敛到一条）。 */
   upsertIpoSubscription(input: NewIpoSubscription): IpoSubscriptionRow;
   deleteIpoSubscription(id: string): boolean;
+
+  /* ── 期权卖权：卖出的合约与到期结算 ─────────────────────────────────────── */
+  /**
+   * 卖出合约列表。
+   *
+   * `status='all'` 用于历史复盘（含已到期/已平仓）；默认按 `opened_at DESC`。
+   * `expiringOnOrBefore` 供到期扫描器用（只取 `status='open'` 且到期日已过的）。
+   */
+  listOptionContracts(filter?: {
+    status?: OptionPositionStatus | 'all';
+    market?: OptionMarket;
+    underlyingAssetId?: string;
+    expiringOnOrBefore?: string;
+  }): OptionContractRow[];
+  getOptionContract(id: string): OptionContractRow | undefined;
+  createOptionContract(input: NewOptionContract): OptionContractRow;
+  updateOptionContract(id: string, patch: OptionContractPatch): OptionContractRow | undefined;
+  deleteOptionContract(id: string): boolean;
+  /** 结算记录（一合约一条）。`status='all'` 含已确认/已忽略的历史。 */
+  listOptionSettlements(filter?: {
+    status?: OptionSettlementStatus | 'all';
+    contractId?: string;
+    expiry?: string;
+  }): OptionSettlementRow[];
+  getOptionSettlement(id: string): OptionSettlementRow | undefined;
+  findOptionSettlementByContract(contractId: string): OptionSettlementRow | undefined;
+  /** 按 `contract_id` 插入或更新：重复扫描同一天不会产生第二条记录。 */
+  upsertOptionSettlement(input: NewOptionSettlement): OptionSettlementRow;
+  updateOptionSettlement(id: string, patch: OptionSettlementPatch): OptionSettlementRow | undefined;
 
   /* ── agent runs ────────────────────────────────────────────────────────── */
   createRun(input: Omit<RunRow, 'finishedAt' | 'summary' | 'error' | 'turns' | 'promptTokens' | 'completionTokens'> & Partial<RunRow>): RunRow;

@@ -264,3 +264,50 @@
 `POST /api/ipo/:id/allot` 把中签股数写进 `assets` + `transactions`（`source='ipo'`，可在「我的资产」里区分打新建仓）：
 重复回报是**修正**（删旧流水再写新，不累加）；`shares=0` 只记状态；未定价且未传缴款价 → 400 而不用 0 成本入账；
 中签缴款**不受预算闸门拦截**（钱已经花了），只在超出当月预算时写 `warnings`。契约见 `docs/API.md §12`。
+
+## 9. 期权链（港股 / 美股，零 Key）
+
+实现：`packages/server/src/datasources/options.ts`（归一化到 `OptionChainSnapshot`）→ `services/options.ts`
+（确定性指标与筛选）→ `routes/options.ts`。**这两个源有意不进 `SOURCE_CATALOGUE`**：那份目录是「按
+市场/类型解析行情与财报」的行情主链，期权链是按合约逐条取的口径，混进去会让 `get_quote` 的源选择
+逻辑失去意义（与打新源同理）。
+
+| 市场 | 端点 | 口径 | 实测与备注 |
+| --- | --- | --- | --- |
+| 美股 | `https://cdn.cboe.com/api/global/delayed_quotes/options/{SYMBOL}.json` | **延迟**报价（`delayed=true`） | 200：AAPL 1,498,581 B / 3,358 条 / 23 个到期，KO 456,744 B / 1,034 / 17，SPY 5,680,886 B / 12,730 / 33。`data.options[]` 含 OCC 码、`bid`/`ask` 及档位、`iv`、`open_interest`、`volume`、`delta`/`gamma`/`vega`/`theta`/`rho`、`theo`、`last_trade_price`；顶层 `data.current_price` / `close` / `iv30`。**必须长超时 + 重试**：CDN 连接超时率实测约 50%，单次 13–194 s。**符号区分大小写**（`aapl.json`=403）且未知代码返回 **403 `AccessDenied` XML（111 B）**——「无数据」不是 404，不能当网络错误重试 |
+| 美股（降级） | `https://api.nasdaq.com/api/quote/{SYM}/option-chain?assetclass=stocks&limit=N` | 延迟 | 200，但**没有 IV 也没有希腊字母**、`strike`/`bid` 是字符串（空值 `"--"`）、`expiryDate` 只有 `"Oct 19"` 无年份；`assetclass` 必须匹配（AAPL 用 `stocks`）。仅作最后兜底 |
+| 美股（可选） | `https://api.marketdata.app/v1/options/expirations/{SYM}/` | 延迟（HTTP **203** Non-Authoritative，不是错误） | 直接返回到期日字符串数组，最省事；其 chain 端点字段最全（有 `dte`/`inTheMoney`/`iv`/希腊字母），但默认只给最近一个到期。**不同上游的价格不可混用在同一个快照里** |
+| 港股 | `https://www.hkex.com.hk/eng/stat/dmstat/dayrpt/dqe{YYMMDD}.htm` | **每日收市报告**（`delayed=true`，EOD） | 港交所官方「STOCK OPTIONS DAILY MARKET REPORT」。实测 6,669,912 B / 4.1 s（2025-10-16），含 138 行 HKATS 标的汇总 + 139 个标的段落 / 58,408 行合约明细。**非交易日 = 404**（通用 404 页）→ 实现从今天往前逐日回退，最多 10 个自然日 |
+
+### 9.1 港股口径的特殊性（必须让用户看到）
+
+| 事项 | 事实（实测） | 处理 |
+| --- | --- | --- |
+| 到期日 | `CONTRACT` 列是**完整到期日** `DDMMMYY`（不是合约月份）：TCH/ALB 各 9 个到期，`17OCT25 24OCT25 30OCT25 27NOV25 30DEC25 29JAN26 30MAR26 29JUN26 29SEP26`，与官方「月度=该月最后营业日前一营业日、周度=该周最后营业日」**9/9 命中** | 直接解析使用，**不需要猜测或让用户确认** |
+| 希腊字母 | HKEX 每日报告**不提供** delta/gamma/vega/theta | `delta` 记 0 表示「未知」，不自己编造；被行权概率由服务层用虚值幅度 + IV 做正态近似，并在 `warnings` 明确标注「估算」 |
+| 报价 | 只有结算价（EOD），没有买卖盘 | `bid`/`ask` 缺失时不参与价差筛选，`liquidityScore` 不给高分，并给 warning |
+| IV | 只有平值系列有值，多数合约为 0（`0` = 上游未提供） | IV ≤ 0 视为缺失（`null`），不代入计算 |
+| 数据行 | 固定 12 个 token；`-` 是**字面量哨兵**（实测 124 行 / 58,408，占 0.21%），如 `... 0.01  -  70 ...` | 空格 split + 去千分位逗号 + `"-" → null`，否则 `NaN`；`+0.31` 这类带正号的值也要能解析 |
+| 标的映射 | 港股代码 → HKATS 代码**非一对一**：实测 `01211→BYA/BYD`、`01833→PHA/PHT`、`00288→WHD/WHE/WHG`、`00788→XTA/XTW`（调整系列） | 命中多个时取成交量+未平仓最大者并记 warning，不要随便取第一个 |
+| 合约乘数 | **乘数 ≠ 每手股数**，差异极大（100–20000）。官方 XLSX 实测：`00700→100`（=1 手）、`09988→500`（**5 手**）、`00005→400`（1 手）、`01810→1000`（**5 手**）、`03690→500`（**5 手**） | `HK_OPTION_MULTIPLIERS` 只登记**核对过官方合约规格**的标的；未登记的按 `HK_OPTION_MULTIPLIER_FALLBACK=100` 估算并**明确 warning**，界面提示以券商合约规格为准。用每手股数算权利金会把 9988/1810/3690 低估 5 倍 |
+| 行权价 | 报告里实际列出的行权价是**混合间距**（如 `00700 30DEC25` 同时有 5 与 10 的步长，`09988` 有 2.5 与 5） | **直接枚举报告里存在的行权价**，不要用官方间距表生成网格（间距表只用于校验用户自填值） |
+| 官方乘数来源 | `https://www.hkex.com.hk/Products/Listed-Derivatives/Single-Stock/Stock-Options?sc_lang=en`（页面内嵌表格）+ 机读 XLSX `.../The-List-of-Stock-Option-Classes-Available-for-Trading_YYYYMMDD.xlsx`（文件名带日期会变，**实现需先抓页面取当前 href**） | 实测均 200 |
+
+港股股票期权的官方合约条款（同来源实测原文）：**美式**行权、**实物股票交割**（T+1 权利金全额 / T+2 股票过户）、
+权利金按**每股**报价（权利金总额 = 权利金 × 合约乘数）、行权费 HK$2.00、交易时段 09:30–12:00 与 13:00–16:00。
+**「HKEX 是否默认自动行权」未实测到官方依据**（需复核）；报告里的 `SETTLEMENT PRICE` 数值可直接使用，但
+其计算口径同样未能从官方拿到（SEOCH 规则 PDF 404）——两者都**不要**在界面/注释里写成已核实的口径。
+
+### 9.2 到期结算用的参考价
+
+| 市场 | 来源 | 说明 |
+| --- | --- | --- |
+| 美股 | 既有日线行情源 | 取到期日（或之后第一个交易日）的收盘价，`priceSource` 写明来源与日期 |
+| 港股 | HKEX 当日报告的官方**收市价**（`CLASS … CLOSING PRICE HK$ …`，实测 139/139 个标的全部存在） | 报告只对交易日存在：取不到就往前逐日回退（最多 10 个自然日），并把**实际使用日期**写进 `priceSource`；两者都取不到 → 判定为「存疑」转待确认，**不猜价格** |
+
+**美股行权与结算规则的实测状态**：`theocc.com`、Cboe rule book、SEC、FINRA、`investor.gov` 相关页
+在本机**全部 403/404（WAF 拦截）**，因此「美式、实物交割 100 股/张、OCC ExByEx 实值 ≥ $0.01 自动行权、
+按标的官方收盘价判定」属**公开规则而非本项目实测结论**，代码注释与界面必须如实标注。到期日同理不能靠
+「每月第三个周五」推算（实测存在周一/周三/月末到期），只能从 OCC 码里枚举。
+
+结算规则的完整口径、自动入账边界与幂等保证见 `docs/API.md §13.3`。

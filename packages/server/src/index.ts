@@ -10,6 +10,7 @@ import { buildApp } from './app.js';
 import { createRepo } from './db/repo.js';
 import { createAgent } from './agent/runtime.js';
 import { createScheduler } from './services/scheduler.js';
+import { startOptionSettlementTimer, stopOptionSettlementTimer } from './services/options-settlement.js';
 import { setServices, setScheduler } from './registry.js';
 import { installToolInterceptor } from './agent/policy.js';
 import { initMcp, reloadMcpServers, shutdownMcp } from './services/mcp-manager.js';
@@ -57,6 +58,11 @@ async function main(): Promise<void> {
     'scheduler initialised',
   );
 
+  // 期权到期结算：独立于 AI 流水线的旁路（进程内定时，另外也能手工触发）。
+  // 刻意不挂到用户可见的「定时任务」上：结算是确定性计算，失败不该让整条流水线变红，
+  // 而且它只在有到期合约时才有事可做。写路径全部持流水线锁并在同一事务内判定+入账。
+  startOptionSettlementTimer();
+
   // P1-1: the tool interceptor enforces `toolPolicy` (deny list / write approval)
   // and writes the audit trail for every tool call, builtin or external.
   installToolInterceptor({ getRepo: () => repo, logger });
@@ -90,6 +96,7 @@ async function main(): Promise<void> {
     app.log.info(`received ${signal}, shutting down`);
     try {
       scheduler.stop();
+      stopOptionSettlementTimer();
       shutdownMcp();
       await app.close();
       repo.close();

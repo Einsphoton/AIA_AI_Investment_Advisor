@@ -22,13 +22,26 @@ import {
   type IpoOffer,
   type IpoSubscription,
   type LlmConfig,
+  type OptionPosition,
+  type OptionSettlement,
   type Settings,
   type Transaction,
 } from '@aia/shared';
 
 import { badRequest, notFound } from '../errors.js';
 import type { ExportBundle, Repo, SettingsPatch } from '../types/repo.js';
-import type { AdviceRow, AssetRow, IpoOfferRow, IpoSubscriptionRow, RunRow, StoredSettings, TxRow, WatchRow } from '../types/models.js';
+import type {
+  AdviceRow,
+  AssetRow,
+  IpoOfferRow,
+  IpoSubscriptionRow,
+  OptionContractRow,
+  OptionSettlementRow,
+  RunRow,
+  StoredSettings,
+  TxRow,
+  WatchRow,
+} from '../types/models.js';
 import { maskApiKey, maskDataSourceConfig, nowIso, round4, safeMessage, settingsPatch, toNumber } from '../db/util.js';
 import { toAdviceItem, toAssetSummary, toRunSummary, toTransaction, toWatchItem } from './portfolio.js';
 import {
@@ -72,6 +85,11 @@ export function buildBackupPayload(
     advice: bundle.advice.map(toAdviceItem),
     ipoOffers: bundle.ipoOffers.map((row) => toIpoOffer(row, bundle.ipoSubscriptions.find((sub) => sub.offerUid === row.uid) ?? null)),
     ipoSubscriptions: bundle.ipoSubscriptions.map(toIpoSubscription),
+    // 期权卖权：合约带上下它的结算记录（一个合约一条），恢复后「到期结论」不丢。
+    optionContracts: bundle.optionContracts.map((row) =>
+      optionPositionFromRow(row, bundle.optionSettlements.find((settlement) => settlement.contractId === row.id) ?? null),
+    ),
+    optionSettlements: bundle.optionSettlements.map(optionSettlementFromRow),
   };
 
   try {
@@ -104,6 +122,8 @@ export function settingsForBackup(stored: StoredSettings): NonNullable<BackupPay
     dataSources: maskDataSourceConfig(stored.dataSources),
     budget: stored.budget,
     schedules: stored.schedules,
+    // 期权卖权的现金担保额/结算模式/是否随流水线运行：都是用户配置，跟着备份走。
+    option: stored.option,
     enforceBudget: stored.enforceBudget,
     watchlistCandidateLimit: stored.watchlistCandidateLimit,
     watchlistRetireDeleteRuns: stored.watchlistRetireDeleteRuns,
@@ -117,15 +137,76 @@ export function settingsForBackup(stored: StoredSettings): NonNullable<BackupPay
   };
 }
 
+/* ─────────────────────── 期权卖权：库行 ↔ 线上结构 ─────────────────────────── */
+
+/**
+ * `OptionContractRow` → `OptionPosition`（备份线上结构）。
+ *
+ * 派生字段（`unrealizedPnl` / `daysToExpiry` / `underlyingPrice` / `moneyness`）要实时
+ * 行情才能算，导出时给**确定性中性值**（0 / 开仓时的标的价 / `unknown`），导入端原样忽略。
+ * `createdAt` / `updatedAt` 不在线上结构里：导入时按导入时间生成，持仓的语义时间戳
+ * （`openedAt` / `closedAt`）照常往返。
+ */
+function optionPositionFromRow(row: OptionContractRow, settlement: OptionSettlementRow | null): OptionPosition {
+  return {
+    id: row.id,
+    adviceId: row.adviceId,
+    strategy: row.strategy,
+    market: row.market,
+    underlyingCode: row.underlyingCode,
+    underlyingName: row.underlyingName,
+    underlyingAssetId: row.underlyingAssetId,
+    optionCode: row.optionCode,
+    optionType: row.optionType,
+    strike: row.strike,
+    expiry: row.expiry,
+    contracts: row.contracts,
+    multiplier: row.multiplier,
+    currency: row.currency,
+    premium: row.premium,
+    fee: row.fee,
+    premiumIncome: row.premiumIncome,
+    collateralKind: row.collateralKind,
+    collateral: row.collateral,
+    underlyingPriceAtOpen: row.underlyingPriceAtOpen,
+    status: row.status,
+    openedAt: row.openedAt,
+    closedAt: row.closedAt,
+    closePrice: row.closePrice,
+    realizedPnl: row.realizedPnl,
+    unrealizedPnl: 0,
+    daysToExpiry: 0,
+    underlyingPrice: row.underlyingPriceAtOpen,
+    moneyness: 'unknown',
+    settlement: settlement ? optionSettlementFromRow(settlement) : null,
+    note: row.note,
+  };
+}
+
+/** `OptionSettlementRow` → `OptionSettlement`：两侧结构一一对应，直接展开。 */
+function optionSettlementFromRow(row: OptionSettlementRow): OptionSettlement {
+  return { ...row };
+}
+
 /* ────────────────────────────────── import ────────────────────────────────── */
 
 const MARKETS = new Set(['CN', 'HK', 'US']);
 const TYPES = new Set(['stock', 'etf', 'fund']);
 const CREATORS = new Set(['manual', 'ai']);
 const TX_KINDS = new Set(['buy', 'sell']);
-const TX_SOURCES = new Set(['manual', 'ai', 'advice', 'ipo']);
+// `option`：到期结算写出的交割流水（交股/收股）必须保住来源，否则恢复后被降级成 manual。
+const TX_SOURCES = new Set(['manual', 'ai', 'advice', 'ipo', 'option']);
 const ACTIONS = new Set(['buy', 'sell']);
 const STATUSES = new Set(['pending', 'confirmed', 'rejected', 'expired']);
+const ADVICE_INSTRUMENTS = new Set(['stock', 'option']);
+const OPTION_MARKETS = new Set(['HK', 'US']);
+const OPTION_STRATEGIES = new Set(['covered_call', 'cash_secured_put']);
+const OPTION_TYPES = new Set(['call', 'put']);
+const OPTION_POSITION_STATUSES = new Set(['open', 'closed', 'assigned', 'expired_otm']);
+const OPTION_COLLATERAL_KINDS = new Set(['shares', 'cash']);
+const OPTION_SETTLEMENT_VERDICTS = new Set(['otm_no_assignment', 'assigned', 'uncertain']);
+const OPTION_SETTLEMENT_STATUSES = new Set(['auto_settled', 'pending_review', 'confirmed', 'dismissed']);
+const OPTION_SETTLEMENT_ACTIONS = new Set(['none', 'shares_delivered', 'shares_received', 'pending']);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -139,7 +220,16 @@ export function validateBackupPayload(input: unknown): BackupPayload {
   if (raw.schema !== undefined && raw.schema !== BACKUP_SCHEMA) {
     throw badRequest(`备份数据无效：schema 应为 ${BACKUP_SCHEMA}`, { schema: raw.schema });
   }
-  for (const key of ['assets', 'transactions', 'watchlist', 'advice', 'ipoOffers', 'ipoSubscriptions'] as const) {
+  for (const key of [
+    'assets',
+    'transactions',
+    'watchlist',
+    'advice',
+    'ipoOffers',
+    'ipoSubscriptions',
+    'optionContracts',
+    'optionSettlements',
+  ] as const) {
     if (raw[key] !== undefined && !Array.isArray(raw[key])) {
       throw badRequest(`备份数据无效：${key} 应为数组`);
     }
@@ -158,6 +248,12 @@ export function validateBackupPayload(input: unknown): BackupPayload {
     ipoOffers: Array.isArray(raw.ipoOffers) ? (raw.ipoOffers as BackupPayload['ipoOffers']) : undefined,
     ipoSubscriptions: Array.isArray(raw.ipoSubscriptions)
       ? (raw.ipoSubscriptions as BackupPayload['ipoSubscriptions'])
+      : undefined,
+    optionContracts: Array.isArray(raw.optionContracts)
+      ? (raw.optionContracts as BackupPayload['optionContracts'])
+      : undefined,
+    optionSettlements: Array.isArray(raw.optionSettlements)
+      ? (raw.optionSettlements as BackupPayload['optionSettlements'])
       : undefined,
     runs: Array.isArray(raw.runs) ? (raw.runs as BackupPayload['runs']) : undefined,
     settings: isRecord(raw.settings) ? (raw.settings as BackupPayload['settings']) : undefined,
@@ -289,6 +385,10 @@ export function toExportBundle(payload: BackupPayload, fallbackUpdatedAt = nowIs
       code: String(item.code ?? ''),
       market: market as AdviceRow['market'],
       type: type as AdviceRow['type'],
+      // 老备份没有 instrument 这一列：按股票建议处理（就是加列之前的行为）。
+      instrument: ADVICE_INSTRUMENTS.has(String(item.instrument))
+        ? (item.instrument as AdviceRow['instrument'])
+        : 'stock',
       action: action as AdviceRow['action'],
       targetShares: toNumber(item.targetShares),
       targetPrice: toNumber(item.targetPrice),
@@ -300,6 +400,8 @@ export function toExportBundle(payload: BackupPayload, fallbackUpdatedAt = nowIs
       executedPrice: item.executedPrice === null || item.executedPrice === undefined ? null : toNumber(item.executedPrice),
       createdAt: String(item.createdAt ?? fallbackUpdatedAt),
       decidedAt: (item.decidedAt as string | null) ?? null,
+      // 卖权方案随建议往返；缺字段/坏结构都按「没有方案」处理，不让一条脏数据毁掉整次导入。
+      option: isRecord(item.option) ? (item.option as unknown as AdviceRow['option']) : null,
     });
   }
 
@@ -324,7 +426,95 @@ export function toExportBundle(payload: BackupPayload, fallbackUpdatedAt = nowIs
     ipoSubscriptions.push(row as IpoSubscriptionRow);
   }
 
-  return { assets, transactions, watchlist, advice, ipoOffers, ipoSubscriptions };
+  // 期权卖权：合约与结算记录分开校验。`contracts` 必须是正整数（小数会被 SQLite 截断，
+  // 权利金收入与担保额随之对不上），坏行整条丢弃，由 repo 的「孤儿结算」兜底逻辑保底。
+  const optionContracts: OptionContractRow[] = [];
+  for (const item of payload.optionContracts ?? []) {
+    if (!isRecord(item)) continue;
+    const id = String(item.id ?? '').trim();
+    const underlyingCode = String(item.underlyingCode ?? '').trim();
+    const expiry = String(item.expiry ?? '').trim();
+    const market = String(item.market ?? '');
+    const strategy = String(item.strategy ?? '');
+    const optionType = String(item.optionType ?? '');
+    const collateralKind = String(item.collateralKind ?? '');
+    const status = String(item.status ?? 'open');
+    const contracts = toNumber(item.contracts);
+    const openedAt = String(item.openedAt ?? '').trim();
+    if (!id || !underlyingCode || !expiry || !openedAt) continue;
+    if (!OPTION_MARKETS.has(market) || !OPTION_STRATEGIES.has(strategy) || !OPTION_TYPES.has(optionType)) continue;
+    if (!OPTION_COLLATERAL_KINDS.has(collateralKind) || !OPTION_POSITION_STATUSES.has(status)) continue;
+    if (!Number.isInteger(contracts) || contracts <= 0) continue;
+    optionContracts.push({
+      id,
+      adviceId: (item.adviceId as string | null) ?? null,
+      strategy: strategy as OptionContractRow['strategy'],
+      market: market as OptionContractRow['market'],
+      underlyingCode,
+      underlyingName: String(item.underlyingName ?? ''),
+      underlyingAssetId: (item.underlyingAssetId as string | null) ?? null,
+      optionCode: String(item.optionCode ?? ''),
+      optionType: optionType as OptionContractRow['optionType'],
+      strike: toNumber(item.strike),
+      expiry,
+      contracts,
+      multiplier: toNumber(item.multiplier, 100),
+      currency: String(item.currency ?? (market === 'HK' ? 'HKD' : 'USD')),
+      premium: toNumber(item.premium),
+      fee: toNumber(item.fee),
+      premiumIncome: toNumber(item.premiumIncome),
+      collateralKind: collateralKind as OptionContractRow['collateralKind'],
+      collateral: toNumber(item.collateral),
+      underlyingPriceAtOpen: toNumber(item.underlyingPriceAtOpen),
+      status: status as OptionContractRow['status'],
+      openedAt,
+      closedAt: (item.closedAt as string | null) ?? null,
+      closePrice: item.closePrice === null || item.closePrice === undefined ? null : toNumber(item.closePrice),
+      realizedPnl: item.realizedPnl === null || item.realizedPnl === undefined ? null : toNumber(item.realizedPnl),
+      note: String(item.note ?? ''),
+      // 线上结构不带创建/更新时间：按导入时间生成（语义时间戳 openedAt/closedAt 已往返）。
+      createdAt: fallbackUpdatedAt,
+      updatedAt: fallbackUpdatedAt,
+    });
+  }
+
+  const optionSettlements: OptionSettlementRow[] = [];
+  for (const item of payload.optionSettlements ?? []) {
+    if (!isRecord(item)) continue;
+    const id = String(item.id ?? '').trim();
+    const contractId = String(item.contractId ?? '').trim();
+    const verdict = String(item.verdict ?? '');
+    const status = String(item.status ?? '');
+    const action = String(item.action ?? 'none');
+    if (!id || !contractId) continue;
+    if (
+      !OPTION_SETTLEMENT_VERDICTS.has(verdict) ||
+      !OPTION_SETTLEMENT_STATUSES.has(status) ||
+      !OPTION_SETTLEMENT_ACTIONS.has(action)
+    ) {
+      continue;
+    }
+    optionSettlements.push({
+      id,
+      contractId,
+      expiry: String(item.expiry ?? ''),
+      evaluatedAt: String(item.evaluatedAt ?? fallbackUpdatedAt),
+      referencePrice: toNumber(item.referencePrice),
+      priceSource: String(item.priceSource ?? ''),
+      verdict: verdict as OptionSettlementRow['verdict'],
+      itmAmount: toNumber(item.itmAmount),
+      itmPct: toNumber(item.itmPct),
+      status: status as OptionSettlementRow['status'],
+      action: action as OptionSettlementRow['action'],
+      transactionId: (item.transactionId as string | null) ?? null,
+      assetId: (item.assetId as string | null) ?? null,
+      realizedPnl: toNumber(item.realizedPnl),
+      note: String(item.note ?? ''),
+      createdAt: fallbackUpdatedAt,
+    });
+  }
+
+  return { assets, transactions, watchlist, advice, ipoOffers, ipoSubscriptions, optionContracts, optionSettlements };
 }
 
 export function importBackupPayload(repo: Repo, input: unknown, mode: ImportMode = 'merge'): ImportResult {
@@ -355,6 +545,25 @@ function applyImportedSettings(repo: Repo, payload: BackupPayload): void {
     } else if (isRecord((imported as Record<string, unknown>).schedule)) {
       // 兼容 2026-10 之前的备份：单个 schedule 对象 → 一个任务。
       patch.schedules = legacyScheduleToTasks((imported as Record<string, unknown>).schedule as Record<string, unknown>);
+    }
+    if (imported.option !== undefined && isRecord(imported.option)) {
+      // 期权卖权配置：现金担保额按市场分别恢复；缺字段（老备份）保持现值。
+      const option = imported.option;
+      const cash: Record<string, unknown> = isRecord(option.cash) ? option.cash : {};
+      const cashOf = (value: unknown, fallback: number): number =>
+        typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+      patch.option = {
+        cash: {
+          HK: cashOf(cash.HK, current.option.cash.HK),
+          US: cashOf(cash.US, current.option.cash.US),
+        },
+        settlementMode:
+          option.settlementMode === 'auto' || option.settlementMode === 'manual'
+            ? option.settlementMode
+            : current.option.settlementMode,
+        runWithPipeline:
+          typeof option.runWithPipeline === 'boolean' ? option.runWithPipeline : current.option.runWithPipeline,
+      };
     }
     if (typeof imported.enforceBudget === 'boolean') patch.enforceBudget = imported.enforceBudget;
     if (typeof imported.watchlistCandidateLimit === 'number') {

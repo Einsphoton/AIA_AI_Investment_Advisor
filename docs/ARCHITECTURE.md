@@ -43,7 +43,7 @@ AIInvestmentAdvisor/
 │   │   ├── db/{schema.ts,repo.ts,util.ts}
 │   │   ├── datasources/{types.ts,http.ts,registry.ts,eastmoney.ts,tencent.ts,fund.ts,macro.ts,news.ts,websearch.ts,keyed.ts,ipo.ts}
 │   │   ├── agent/{loop.ts,llm.ts,tools.ts,prompts.ts,runtime.ts,budget.ts,positions.ts}
-│   │   ├── services/{portfolio.ts,analytics.ts,briefing.ts,advice.ts,ipo.ts,scheduler.ts,backup.ts,fx.ts}
+│   │   ├── services/{portfolio.ts,analytics.ts,briefing.ts,advice.ts,ipo.ts,scheduler.ts,auto-retry.ts,backup.ts,fx.ts}
 │   │   └── routes/{index.ts,sse.ts,settings.ts,assets.ts,watchlist.ts,ipo.ts,advice.ts,dashboard.ts,market.ts,chat.ts,agent.ts,backup.ts}
 │   └── test/*.test.ts          # node:test（由 scripts/run-tests.mjs 同进程执行）
 └── packages/web/
@@ -188,6 +188,8 @@ run(session, systemPrompt, userGoal)
 | `upsert_watch_item` | 新建/更新标的（优质评估、目标价、预期收益、分析总结）；更新退役标的会自动复活 |
 | `retire_watch_item` | **软淘汰**：标记不再适合继续跟踪的标的，写回原因并累计 `retireStreak`（有持仓时直接拒绝） |
 | `create_advice` | 生成买入/卖出建议（受预算约束） |
+| `list_option_chain` / `screen_option_candidates` | **期权卖权只读**：取港股/美股期权链原始报价 / 按 `OPTION_SCREEN_RULES` 做确定性筛选（附被挡掉的原因），指标全部由服务端计算 |
+| `create_option_advice` | **期权卖权写入**（`requiresWrite='advice'`、`kinds:['option-advice']`）：写一条卖出期权建议（`instrument='option'` + `option_plan`）。机械校验：只做港股/美股、策略与期权方向自洽、到期日必须在未来、覆盖式卖 Call 的 `乘数×张数 ≤ 持仓股数`、现金担保卖 Put 的 `行权价×乘数×张数 ≤ 该市场可用现金`（不足时给出「最多 N 张」）。期限/权利金越界只进 `warnings` |
 | `save_dashboard_briefing` | 写回 Dashboard 的 AI 简报 |
 | `get_budget` | 查询当月预算剩余 |
 | `get_settings_profile` | 读取投资性格/报告风格与淘汰阈值，用于调整分析口径 |
@@ -196,16 +198,30 @@ run(session, systemPrompt, userGoal)
 | `record_ipo_subscription` / `record_ipo_allotment` | **打新写入**：登记「我申购了 N 股」/「我中了 N 股」；后者自动建资产 + 写 `source='ipo'` 的买入流水（修正语义由服务层保证） |
 | `delete_watch_item` | **系统工具（`systemOnly`，不发给模型）**：按淘汰规则真正删除已退役标的 |
 
-### 4.3 四条流水线（对应 UI 按钮）
+### 4.3 五条流水线（对应 UI 按钮）
 
 1. **AI 资产分析**（`POST /api/assets/analyze`）：逐个持仓 → 并行抓取行情/K线/基本面/**财报三表（4 期）**/基金详情/分红/新闻 → LLM 深度分析（必含财报跨期趋势）→ 写回 `ai_summary` → 汇总成组合简报（Dashboard 第四板块）。
 2. **AI 标的分析**（`POST /api/watchlist/analyze`）：按投资性格从信息源搜索候选 → 初筛（代码/流动性/匹配度）→ 深度分析 → `upsert_watch_item`（含优质评估、目标价、预期收益、逻辑）→ 同时刷新既有标的的估值与结论。
 3. **AI 打新分析**（`POST /api/ipo/analyze`，2026-10 新增）：先 `refreshIpoOffers` 抓三地新股 → 对每只在招标的（默认 8 只）组装「发行要素 + 中签率/超购 + 一手入场费推算 + 用户登记 + 当月预算 + 宏观快照」简报 → LLM 按六段框架（发行与估值 / 招股书要点 / 基本面与财务 / 宏观与微观 / 国际与政商环境 / 打新策略与预算联动）分析 → `save_ipo_analysis` 写回结论（**必须含胜率、预期收益与一句话理由**；`verdict` 表达「本期该不该打」，预算不足但标的不差时判 `neutral` 并写明缺口）。**结论不写 `advice` 表**：建议确认会直接写资产，而「建议申购」是尚未成交的标的，语义不同（见 `docs/API.md §6/§12`）。
-4. **AI 投资建议**（`POST /api/advice/generate`）：先跑 1、2、3 → 结合持仓、预算、性格与在招新股 → 生成买/卖建议（`create_advice`）→ 写入 `advice` 表，`status=pending`。
+4. **AI 期权卖权**（`POST /api/options/analyze`，2026-10 新增）：先确定性取数（持仓里的港股/美股股票作为覆盖式卖 Call 的担保、设置里的各市场可用现金、逐标的期权链的预筛 top N 候选与数据口径）→ 组装目标（首要目标是**安全收权利金**；标的明显划算才用现金担保卖 Put 收股；卖 Call 必须结合实际持股）→ LLM 用 `list_option_chain` / `screen_option_candidates` 现取明细 → 逐条 `create_option_advice` 落 `advice` 表（`instrument='option'`）。**空集不是错误**：没有可卖标的也会落一条 run 并在总结里说明原因。
 
-四条流水线共用同一个 Loop 与工具集，仅系统提示词与目标不同（`DEFAULT_WRITES` 按 kind 限定可写域，
-如 `ipo-analysis` 只能写 `ipo`）；调度器（interval/daily）的每个任务可选开关四个步骤，复用
-`POST /api/agent/run-now` 的同一套流程。
+   **可分析范围 = 持股 ∪ 现金**（`optionAdviceScope`）：覆盖式卖 Call 的担保物是**持股**，现金担保卖 Put 的担保物是**现金**，两者任一存在就有可分析范围。只有「没有港股/美股持股 **且** 各市场现金都是 0」才算没有担保物（此时目标里会写清缺的是哪一种担保物）。账户没有持股但填了现金时，阶段从**观察池**（在池的港股/美股股票与 ETF，按优质分排序、每市场最多 2 个）取标的预筛 `cash_secured_put` 候选 —— **卖 Put 不需要先持股**。预取并发 2 条，且 `POST /api/options/analyze` 要等预取完才返回 `runId`（期权链很重：港股每日报告 ≈ 6.7MB、约 30–60s；CBOE 单请求可达数分钟），期间按钮在转、进度见「活动」页。
+   `screen_option_candidates` 对每个候选返回服务端算好的 `maxContracts`（卖 Put = 可用现金 ÷ (行权价 × 乘数)，卖 Call = 持股 ÷ 乘数，上限 50）：模型默认只卖 1 张，实际张数必须由这个数字决定，否则权利金收入会被严重低估（这条曾导致模型以「每张只有几十港元」为由放弃整个策略）。
+5. **AI 投资建议**（`POST /api/advice/generate`）：先跑 1、2、3、4 → 结合持仓、预算、性格、在招新股与**已在手的期权担保占用** → 生成买/卖股票建议（`create_advice`）→ 写入 `advice` 表，`status=pending`。期权阶段排在股票建议之前，正是为了让股票建议看到被卖 Put 占用的现金，避免同一笔钱被两条建议重复使用。
+
+五条流水线共用同一个 Loop 与工具集，仅系统提示词与目标不同（`DEFAULT_WRITES` 按 kind 限定可写域，
+如 `ipo-analysis` 只能写 `ipo`，`option-advice` 只能写 `advice`）；调度器（interval/daily）的每个任务可选
+开关四个步骤，复用 `POST /api/agent/run-now` 的同一套流程。**期权卖权没有独立的定时开关**：它跟随
+「投资建议」步骤（`mergeTaskFlags` 里 `skipOption = !runAdvice`），另有全局总开关
+`settings.option.runWithPipeline`（设置页可关）——刻意只留一套口径，避免「设置关了但任务还在跑」的矛盾。
+
+### 4.3.3 期权到期结算（确定性，不经过 LLM）
+
+`services/options-settlement.ts` 是独立于流水线的旁路：进程内定时（启动后 ~30s，之后每 6h）+ 手工
+`POST /api/options/settlements/scan`，整体在流水线锁内运行（拿不到锁就跳过本次；手工触发返回 409）。
+判定、入账与「已入账则跳过」全部在同一 `repo.transaction` 内完成（中间无 `await`），因此定时扫描与
+用户手工确认重叠也不会重复写流水。判定口径、精度边界与「结论明确才自动入账，存疑转待确认」的规则
+见 `docs/API.md §13.3`。
 
 ### 4.3.2 自选标的淘汰（P3：软标记 → 计数 → 删除）
 
@@ -253,9 +269,10 @@ run(session, systemPrompt, userGoal)
 | **写入审计** | `agent/policy.ts` + 表 `audit_log` | 每次工具调用落一行：run/session、工具、风险、outcome（executed/denied/deferred/failed）、实体、参数摘要；审计失败永不影响 run |
 | **人工审批** | `agent/policy.ts` + 表 `pending_writes` + `routes/approval.ts` | `requireWriteApproval=true` 时写操作不直接落库，进入待审批；批准才真正执行（`runWithApprovalBypass` 单次放行 + 审计） |
 | **MCP 接入** | `agent/mcp.ts` + `services/mcp-manager.ts` + `routes/mcp.ts` | JSON-RPC 2.0（initialize → tools/list → tools/call），stdio 与 http 两种传输且**可注入**（沙箱/测试用进程内替身）；工具以 `mcp__<server>__<tool>` 动态并入工具表，风险 `external`；单服务器失败被隔离 |
-| **轨迹回放与续跑** | `agent/loop.ts` + 表 `agent_run_messages` + `routes/runs.ts` | 每条消息持久化；`GET /api/agent/runs/:id/trace` 回放完整轨迹；`POST /api/agent/runs/:id/resume` 从轨迹继续（受同一把流水线锁保护，`status='done'` 拒绝续跑） |
+| **轨迹回放与续跑** | `agent/loop.ts` + 表 `agent_run_messages` + `routes/runs.ts` | 每条消息持久化；`GET /api/agent/runs/:id/trace` 回放完整轨迹；`POST /api/agent/runs/:id/resume` 从轨迹继续（受同一把流水线锁保护，`status='done'` 拒绝续跑）。续跑拿到**与全新运行相同的轮次预算**（`AGENT_RESUME_TURNS`；过去只追加 8 轮，跑不完一个流水线阶段，自动续跑因此反复撞轮次上限）；预算/步数用尽且一句正文都没有时，追加**一次不带工具的「收尾作答」**（P1-4），把工具循环的「预算耗尽」变成一份结论而不是失败（`summary` 标注结论是在预算用尽后给出的），并让失败文案如实区分轮次上限 / 步数上限 / 空结论 |
 | **并行工具执行（P2）** | `agent/loop.ts` + `AGENT_TOOL_CONCURRENCY` | 同一条 assistant 消息里的 `read`/`external` 工具**并发执行**（默认上限 4），`write` 工具作为**屏障**串行且保持原顺序；结果仍按模型给出的顺序落库，轨迹保持确定性、可回放 |
 | **上游失败重试（P2）** | `agent/llm.ts` + `LLM_MAX_RETRIES` / `LLM_RETRY_BASE_MS` | 429 / 408 / 5xx / 网络错误做指数退避 + 抖动重试（默认 3 次），尊重 `Retry-After`（上限 30s，防止异常头拖死请求）；取消与确定性 4xx **永不**重试 |
+| **定时流水线自动续跑** | `services/auto-retry.ts` + `services/scheduler.ts` + `kv:scheduler:inFlight` / `kv:scheduler:autoRetry` + `GET /api/agent/retry` | 调度器启动的流水线失败后先做**失败分类**：LLM 429 / 5xx / 网络 / 超时 / 客户端内重试后仍空回复、轮次上限（`达到最大推理轮次`）、进程中断（`运行被中断…`）、未知瞬时错误 → **可重试**；未配置 API Key（`未配置 API Key`）/ 401·403 / 402 / 404 / 用户取消（`已取消`）/ 无持久化轨迹 → **不重试**（例外：若整个续跑任务是 resume 且所有阶段都报无轨迹，改判为 `kind='pipeline'` 整条重跑一次，而不是就此停止）。可重试时按约 2 → 10 → 30 分钟（±15% 抖动、下限 30 秒，最多 3 次）从 `agent_run_messages` 走与手动「一键续跑」**同一条 resume 路径**续跑失败的 run（不重跑已完成阶段），计划落在 `kv`，重启不丢；启动后 ~45 s 自愈被中断的定时流水线（有轨迹则续跑并补跑这一轮未执行的阶段，已完成的与续跑成功的阶段都跳过；无轨迹则整条重跑一次、同样跳过已完成阶段；`failStaleRuns` 仍先把中断行标成 `error` 并保留已花 token）。`Scheduler.nextRunAt()` / `plan()` 在有续跑待执行时插入合成项 `自动续跑 · 第 N/3 次`，所以界面「下次运行」反映的是续跑时间。与手动流水线共用同一把锁，锁被占用时顺延 ~2 分钟且不消耗次数；3 次用完只记日志。手动入口失败仍直接报给用户、**不会**自动续跑；续跑成功后原失败 run 的 `error` 会追加 `已自动续跑` 标记（`status` 仍是 `error`、已花 token 不回滚），`POST /api/agent/runs/:id/resume` 对它返回 **409**） |
 | **提示注入加固（P2）** | `agent/tools.ts` + `agent/prompts.ts` | 所有 `external` 工具（含 MCP）返回正文被包进 `<<UNTRUSTED_WEB_CONTENT>> … <</UNTRUSTED_WEB_CONTENT>>` 并标注「是数据不是指令」；命中注入模式时额外给出 ⚠️ 告警；系统提示词第 8 条要求忽略其中任何指令 |
 | **思考模型兼容（reasoning_content）** | `agent/llm.ts` + `agent/loop.ts` + 表 `agent_run_messages` | DeepSeek 类思考模型要求 assistant 工具消息把思考轨迹回传，否则多轮工具循环在第 2 轮被 HTTP 400 打死（生产实测：`watchlist-analysis` 第 5 轮整批失败）。现已在流式/非流式两条路径累积并回传，且随轨迹落库，续跑同样带上；若厂商反过来拒绝该字段，则按错误指向翻转一次回传开关并重试 |
 | **建议结果追踪** | `services/advice-outcomes.ts` + 表 `advice_outcomes` | 把「建议靠不靠谱」变成可计算的数字：每条建议按**建议日之后第一个交易日**收盘建基准（无前视偏差），与同区间基准指数比较，产出方向调整收益、超额、区间极值、胜率/跑赢率。全部确定性、可重建、幂等；样本不足的条目只计入 `unmeasured`，绝不进胜率分母 |

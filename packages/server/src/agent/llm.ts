@@ -763,6 +763,13 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     const choice = json.choices?.[0];
     const content = choice?.message?.content ?? '';
     const reasoning = choice?.message?.reasoning_content ?? '';
+    const toolCalls = choice?.message?.tool_calls ?? [];
+    // Same contract as the streamed path: a completion with neither prose nor a
+    // tool call is a gateway hiccup. This path used to *return* it happily, and
+    // the loop then reported it as「达到最大推理轮次」 (production: an
+    // auto-resumed run was blamed for a turn cap after its only turn came back
+    // empty through the non-streaming fallback).
+    if (content.length === 0 && toolCalls.length === 0) throw new LlmError('LLM 返回了空响应', 'LLM_EMPTY');
     if (content) request.onDelta?.(content);
     const promptTokens = json.usage?.prompt_tokens ?? 0;
     const completionTokens = json.usage?.completion_tokens ?? 0;
@@ -775,7 +782,7 @@ export function createLlmClient(configInput: Partial<LlmConfig> | undefined, log
     return {
       content,
       reasoningContent: reasoning,
-      toolCalls: choice?.message?.tool_calls ?? [],
+      toolCalls,
       promptTokens,
       completionTokens,
       cachedTokens: metrics.cachedTokens,

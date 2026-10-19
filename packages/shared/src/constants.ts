@@ -14,6 +14,13 @@ import type {
   LlmConfig,
   Market,
   McpServerConfig,
+  OptionMarket,
+  OptionPositionStatus,
+  OptionSettings,
+  OptionSettlementStatus,
+  OptionSettlementVerdict,
+  OptionStrategy,
+  OptionType,
   Persona,
   RangeKey,
   ReportStyle,
@@ -1015,6 +1022,172 @@ export const IPO_SOURCES_BY_MARKET: Record<Market, SourceId[]> = {
   US: ['nasdaq'],
 };
 
+/* ────────────────────────────── 期权卖权 (Options) ────────────────────────── */
+
+/** 只做港股与美股期权：A 股没有个股期权，不做。 */
+export const OPTION_MARKETS: OptionMarket[] = ['HK', 'US'];
+
+/**
+ * 期权设置的默认值。
+ *
+ * `settlementMode` 默认 `auto`：到期结论明确时直接入账（用户选了「明确就自动、
+ * 存疑转待确认」）；`cash` 默认 0 = 未填写，此时不给出无法覆盖的卖 Put。
+ */
+export const DEFAULT_OPTION_SETTINGS: OptionSettings = {
+  cash: { HK: 0, US: 0 },
+  settlementMode: 'auto',
+  runWithPipeline: true,
+};
+
+/** 卖权策略的中文标签（界面与 AI 提示词共用）。 */
+export const OPTION_STRATEGY_LABELS: Record<OptionStrategy, string> = {
+  covered_call: '覆盖式卖 Call',
+  cash_secured_put: '现金担保卖 Put',
+};
+
+/** 策略目标的一句话说明（界面与提示词共用，避免两处口径不一致）。 */
+export const OPTION_STRATEGY_INTENT: Record<OptionStrategy, string> = {
+  covered_call: '首要目标：用已有持股做担保收权利金；被行权即按行权价交股。',
+  cash_secured_put: '次要目标：标的足够划算时才做，被行权即按行权价收股（收股的同时权利金归你）。',
+};
+
+export const OPTION_TYPE_LABELS: Record<OptionType, string> = { call: 'Call', put: 'Put' };
+
+export const OPTION_POSITION_STATUS_LABELS: Record<OptionPositionStatus, string> = {
+  open: '持有中',
+  closed: '已平仓',
+  assigned: '已被行权',
+  expired_otm: '到期作废',
+};
+
+export const OPTION_SETTLEMENT_VERDICT_LABELS: Record<OptionSettlementVerdict, string> = {
+  otm_no_assignment: '虚值到期·权利金落袋',
+  assigned: '实值到期·已行权',
+  uncertain: '判定存疑·待确认',
+};
+
+export const OPTION_SETTLEMENT_STATUS_LABELS: Record<OptionSettlementStatus, string> = {
+  auto_settled: '已自动入账',
+  pending_review: '待确认',
+  confirmed: '已确认',
+  dismissed: '已忽略',
+};
+
+export const OPTION_SETTLEMENT_ACTION_LABELS: Record<
+  'none' | 'shares_delivered' | 'shares_received' | 'pending',
+  string
+> = {
+  none: '无需交割',
+  shares_delivered: '已按行权价交股（卖 Call 被行权）',
+  shares_received: '已按行权价收股（卖 Put 被行权）',
+  pending: '待确认后才入账',
+};
+
+/**
+ * 期权数据源的展示名。
+ *
+ * 与打新源同理（见上方 `IPO_SOURCE_LABELS`），这些源**不进入** `SOURCE_CATALOGUE`：
+ * 那份目录只描述「按市场/类型解析行情与财报」的 provider 链，用来填设置页的下拉；
+ * 期权链是独立能力，混进去用户会把它当成某市场的行情源。
+ */
+export const OPTION_SOURCE_LABELS: Record<string, string> = {
+  cboe: 'CBOE 延迟期权链',
+  nasdaq: '纳斯达克期权链',
+  hkex: '港交所每日收市报告',
+  manual: '手工录入',
+};
+
+/** 期权链按市场的回退顺序（也用于界面提示「这条数据来自哪里」）。 */
+export const OPTION_SOURCES_BY_MARKET: Record<OptionMarket, SourceId[]> = {
+  US: ['cboe', 'nasdaq'],
+  HK: ['hkex'],
+};
+
+/** 美股期权每张 = 100 股（OCC 标准合约乘数）。 */
+export const US_OPTION_MULTIPLIER = 100;
+
+/**
+ * 港股股票期权每张对应的股数（HKEX 各标的的合约乘数不一样）。
+ *
+ * 键为**去前导零**的港股代码（`00700` → `700`、`00005` → `5`）；值为股/张。
+ *
+ * 来源（两者都在 2026-10-19 实测 HTTP 200，且数值一致）：
+ *  1. HKEX 股票期权合约规格页（Contract Terms + 页面内嵌的期权类别表）：
+ *     https://www.hkex.com.hk/Products/Listed-Derivatives/Single-Stock/Stock-Options?sc_lang=en
+ *  2. HKEX《The List of Stock Option Classes Available for Trading》XLSX（机读，openpyxl 可直读）：
+ *     https://www.hkex.com.hk/-/media/HKEX-Market/Products/Listed-Derivatives/Single-Stock/Stock-Options/The-List-of-Stock-Option-Classes-Available-for-Trading_20261005.xlsx
+ *     （该文件名带日期、会随更新变化；实现时若要联网核对，应抓页面再取当前 href，不要硬编码日期。）
+ *
+ * ⚠️ **乘数 ≠ 每手股数**：`9988`(ALB) = 500（每手 100 的 5 倍）、`1810`(MIU) = 1,000
+ * （每手 200 的 5 倍）、`3690`(MET) = 500（每手 100 的 5 倍）。按每手股数算权利金
+ * 会**低估 5 倍**。官方 XLSX 里 154 个类别的乘数跨度为 20–20,000 股/张
+ * （实测分布：100:10、200:10、400:4、500:34、1000:46、2000:24 …），
+ * 所以不存在「安全默认值」。
+ *
+ * **只放经过核对的标的**：查不到的标的必须回退到
+ * `HK_OPTION_MULTIPLIER_FALLBACK` 并在 `warnings` 里明确写出「合约乘数未核对，
+ * 权利金收入可能按 100 股/张估算」，绝不允许静默用一个可能错的乘数算钱。
+ */
+export const HK_OPTION_MULTIPLIERS: Record<string, number> = {
+  // 00700 Tencent Holdings Limited (TCH) — XLSX 行 ['23','700','Tencent Holdings Limited','TCH','100','1','✓','1','250000']
+  700: 100,
+  // 09988 Alibaba Group Holding Ltd. (ALB) — XLSX 行 ['69','9988','Alibaba Group Holding Ltd.','ALB','500','5',...]（5 个每手）
+  9988: 500,
+  // 00005 HSBC Holdings Plc. (HKB) — XLSX 行 ['5','5','HSBC Holdings Plc.','HKB','400','1',...]
+  5: 400,
+  // 01810 XiaoMi Corporation (MIU) — XLSX 行 ['31','1810','XiaoMi Corporation','MIU','1000','5',...]（5 个每手）
+  1810: 1000,
+  // 03690 Meituan (MET) — XLSX 行 ['52','3690','Meituan','MET','500','5',...]（5 个每手）
+  3690: 500,
+};
+
+/** 港股合约乘数未知时的回退值（必须同时给出 warning）。 */
+export const HK_OPTION_MULTIPLIER_FALLBACK = 100;
+
+/**
+ * 卖权候选的确定性筛选规则。
+ *
+ * 「安全收权利金」在这里被翻译成可机械校验的数字门槛：剩余期限不能太短
+ * （时间价值太少）也不能太长（占用资金久、被行权概率高）；delta 落在温和区间
+ * （太小时权利金不值得,太大时容易被行权）；未平仓与价差保证能真的成交。
+ */
+export const OPTION_SCREEN_RULES = {
+  /** 剩余自然日下限。 */
+  minDaysToExpiry: 7,
+  /** 剩余自然日上限。 */
+  maxDaysToExpiry: 75,
+  /** |delta| 下限：低于此值的合约权利金过薄。 */
+  minAbsDelta: 0.08,
+  /** |delta| 上限：高于此值被行权概率过高，不算「安全」。 */
+  maxAbsDelta: 0.35,
+  /** 未平仓合约数下限。 */
+  minOpenInterest: 50,
+  /** 买卖价差占中间价上限（%）：流动性不足时按中间价假设会高估权利金。 */
+  maxSpreadPct: 20,
+  /** 年化权利金收益率下限（%）。 */
+  minAnnualizedYieldPct: 6,
+  /** 每张权利金金额下限（本币）：避免「1 分钱合约」占用额度却毫无收益。 */
+  minPremiumPerContract: 20,
+  /** 每个标的最多返回多少个候选（按年化收益率排序）。 */
+  maxCandidatesPerUnderlying: 6,
+} as const;
+
+/**
+ * 到期结算的判定口径（`services/options.ts` 的结算器使用）。
+ *
+ * 美股：OCC 规则是「实值 ≥ $0.01 即自动行权」，所以只要不是平值附近的
+ * 模糊区间，结论是确定的。港股为实物交割，同样按到期日参考价与行权价比较。
+ */
+export const OPTION_SETTLEMENT_RULES = {
+  /** 实值金额低于此值（每股，本币）视为虚值到期。 */
+  minItmAmount: 0.01,
+  /**
+   * 参考价与行权价的距离小于行权价的这个比例时判为「存疑」，转人工确认：
+   * 收盘价四舍五入、结算价口径差异、跨假期取不到当日价都可能把结论翻面。
+   */
+  uncertainBandPct: 0.5,
+} as const;
+
 /**
  * Data-source catalogue. `priority` orders the automatic fallback chain
  * (lower number wins). Only key-free providers are enabled out of the box.
@@ -1199,8 +1372,20 @@ export const AGENT_MAX_TOOL_CALLS_PER_TURN = 6;
  */
 export const AGENT_MAX_STEPS = 160;
 
-/** Extra turns granted by `POST /api/agent/runs/:id/resume` (P1-3). */
-export const AGENT_RESUME_EXTRA_TURNS = 8;
+/**
+ * Turn budget of a resumed run (`POST /api/agent/runs/:id/resume`, P1-3).
+ *
+ * Used to be **8 extra turns** ("跟着上次的预算再追加 8 轮"). That is not enough
+ * to finish a pipeline stage: production measured `watchlist-analysis` needing
+ * 12–20 turns, so an auto-resumed stage burned its 8 turns on tool calls, failed
+ * with「达到最大推理轮次（8）仍未给出最终结论」, and the scheduler retried the
+ * same 8-turn top-up two more times — three identical failures, all logged.
+ *
+ * A resume continues an *unfinished* run, so it gets the same budget as a fresh
+ * run. A converging run exits on its own turn, so the larger ceiling costs
+ * nothing for cheap runs and only binds for the ones that genuinely need it.
+ */
+export const AGENT_RESUME_TURNS = AGENT_MAX_TURNS;
 
 /* ─────────────────────── agent execution tuning (P2) ─────────────────────── */
 

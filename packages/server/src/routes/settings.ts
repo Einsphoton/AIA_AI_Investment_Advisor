@@ -134,6 +134,20 @@ const settingsInputSchema = z.object({
   watchlistCandidateLimit: z.number().int().min(0).max(100).optional(),
   /** P3：连续确认退役多少次后才真正删除标的；0 = 只标记不删除。 */
   watchlistRetireDeleteRuns: z.number().int().min(0).max(50).optional(),
+  // 期权卖权：可用现金（分市场，本币）与到期结算模式。现金担保卖 Put 的保证金
+  // 校验完全依赖这个数字，所以只接受非负有限值（上限拦住误填的一串零）。
+  option: z
+    .object({
+      cash: z
+        .object({
+          HK: z.number().min(0).max(1_000_000_000).optional(),
+          US: z.number().min(0).max(1_000_000_000).optional(),
+        })
+        .optional(),
+      settlementMode: z.enum(['auto', 'manual']).optional(),
+      runWithPipeline: z.boolean().optional(),
+    })
+    .optional(),
   // P1-1: partial anywhere (repo.saveSettings merges both objects), so the UI
   // can flip `requireWriteApproval` without echoing the whole deny list.
   toolPolicy: z
@@ -199,6 +213,7 @@ export function toSettingsDto(stored: StoredSettings): Settings {
       ...server,
       env: Object.fromEntries(Object.keys(server.env ?? {}).map((key) => [key, ''])),
     })),
+    option: stored.option,
     updatedAt: stored.updatedAt,
   };
 }
@@ -437,6 +452,14 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
       patch.toolPolicy = stripUndefined(body.toolPolicy) as StoredSettings['toolPolicy'];
     }
     if (body.mcpServers !== undefined) patch.mcpServers = body.mcpServers;
+    // 期权设置：部分更新，cash 里只覆盖显式给出的市场（另一个市场保持原值）。
+    if (body.option !== undefined) {
+      patch.option = {
+        ...(body.option.settlementMode !== undefined ? { settlementMode: body.option.settlementMode } : {}),
+        ...(body.option.runWithPipeline !== undefined ? { runWithPipeline: body.option.runWithPipeline } : {}),
+        ...(body.option.cash !== undefined ? { cash: stripUndefined(body.option.cash) } : {}),
+      } as unknown as StoredSettings['option'];
+    }
 
     // Tri-state API key: omitted/'' = keep, null = clear, string = overwrite.
     let nextApiKey: string | undefined;

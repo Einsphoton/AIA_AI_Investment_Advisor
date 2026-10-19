@@ -1788,6 +1788,35 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
   .agent-dock-metrics { grid-template-columns: 1fr; }
 }
 
+/* ── 23. 期权卖权（建议卡片 / 待确认结算 / 数据口径）─────────────────────────
+   设计目标：把「安全地收权利金」的判断依据摊开——安全垫、被行权概率、担保占用、
+   流动性、数据来源与是否延迟必须在同一张卡片里可见，所以用独立卡片而不是表格行。 */
+.option-card {
+  display: flex; flex-direction: column; gap: 8px;
+  border-left: 2px solid rgba(212, 175, 55, 0.42);
+}
+.option-metric { padding: 8px 10px; }
+.option-metric .strong { font-size: 15px; }
+.option-candidate { border-left: 2px solid rgba(56, 189, 248, 0.35); }
+
+/* 数据口径条：来源 · 抓取时间 · 是否延迟，排在所有数字前面。 */
+.option-provenance {
+  padding: 9px 11px;
+  border: 1px solid var(--border-quiet);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+}
+
+/* 待确认结算：到期结算里唯一需要人负责的部分，用金色左边框让它跳出来。 */
+.settle-card {
+  padding: 11px 12px;
+  border: 1px solid var(--border-quiet);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+}
+.settle-card-uncertain { border-left-color: var(--warn); background: rgba(240, 180, 41, 0.06); }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;

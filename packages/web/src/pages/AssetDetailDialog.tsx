@@ -5,8 +5,9 @@
  * InstrumentDetailSections，避免在页面里重复拉取行情。
  */
 import { useEffect, useMemo, useState } from 'react';
-import type { AssetDetail, Transaction } from '@aia/shared';
-import { INSTRUMENT_TYPE_LABELS } from '@aia/shared';
+import { Link } from 'react-router-dom';
+import type { AssetDetail, OptionPosition, Transaction } from '@aia/shared';
+import { INSTRUMENT_TYPE_LABELS, OPTION_STRATEGY_LABELS, OPTION_TYPE_LABELS } from '@aia/shared';
 import { api } from '../api/client';
 import { toApiError, useAsync } from '../api/hooks';
 import { fmtDate, fmtDateTime, fmtMoney, fmtPct, fmtPrice, fmtShares, fmtSignedMoney, pnlClass } from '../format';
@@ -27,6 +28,7 @@ import {
 import { MarketSeriesPanel, ProfilePanel, markersFromTransactions } from '../components/InstrumentDetailSections';
 import { FinancialsPanel } from '../components/FinancialsPanel';
 import { Markdown } from '../components/markdown/Markdown';
+import { OPTION_POSITION_TONE, expiryCountdown } from './optionView';
 
 const TX_SOURCE_LABELS: Record<string, string> = {
   manual: '手动',
@@ -113,6 +115,22 @@ export function AssetDetailDialog(props: {
   );
   const detail = open && assetId ? state.data : null;
   const markers = useMemo(() => markersFromTransactions(detail?.transactions ?? []), [detail]);
+  /**
+   * 该标的的在手期权合约（覆盖式卖 Call 与持仓是一体的：卖 Call 的担保就是这里的持股）。
+   *
+   * 期权接口不可用时只隐藏这一块，不让「资产详情」整页报错 —— 期权是附加信息，
+   * 而资产/交易记录才是这张浮窗的主体。
+   */
+  const optionState = useAsync<OptionPosition[]>(
+    () =>
+      open
+        ? api.options
+            .positions()
+            .then((result) => result.items)
+            .catch(() => [])
+        : Promise.resolve([]),
+    [open, assetId],
+  );
 
   // 换资产时回到「概览」，不要停留在上一个资产的 AI 页签。
   useEffect(() => {
@@ -122,6 +140,14 @@ export function AssetDetailDialog(props: {
   const instrument = detail
     ? { market: detail.market, code: detail.code, type: detail.type, name: detail.name, currency: detail.currency }
     : null;
+
+  /** 港股代码有前导零（持仓 700 / 期权 00700），比较前统一归一，否则会漏掉合约。 */
+  const codeKey = (code: string): string => code.trim().toUpperCase().replace(/^0+(?=\d)/, '');
+  const optionContracts = (optionState.data ?? []).filter(
+    (position) =>
+      (detail !== null && position.underlyingAssetId === detail.id) ||
+      (detail !== null && codeKey(position.underlyingCode) === codeKey(detail.code)),
+  );
 
   const confirmRemoveTx = async () => {
     if (!detail || !pendingTx) return;
@@ -202,6 +228,23 @@ export function AssetDetailDialog(props: {
               {/* 买卖点来自交易记录，与列表中的 AI 分析共用同一份数据。 */}
               <MarketSeriesPanel instrument={instrument} markers={markers} />
 
+              {/* 卖 Call 与持仓是一体的：担保就是这个标的的持股，所以合约必须出现在资产详情里。 */}
+              <Card
+                title={
+                  <span className="center gap-2">
+                    已卖出的期权合约
+                    {optionContracts.length > 0 && <Badge tone="ai">{optionContracts.length} 笔</Badge>}
+                  </span>
+                }
+                actions={
+                  <Link to="/options" className="tiny">
+                    去「期权卖权」页管理与结算 →
+                  </Link>
+                }
+              >
+                <AssetOptionPositions items={optionContracts} shares={detail.shares} currency={detail.currency} />
+              </Card>
+
               <ProfilePanel instrument={instrument} />
 
               {/* 财报体积大且不是每次都要看 → 默认折叠，避免弹窗被拉得很长。 */}
@@ -251,6 +294,78 @@ export function AssetDetailDialog(props: {
         onCancel={() => setPendingTx(null)}
       />
     </Modal>
+  );
+}
+
+/**
+ * 该标的的卖出合约（覆盖式卖 Call 为主）。owner: web-options.
+ *
+ * 与持仓联动体现在「担保够不够」上：卖 Call 被行权要交出 乘数 × 张数 股，
+ * 若当前持股少于这个数，被行权时就会变成裸卖 Call（风险完全不同），必须当场标出来。
+ */
+export function AssetOptionPositions(props: { items: OptionPosition[]; shares: number; currency: string }) {
+  const { items } = props;
+  if (items.length === 0) {
+    return (
+      <div className="tiny mute">
+        该标的没有在手的卖出合约。在「AI 投资建议」页确认期权建议、或在「期权卖权」页手工登记后，
+        行权价 / 到期日 / 张数 / 权利金会显示在这里，并核对持股是否够担保。
+      </div>
+    );
+  }
+  return (
+    <div className="table-wrap">
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>合约</th>
+            <th>策略 / 方向</th>
+            <th className="num">行权价</th>
+            <th>到期日</th>
+            <th className="num">张数</th>
+            <th className="num">每股价权利金</th>
+            <th className="num">权利金收入</th>
+            <th className="num">担保占用 / 持股缺口</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((position) => {
+            const requiredShares = position.multiplier * position.contracts;
+            const gap = position.optionType === 'call' ? requiredShares - props.shares : 0;
+            return (
+              <tr key={position.id}>
+                <td>
+                  <div className="mono tiny">{position.optionCode}</div>
+                  <div className="tiny mute">{position.underlyingName || position.underlyingCode}</div>
+                </td>
+                <td>
+                  <Badge tone={position.strategy === 'covered_call' ? 'manual' : 'warn'}>{OPTION_STRATEGY_LABELS[position.strategy]}</Badge>
+                  <div className="tiny mute mt-1">{OPTION_TYPE_LABELS[position.optionType]}</div>
+                </td>
+                <td className="num mono">{fmtPrice(position.strike, position.currency || props.currency)}</td>
+                <td className="tiny nowrap">
+                  {fmtDate(position.expiry)}
+                  <div className="mute">{expiryCountdown(position.expiry)}</div>
+                </td>
+                <td className="num mono">{fmtShares(position.contracts)}</td>
+                <td className="num mono">{fmtPrice(position.premium, position.currency || props.currency)}</td>
+                <td className="num mono">{fmtMoney(position.premiumIncome, position.currency || props.currency)}</td>
+                <td className="num tiny">
+                  <div className="mono">{fmtMoney(position.collateral, position.currency || props.currency)}</div>
+                  <div className="mute">{`需持股 ${fmtShares(requiredShares)} / 现有 ${fmtShares(props.shares)} 股`}</div>
+                  {gap > 0 && <div className="warn">{`持股缺口 ${fmtShares(gap)} 股：被行权会变成裸卖 Call`}</div>}
+                </td>
+                <td>
+                  <Badge tone={OPTION_POSITION_TONE[position.status]}>{position.status === 'open' ? '持有中' : position.status}</Badge>
+                  <div className={`tiny ${pnlClass(position.unrealizedPnl)}`}>浮盈 {fmtSignedMoney(position.unrealizedPnl, position.currency || props.currency)}</div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

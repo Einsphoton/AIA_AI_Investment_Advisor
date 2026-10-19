@@ -80,7 +80,22 @@ import {
   toSchedulePayload,
   type Draft,
 } from '../src/pages/settingsDraft';
-import { selectResumableRuns } from '../src/components/InterruptedRunsAlert';
+import {
+  AUTO_RESUMED_MARKER,
+  AutoRetryNotice,
+  autoRetrySummary,
+  isAutoResumed,
+  normalizePendingRetry,
+  selectResumableRuns,
+} from '../src/components/InterruptedRunsAlert';
+import type { AgentRetryPending } from '../src/api/client';
+/**
+ * 期权卖权 UI 的专项断言（建议卡片 / 最终确认弹窗 / 待确认结算 / 数据口径 / 设置项）。
+ *
+ * 它的断言全部写在 `options-web.test.tsx` 里；这里只负责把那个文件带进 rollup 的
+ * 单一测试入口（`rollup.test.config.mjs` 只把本文件当作 input），不修改本文件任何断言。
+ */
+import './options-web.test';
 
 const ROUTES: { path: string; expect: string[] }[] = [
   { path: '/', expect: ['Dashboard'] },
@@ -131,6 +146,28 @@ test('侧边栏包含全部八个导航入口', () => {
   for (const label of ['Dashboard', '我的资产', '我的标的', '新股打新', 'AI 投资建议', 'AI Chat', '活动与审计', '设置']) {
     assert.ok(html.includes(label), `侧边栏缺少导航项「${label}」`);
   }
+});
+
+test('导航顺序：「AI 投资建议」紧跟「我的标的」（建议是持仓与标的的下游动作）', () => {
+  const layout = readSource('components', 'Layout.tsx');
+  const order = ["'/assets'", "'/watchlist'", "'/advice'", "'/ipo'", "'/options'", "'/compare'"].map((route) => {
+    const index = layout.indexOf(`to: ${route}`);
+    assert.ok(index > 0, `导航缺少 ${route}`);
+    return index;
+  });
+  for (let i = 1; i < order.length; i += 1) {
+    assert.ok(order[i - 1]! < order[i]!, `导航顺序不对：${["'/assets'", "'/watchlist'", "'/advice'", "'/ipo'", "'/options'", "'/compare'"][i - 1]} 必须在 ${["'/assets'", "'/watchlist'", "'/advice'", "'/ipo'", "'/options'", "'/compare'"][i]} 之前`);
+  }
+  // 渲染出来的侧边栏也必须同序（防止有人只改 NAV 里的对象、不按顺序渲染）。
+  const html = render('/');
+  const at = (label: string) => {
+    const index = html.indexOf(label);
+    assert.ok(index > 0, `侧边栏缺少「${label}」`);
+    return index;
+  };
+  assert.ok(at('我的标的') < at('AI 投资建议'), '「AI 投资建议」必须排在「我的标的」之后');
+  assert.ok(at('AI 投资建议') < at('新股打新'), '「AI 投资建议」必须排在「新股打新」之前');
+  assert.ok(at('新股打新') < at('期权卖权'), '「新股打新」仍应排在「期权卖权」之前');
 });
 
 /* ───────────────────── 左上角版本徽标 ───────────────────── */
@@ -1538,6 +1575,7 @@ function settingsStub(schedules: Draft['schedules']): Parameters<typeof toDraft>
     apiKeyMasked: '',
     dataSources: {},
     budget: { CN: 5000, HK: 5000, US: 1000 },
+    option: { cash: { HK: 0, US: 0 }, settlementMode: 'auto', runWithPipeline: true },
     schedules: schedules.map((task) => ({
       id: task.id,
       name: task.name,
@@ -1969,4 +2007,179 @@ test('AI 投资建议页：建议放弃的标的不再占位，只报个数', ()
   const detail = readSource('pages', 'IpoDetailDialog.tsx');
   assert.ok(/focusRegister/.test(detail), '浮窗要支持 focusRegister');
   assert.ok(/scrollIntoView/.test(detail), 'focusRegister 要真的把视图带过去');
+});
+
+/* ═══════════ 定时流水线自动续跑：不让用户和自动重试双跑（烧 token） ═══════════ */
+
+/** 自动续跑相关的 run 桩（与上面的 selectResumableRuns 用例同构）。 */
+function retryRun(id: string, status: AgentRunSummary['status']): AgentRunSummary {
+  return {
+    id,
+    kind: 'asset-analysis',
+    status,
+    title: `run ${id}`,
+    summary: '',
+    error: status === 'error' ? '运行被中断（服务进程在本次分析结束前退出，重启后已标记为失败）。' : null,
+    turns: 1,
+    stepCount: 2,
+    startedAt: '2026-10-15T10:01:57.734Z',
+    finishedAt: '2026-10-15T10:04:36.834Z',
+  };
+}
+
+function pendingRetry(over: Partial<AgentRetryPending> = {}): AgentRetryPending {
+  return {
+    kind: 'resume',
+    attempt: 2,
+    maxAttempts: 3,
+    nextRunAt: '2026-10-19T03:30:00.000Z',
+    failedRunIds: ['b'],
+    taskNames: ['工作日盘前'],
+    lastError: '连接上游超时（read ETIMEDOUT）',
+    ...over,
+  };
+}
+
+test('selectResumableRuns：已被自动续跑接管的 run 不再提供手动入口', () => {
+  const runs = [
+    retryRun('a', 'error'),
+    retryRun('b', 'error'),
+    retryRun('c', 'done'),
+    retryRun('d', 'error'),
+  ];
+
+  // 第三参默认空数组 —— 老调用点的行为必须一字不变。
+  assert.deepEqual(
+    selectResumableRuns(runs, []).map((item) => item.id),
+    ['a', 'b', 'd'],
+    '不传 autoRetryRunIds 时必须与旧行为完全一致',
+  );
+  assert.deepEqual(
+    selectResumableRuns(runs, ['a']).map((item) => item.id),
+    ['b', 'd'],
+    '只忽略一个时行为不变',
+  );
+
+  // 自动续跑接管的 id 必须从手动列表里剔掉：否则用户点一下就和自动重试并发跑两遍。
+  assert.deepEqual(
+    selectResumableRuns(runs, [], ['b']).map((item) => item.id),
+    ['a', 'd'],
+    '自动续跑的 run 不能再出现在「一键续跑」列表里',
+  );
+  assert.deepEqual(
+    selectResumableRuns(runs, ['a'], ['d']).map((item) => item.id),
+    ['b'],
+    '「已忽略」与「自动续跑」两个集合要同时生效',
+  );
+  assert.deepEqual(selectResumableRuns(runs, [], ['a', 'b', 'd']), [], '全被自动接管时不剩手动入口');
+  assert.deepEqual(selectResumableRuns([], [], ['x']), [], '空列表不能因为新增参数而抛错');
+});
+
+test('selectResumableRuns：自动续跑成功后留下的旧 error 行不再提示手动续跑', () => {
+  // 服务端成功后不改写 status（历史事实），只往 error 末尾追加标记；
+  // 此时 pending 已清空，只能靠标记识别，否则用户会对着一条「早就续跑成功」的旧记录再点一次。
+  const marked = {
+    ...retryRun('m1', 'error'),
+    error: '运行被中断（服务进程在本次分析结束前退出，重启后已标记为失败）。（已自动续跑：第 1/3 次，新运行 1234abcd）',
+  };
+  assert.equal(AUTO_RESUMED_MARKER, '已自动续跑', '标记必须与服务端 auto-retry.ts 的常量一致');
+  assert.equal(isAutoResumed(marked), true, '带标记的 run 视为已被自动续跑接管');
+  assert.equal(isAutoResumed(retryRun('x', 'error')), false, '普通失败的 run 不受影响');
+  // error 为 null 的 run（正常失败或历史数据）必须安全判 false，不能抛错。
+  assert.equal(isAutoResumed({ error: null }), false, 'error 为 null 时不能崩');
+  assert.equal(isAutoResumed({ error: undefined }), false);
+
+  const plainError = retryRun('a', 'error');
+  const nullError = { ...retryRun('s', 'error'), error: null };
+  const runs = [plainError, marked, nullError, retryRun('d', 'done')];
+  assert.deepEqual(
+    selectResumableRuns(runs, []).map((item) => item.id),
+    ['a', 's'],
+    '已自动续跑成功的旧 error 行与 error=null 的正常失败行要区分开：前者不提示，后者照常提示',
+  );
+  // 与「自动重试排队中」叠加时同样生效。
+  assert.deepEqual(
+    selectResumableRuns(runs, [], ['s']).map((item) => item.id),
+    ['a'],
+    '标记过滤与 autoRetryRunIds 过滤要能同时起作用',
+  );
+
+  // 组件源码里必须真的用了这个判据，而不是只在纯函数里存在。
+  const alert = readSource('components', 'InterruptedRunsAlert.tsx');
+  assert.ok(/已自动续跑/.test(alert), '提示条必须识别「已自动续跑」标记（否则旧 error 行仍会被劝手动续跑）');
+  assert.ok(/isAutoResumed\(run\)/.test(alert), 'selectResumableRuns 必须按标记过滤');
+});
+
+test('自动续跑状态归一化：请求失败 / 脏数据一律降级为「没有排队」', () => {
+  assert.equal(normalizePendingRetry(null), null, '接口失败（data 仍为 null）必须降级');
+  assert.equal(normalizePendingRetry(undefined), null);
+  assert.equal(normalizePendingRetry({ pending: null, maxAttempts: 3 }), null, '服务端明确说没有排队');
+  // 老服务端没有这个端点时 request 会抛错，useAsync 把 data 留成 null —— 同上。
+  const pending = pendingRetry();
+  assert.equal(normalizePendingRetry({ pending, maxAttempts: 3 }), pending);
+});
+
+test('自动续跑信息条：写明第 N/M 次与失败原因，且绝不出现手动续跑按钮', () => {
+  const pending = pendingRetry();
+  const html = renderToString(
+    <AutoRetryNotice pending={pending} runTitles={['资产分析', '标的分析']} />,
+  )
+    // renderToString 会在相邻文本节点间插入 <!-- --> 水合标记，断言前先剥掉。
+    .replace(/<!--[^>]*-->/g, '');
+  assert.ok(html.includes('alert-info'), '自动续跑是「告知」，用 info 色调而不是警告色');
+  assert.ok(html.includes('自动续跑'), '缺少「自动续跑」标识');
+  assert.ok(html.includes('第 2/3 次'), '必须写明是第几次尝试，用户才知道还剩几次机会');
+  assert.ok(html.includes('失败原因：连接上游超时（read ETIMEDOUT）'), '必须带上最近一次失败原因');
+  assert.ok(html.includes('无需手动操作'), '必须说明用户不需要做任何事');
+  assert.ok(html.includes('资产分析') && html.includes('标的分析'), '应列出被自动接管的运行');
+  assert.ok(!html.includes('一键续跑'), '信息条里出现手动续跑入口 = 用户会双跑烧 token');
+  // 文案抽成纯函数，便于单测；格式与组件完全同源。
+  assert.equal(autoRetrySummary(pending).detail, '失败原因：连接上游超时（read ETIMEDOUT）');
+  assert.ok(autoRetrySummary(pending).headline.includes('第 2/3 次'));
+
+  // `kind: 'pipeline'` 时没有单个 run 可列：退回服务端给的定时任务名。
+  const pipeline = renderToString(
+    <AutoRetryNotice pending={pendingRetry({ kind: 'pipeline', failedRunIds: [], taskNames: ['工作日盘前'] })} />,
+  ).replace(/<!--[^>]*-->/g, '');
+  assert.ok(pipeline.includes('工作日盘前'), '整条流水线重跑时要说明是哪个定时任务');
+  assert.ok(pipeline.includes('整条定时流水线会重新执行'), '要说明 pipeline 的语义与 resume 不同');
+
+  // 字段缺失（老服务端 / 脏数据）不能让提示条崩成 undefined。
+  const bare = renderToString(
+    <AutoRetryNotice pending={pendingRetry({ lastError: '', nextRunAt: '', maxAttempts: 0 })} />,
+  ).replace(/<!--[^>]*-->/g, '');
+  assert.ok(!bare.includes('undefined'), '缺字段不得渲染出 undefined');
+  assert.ok(bare.includes('失败原因：未记录失败原因'), '没有失败原因时要给出可读兜底');
+  assert.ok(bare.includes('/3 次'), 'maxAttempts 非法时回落到契约固定的 3');
+});
+
+test('提示条接线：读取自动续跑状态，自动续跑的 id 不进入手动列表', () => {
+  const alert = readSource('components', 'InterruptedRunsAlert.tsx');
+  assert.ok(/api\.agent\.retryState\(\)/.test(alert), '提示条必须拉取自动续跑状态 GET /api/agent/retry');
+  assert.ok(
+    /selectResumableRuns\(runs\.data \?\? \[\], dismissed, pendingRunIds\)/.test(alert),
+    '自动续跑的 run id 必须传给 selectResumableRuns（否则仍会显示一键续跑）',
+  );
+  assert.ok(/pending\?\.failedRunIds \?\? \[\]/.test(alert), '要从 pending.failedRunIds 计算自动重试集合');
+  assert.ok(
+    /useAgentRefresh\(\(\) => \{/.test(alert) && /retry\.reload\(\)/.test(alert),
+    '运行结束后必须同时刷新自动续跑状态（排队状态会变）',
+  );
+  // 自动续跑状态失败必须降级，不能连累基于 runs 的提示条（两路请求相互独立）。
+  assert.ok(/normalizePendingRetry\(retry\.data\)/.test(alert), '自动续跑状态必须先归一化再使用');
+  assert.ok(
+    /resumable\.length === 0 && !pending/.test(alert),
+    '只有「没有可续跑 run」且「没有排队的自动续跑」时才整体不渲染',
+  );
+
+  const client = readSource('api', 'client.ts');
+  assert.ok(
+    /retryState: \(\) => request<AgentRetryState>\('\/agent\/retry'\)/.test(client),
+    'client 缺少 agent.retryState（GET /api/agent/retry）',
+  );
+  assert.ok(/export interface AgentRetryState/.test(client), '缺少 AgentRetryState 契约');
+  assert.ok(/export interface AgentRetryPending/.test(client), '缺少 AgentRetryPending 契约');
+  for (const field of ['failedRunIds', 'taskNames', 'lastError', 'nextRunAt', 'maxAttempts', 'attempt']) {
+    assert.ok(new RegExp(`\\b${field}\\b`).test(client), `自动续跑契约缺少 ${field}`);
+  }
 });

@@ -130,7 +130,8 @@ export function DashboardPage() {
           {signals?.priceStale && <Badge tone="warn">行情可能过期，建议刷新</Badge>}
           {signals?.scheduleEnabled && (
             <Badge tone="ok">
-              定时任务已开启（{signals.nextRuns?.length ?? 0} 个）
+              定时任务已开启（
+              {(signals.nextRuns ?? []).filter((entry) => !entry.id.startsWith('__')).length} 个）
               {signals.nextRunAt ? ` · 下次 ${fmtDateTime(signals.nextRunAt)}` : ''}
             </Badge>
           )}

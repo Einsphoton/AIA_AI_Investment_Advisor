@@ -324,6 +324,11 @@ export async function trackAdviceOutcomes(deps: OutcomeTrackingDeps): Promise<Ou
 
   const advice = repo
     .listAdvice({ limit: MAX_TRACKED_ADVICE })
+    // 期权卖权建议不参与股票口径的结果追踪：那一行的 code 是**标的**、盈亏由合约
+    // 权利金与行权结果决定，按标的涨跌算「建议收益」既无意义又会让胜率虚高；
+    // 期权自己的表现看 `/api/options/positions`（option_contracts 的未实现/已实现盈亏）。
+    // 这里必须过滤，否则还会对同一标的重复取日线序列。
+    .filter((row) => row.instrument !== 'option')
     .filter((row) => row.createdAt >= cutoff)
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 

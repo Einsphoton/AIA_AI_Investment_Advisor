@@ -779,4 +779,21 @@ function done(provider: SourceId, ok: boolean, started: number, message: string)
   return { provider, ok, latencyMs: Date.now() - started, message };
 }
 
+/* ──────────────────────────── options (thin re-export) ───────────────────── */
+
+/**
+ * 期权链是独立能力，不走 `DataSourceSlot` 的 provider 链（见 `OPTION_SOURCES_BY_MARKET`），
+ * 因此这里只做**薄 re-export**，不放任何解析逻辑 —— 实现全部在 `./options.js`。
+ */
+export {
+  DEFAULT_MAX_EXPIRIES,
+  OptionChainUnavailableError,
+  clearOptionsCache,
+  describeOptionError,
+  hkUnderlyingClose,
+  optionChain,
+  optionMultiplier,
+} from './options.js';
+export type { OptionChainRequest } from './options.js';
+
 export type { ProviderQuote, ProviderSeries };
